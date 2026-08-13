@@ -90,6 +90,26 @@ On the demo lane it independently reproduces the section-4 result (SALL4 and
 SMARCC1 strongest; EZH2, SUZ12, NANOG and CTNNB1 all peaking in the same
 cluster) without using clusters at all.
 
+**7 · Co-functional modules & gene programs**
+The "regulome" map, after
+[Chen et al. 2023](https://www.nature.com/articles/s41586-023-06733-x). A
+perturbation×gene matrix of log2FC-vs-control is clustered on both axes:
+perturbations into **co-functional modules** (Spearman-correlation clustering)
+and downstream genes into **co-regulated programs** (Pearson-correlation
+clustering). It then relates the two — a signed module×program strength matrix
+and alluvial — and draws the TF-hub and module–module networks. Every cell is
+also scored for each program. Modules (`M1..`) and programs (`P1..`) are numbered
+clusters, not biological labels; their member TFs and top genes are in the
+tables so you can annotate them. The number of modules/programs is configurable
+(`modules.n_modules` / `modules.n_programs`, or an automatic dendrogram cut).
+
+```bash
+pip install -e ".[networks]"   # optional: the network-graph layouts (networkx)
+```
+
+The stage skips itself when a run has too few perturbations to be meaningful (a
+single small lane), so it is most useful on a full multi-lane screen.
+
 ---
 
 ## Install

@@ -1332,6 +1332,48 @@ def test_lochness_can_be_disabled(synthetic, tmp_path):
 
 
 # ---------------------------------------------------------------------------
+# Co-functional modules & gene programs
+# ---------------------------------------------------------------------------
+
+
+def test_modules_outputs_are_produced(mtx_run):
+    """The module/program stage writes its tables and figures on a normal run."""
+    td = mtx_run.outdir / "tables"
+    effect = pd.read_csv(td / "effect_matrix.csv")
+    programs = pd.read_csv(td / "gene_programs.csv")
+    modules = pd.read_csv(td / "cofunctional_modules.csv")
+    strength = pd.read_csv(td / "module_program_strength.csv")
+
+    # Effect matrix is perturbation x gene (plus the target_gene index column).
+    assert effect.shape[0] == modules.shape[0]
+    assert effect.shape[1] - 1 == programs.shape[0]
+    assert {"target_gene", "module", "n_cells", "n_de_genes"} <= set(modules.columns)
+    assert {"gene", "program"} <= set(programs.columns)
+    # module x program strength: one row per module, one column per program (+ label).
+    assert strength.shape[0] == modules["module"].nunique()
+
+    figs = {p.stem for p in (mtx_run.figures_dir / "modules").glob("*.png")}
+    assert "regulome_heatmap" in figs
+    assert "module_program_strength" in figs
+    assert "module_program_alluvial" in figs
+
+    # Per-cell program scores landed in obs.
+    score_cols = [c for c in mtx_run.adata.obs.columns if c.startswith("program_")]
+    assert score_cols, "expected per-cell program score columns in obs"
+
+
+def test_modules_can_be_disabled(synthetic, tmp_path):
+    from perturbseq_pipeline.cli import run_pipeline
+
+    cfg = _base_config(synthetic, tmp_path / "run_nomodules")
+    cfg.modules.enabled = False
+    result = run_pipeline(cfg)
+    assert not (result.outdir / "figures" / "modules").exists()
+    assert not (result.outdir / "tables" / "effect_matrix.csv").exists()
+    assert result.report.is_file()
+
+
+# ---------------------------------------------------------------------------
 # Statistics
 # ---------------------------------------------------------------------------
 

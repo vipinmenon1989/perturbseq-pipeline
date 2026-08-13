@@ -59,6 +59,7 @@ SECTION_PS_PER_TARGET = "ps_score/per_target"
 SECTION_PS_LDA = "ps_score/lda"
 SECTION_LOCHNESS = "lochness"
 SECTION_LOCHNESS_PER_TARGET = "lochness/per_target"
+SECTION_MODULES = "modules"
 
 _CLASS_COLORS = {
     CLASS_TARGETING: "#2b6cb0",
@@ -1760,4 +1761,386 @@ def plot_lochness(expr, results, reg: FigureRegistry, cfg: Config) -> None:
         "Wrote %d per-perturbation lochNESS maps (%d shown in the report)",
         len(summary),
         min(top_n, len(summary)),
+    )
+
+
+# ---------------------------------------------------------------------------
+# Co-functional modules & gene programs
+# ---------------------------------------------------------------------------
+
+
+def _label_colors(labels: List[str]) -> dict:
+    uniq = list(dict.fromkeys(labels))
+    pal = sns.color_palette("tab20", max(len(uniq), 3))
+    return {lab: tuple(pal[i % len(pal)]) for i, lab in enumerate(uniq)}
+
+
+def _block_spans(seq: List[str]):
+    """(label, start, stop) for each contiguous run of equal labels."""
+    spans = []
+    if not len(seq):
+        return spans
+    start = 0
+    for i in range(1, len(seq) + 1):
+        if i == len(seq) or seq[i] != seq[start]:
+            spans.append((seq[start], start, i))
+            start = i
+    return spans
+
+
+def _display_order(items, label_of, label_rank, item_rank):
+    """Group items so each cluster is a contiguous block (leaf order within)."""
+    return sorted(items, key=lambda x: (label_rank[label_of[x]], item_rank[x]))
+
+
+def _plot_effect_heatmap(results, reg, cfg) -> None:
+    """The core Fig-1c-style clustered heatmap: genes x perturbations."""
+    prog = results.gene_programs.set_index("gene")["program"]
+    mod = results.modules.set_index("target_gene")["module"]
+    prog_rank = {l: i for i, l in enumerate(results.program_labels)}
+    mod_rank = {l: i for i, l in enumerate(results.module_labels)}
+    g_rank = {g: i for i, g in enumerate(results.gene_order)}
+    p_rank = {p: i for i, p in enumerate(results.perturbation_order)}
+
+    genes = _display_order(results.gene_order, prog, prog_rank, g_rank)
+    perts = _display_order(results.perturbation_order, mod, mod_rank, p_rank)
+    D = results.effect_matrix.loc[perts, genes].T  # genes x perturbations
+    row_lab = [prog[g] for g in genes]
+    col_lab = [mod[t] for t in perts]
+
+    prog_colors = _label_colors(results.program_labels)
+    mod_colors = _label_colors(results.module_labels)
+    lim = float(np.nanpercentile(np.abs(D.to_numpy()), 98)) or 1.0
+
+    w = max(7.0, 0.06 * len(perts) + 3)
+    h = max(6.0, 0.02 * len(genes) + 3)
+    fig = plt.figure(figsize=(w, h))
+    gs = fig.add_gridspec(
+        2, 3, width_ratios=[0.02, 1, 0.04], height_ratios=[0.03, 1],
+        wspace=0.02, hspace=0.02,
+    )
+    ax_top = fig.add_subplot(gs[0, 1])
+    ax_left = fig.add_subplot(gs[1, 0])
+    ax = fig.add_subplot(gs[1, 1])
+    cax = fig.add_subplot(gs[1, 2])
+
+    im = ax.imshow(D.to_numpy(), cmap="RdBu_r", vmin=-lim, vmax=lim, aspect="auto")
+    ax.set_yticks([])
+    if len(perts) <= 60:
+        ax.set_xticks(range(len(perts)))
+        ax.set_xticklabels(perts, rotation=90, fontsize=5)
+    else:
+        ax.set_xticks([])
+    ax.set_xlabel(f"{len(perts)} perturbations (grouped into {results.n_modules} modules)")
+    ax.set_ylabel(f"{len(genes)} genes (grouped into {results.n_programs} programs)")
+
+    ax_top.imshow(
+        np.array([[mod_colors[l] for l in col_lab]]), aspect="auto"
+    )
+    ax_top.set_xticks([]); ax_top.set_yticks([])
+    for lab, s, e in _block_spans(col_lab):
+        ax_top.text((s + e - 1) / 2, 0, lab, ha="center", va="center",
+                    fontsize=7, fontweight="bold")
+    ax_left.imshow(
+        np.array([[prog_colors[l]] for l in row_lab]), aspect="auto"
+    )
+    ax_left.set_xticks([]); ax_left.set_yticks([])
+    for lab, s, e in _block_spans(row_lab):
+        ax_left.text(0, (s + e - 1) / 2, lab, ha="center", va="center",
+                     rotation=90, fontsize=7, fontweight="bold")
+    # thin separators between blocks on the main heatmap
+    for _, _, e in _block_spans(col_lab)[:-1]:
+        ax.axvline(e - 0.5, color="white", lw=0.6)
+    for _, _, e in _block_spans(row_lab)[:-1]:
+        ax.axhline(e - 0.5, color="white", lw=0.6)
+
+    plt.colorbar(im, cax=cax, label="log2FC vs control")
+    ax_top.set_title(
+        f"Regulome map: {results.n_modules} co-functional modules x "
+        f"{results.n_programs} gene programs",
+        fontsize=11, pad=14,
+    )
+    reg.save(
+        fig, "regulome_heatmap", SECTION_MODULES,
+        "Co-functional modules and gene programs",
+        f"Perturbation x gene log2FC vs {CONTROL_LABELS.get(results.control, results.control)}. "
+        f"Columns are {len(perts)} perturbations grouped into {results.n_modules} co-functional "
+        f"modules ({results.module_correlation}-correlation clustering); rows are {len(genes)} "
+        f"downstream genes grouped into {results.n_programs} programs "
+        f"({results.program_correlation}-correlation clustering). Red = up, blue = down after "
+        "perturbation. Module (M) and program (P) labels are arbitrary cluster ids.",
+    )
+
+
+def _plot_module_program(results, reg, cfg) -> None:
+    mp = results.module_program
+    if mp.empty:
+        return
+    lim = float(np.nanmax(np.abs(mp.to_numpy()))) or 1.0
+    fig, ax = plt.subplots(figsize=(max(4, 0.7 * mp.shape[1] + 2), max(3, 0.5 * mp.shape[0] + 1.5)))
+    im = ax.imshow(mp.to_numpy(), cmap="RdBu_r", vmin=-lim, vmax=lim, aspect="auto")
+    ax.set_xticks(range(mp.shape[1])); ax.set_xticklabels(mp.columns)
+    ax.set_yticks(range(mp.shape[0])); ax.set_yticklabels(mp.index)
+    ax.set_xlabel("Gene program"); ax.set_ylabel("Co-functional module")
+    for i in range(mp.shape[0]):
+        for j in range(mp.shape[1]):
+            v = mp.to_numpy()[i, j]
+            if np.isfinite(v):
+                ax.text(j, i, f"{v:+.2f}", ha="center", va="center", fontsize=7,
+                        color="white" if abs(v) > 0.6 * lim else "black")
+    plt.colorbar(im, ax=ax, shrink=0.7, label="mean log2FC")
+    ax.set_title("Module -> program regulatory strength", fontsize=11)
+    fig.tight_layout()
+    reg.save(
+        fig, "module_program_strength", SECTION_MODULES,
+        "Module x program strength",
+        "Signed strength of each module's regulation of each program: the mean "
+        "program-gene log2FC per perturbation, averaged over the module's "
+        "perturbations. Red = net activation, blue = net repression.",
+    )
+
+
+def _plot_alluvial(results, reg, cfg) -> None:
+    mp = results.module_program
+    if mp.empty or mp.shape[0] < 1 or mp.shape[1] < 1:
+        return
+    mod_colors = _label_colors(results.module_labels)
+    mag = mp.abs().fillna(0.0)
+    mod_tot = mag.sum(axis=1)
+    prog_tot = mag.sum(axis=0)
+    total = float(mag.to_numpy().sum())
+    if total <= 0:
+        return
+    gap = 0.02
+
+    def _stack(totals):
+        pos, y = {}, 1.0
+        n = len(totals)
+        usable = 1.0 - gap * (n - 1)
+        for name, t in totals.items():
+            hgt = usable * (t / total) if total else 0.0
+            pos[name] = (y - hgt, y)  # (low, high)
+            y -= hgt + gap
+        return pos
+
+    left = _stack(mod_tot)
+    right = _stack(prog_tot)
+    fig, ax = plt.subplots(figsize=(7, max(4, 0.5 * mp.shape[0] + 2)))
+
+    left_cursor = {m: left[m][1] for m in mp.index}
+    right_cursor = {p: right[p][1] for p in mp.columns}
+    xs = np.linspace(0, 1, 40)
+    sm = xs * xs * (3 - 2 * xs)
+    for m in mp.index:
+        for p in mp.columns:
+            v = mp.loc[m, p]
+            if not np.isfinite(v) or v == 0:
+                continue
+            thick = (1.0 - gap * (max(len(mp.index), len(mp.columns)) - 1)) * (abs(v) / total)
+            l_hi = left_cursor[m]; l_lo = l_hi - thick; left_cursor[m] = l_lo
+            r_hi = right_cursor[p]; r_lo = r_hi - thick; right_cursor[p] = r_lo
+            X = 0.08 + 0.84 * xs
+            lo = l_lo + (r_lo - l_lo) * sm
+            hi = l_hi + (r_hi - l_hi) * sm
+            ax.fill_between(X, lo, hi, color=("#c0392b" if v > 0 else "#2c6fbb"),
+                            alpha=0.55, lw=0)
+    for m, (lo, hi) in left.items():
+        ax.add_patch(plt.Rectangle((0.04, lo), 0.04, hi - lo, color=mod_colors[m]))
+        ax.text(0.02, (lo + hi) / 2, m, ha="right", va="center", fontsize=8, fontweight="bold")
+    for p, (lo, hi) in right.items():
+        ax.add_patch(plt.Rectangle((0.92, lo), 0.04, hi - lo, color="#666666"))
+        ax.text(0.98, (lo + hi) / 2, p, ha="left", va="center", fontsize=8, fontweight="bold")
+    ax.set_xlim(0, 1); ax.set_ylim(0, 1.02); ax.axis("off")
+    ax.set_title("Module -> program regulation (alluvial)\nred = activation, blue = repression",
+                 fontsize=11)
+    reg.save(
+        fig, "module_program_alluvial", SECTION_MODULES,
+        "Module -> program alluvial",
+        "Regulatory flow from co-functional modules (left) to gene programs "
+        "(right). Ribbon width is the magnitude of the mean effect; red = "
+        "activation, blue = repression. Bar heights show each module/program's "
+        "total regulatory strength.",
+    )
+
+
+def _plot_module_correlation(results, reg, cfg) -> None:
+    perts = results.perturbation_order
+    if len(perts) < 3:
+        return
+    mod = results.modules.set_index("target_gene")["module"]
+    mod_rank = {l: i for i, l in enumerate(results.module_labels)}
+    p_rank = {p: i for i, p in enumerate(perts)}
+    order = _display_order(perts, mod, mod_rank, p_rank)
+    corr = results.effect_matrix.loc[order].T.corr(method=results.module_correlation)
+    fig, ax = plt.subplots(figsize=(max(5, 0.14 * len(order) + 2),) * 2)
+    im = ax.imshow(corr.to_numpy(), cmap="RdBu_r", vmin=-1, vmax=1)
+    show = len(order) <= 70
+    ax.set_xticks(range(len(order)) if show else [])
+    if show:
+        ax.set_xticklabels(order, rotation=90, fontsize=4)
+        ax.set_yticks(range(len(order))); ax.set_yticklabels(order, fontsize=4)
+    else:
+        ax.set_yticks([])
+    for _, _, e in _block_spans([mod[t] for t in order])[:-1]:
+        ax.axvline(e - 0.5, color="black", lw=0.5); ax.axhline(e - 0.5, color="black", lw=0.5)
+    plt.colorbar(im, ax=ax, shrink=0.6, label=f"{results.module_correlation} r")
+    ax.set_title("Perturbation similarity (co-functional modules)", fontsize=11)
+    fig.tight_layout()
+    reg.save(
+        fig, "module_correlation", SECTION_MODULES,
+        "Perturbation correlation (modules)",
+        f"{results.module_correlation.title()} correlation between perturbations "
+        "of their transcriptome-wide effect profiles. Black lines separate the "
+        "co-functional modules; red blocks are perturbations acting together.",
+    )
+
+
+def _plot_program_activity(results, reg, cfg) -> None:
+    act = results.program_activity
+    if act.empty:
+        return
+    lim = float(np.nanmax(np.abs(act.to_numpy()))) or 1.0
+    fig, ax = plt.subplots(figsize=(max(4, 0.5 * act.shape[1] + 2), max(2.5, 0.5 * act.shape[0] + 1.5)))
+    im = ax.imshow(act.to_numpy(), cmap="RdBu_r", vmin=-lim, vmax=lim, aspect="auto")
+    ax.set_xticks(range(act.shape[1])); ax.set_xticklabels(act.columns, fontsize=7)
+    ax.set_yticks(range(act.shape[0])); ax.set_yticklabels(act.index)
+    ax.set_xlabel(f"Cluster ({cfg.modules.cluster_key})"); ax.set_ylabel("Gene program")
+    plt.colorbar(im, ax=ax, shrink=0.7, label="mean program score")
+    ax.set_title("Gene-program activity by cluster", fontsize=11)
+    fig.tight_layout()
+    reg.save(
+        fig, "program_activity_by_cluster", SECTION_MODULES,
+        "Program activity by cluster",
+        "Mean per-cell program score (sc.tl.score_genes) in each cell-state "
+        "cluster — which transcriptional states each program marks.",
+    )
+
+
+def _plot_program_umaps(expr, results, reg, cfg) -> None:
+    if "X_umap" not in expr.obsm or not results.score_columns:
+        return
+    coords = np.asarray(expr.obsm["X_umap"])
+    top_n = cfg.modules.top_n_report
+    for rank, (label, col) in enumerate(zip(results.program_labels, results.score_columns)):
+        if col not in expr.obs:
+            continue
+        fig, ax = plt.subplots(figsize=(5, 4.2))
+        _scatter_umap(ax, coords, expr.obs[col].to_numpy(), False,
+                      f"Program {label} activity", size=4, cmap="RdBu_r")
+        fig.tight_layout()
+        reg.save(
+            fig, f"program_{label}_umap", SECTION_MODULES,
+            f"Program {label} activity (UMAP)",
+            f"Per-cell score for program {label} "
+            f"({len(results.program_genes.get(label, []))} genes) on the embedding.",
+            in_report=rank < top_n,
+        )
+
+
+def _plot_networks(results, reg, cfg) -> None:
+    conn = results.module_connectivity
+    if conn.shape[0] >= 2:
+        fig, ax = plt.subplots(figsize=(max(4, 0.5 * conn.shape[0] + 2),) * 2)
+        im = ax.imshow(conn.to_numpy(), cmap="magma", aspect="auto")
+        ax.set_xticks(range(conn.shape[1])); ax.set_xticklabels(conn.columns, fontsize=7)
+        ax.set_yticks(range(conn.shape[0])); ax.set_yticklabels(conn.index, fontsize=7)
+        plt.colorbar(im, ax=ax, shrink=0.7, label="TF-TF edges / (size_i x size_j)")
+        ax.set_title("Module-module connectivity", fontsize=11)
+        fig.tight_layout()
+        reg.save(
+            fig, "module_connectivity", SECTION_MODULES,
+            "Module-module connectivity",
+            "Regulatory connectivity between modules: TF->TF edges spanning two "
+            "modules, normalised by the product of their sizes.",
+        )
+    if not cfg.modules.draw_networks:
+        return
+    try:
+        import networkx as nx
+    except ImportError:
+        logger.warning(
+            "modules.draw_networks is on but networkx is not installed; skipping "
+            "the network graphs (pip install -e '.[networks]'). Heatmaps still drawn."
+        )
+        return
+
+    mod_colors = _label_colors(results.module_labels)
+    # Module graph: nodes = modules (size by membership), edges = connectivity.
+    if conn.shape[0] >= 2:
+        G = nx.Graph()
+        sizes = results.modules["module"].value_counts()
+        for m in conn.index:
+            G.add_node(m, size=int(sizes.get(m, 1)))
+        for i, a in enumerate(conn.index):
+            for b in conn.columns[i + 1:]:
+                w = conn.loc[a, b] + conn.loc[b, a]
+                if w > 0:
+                    G.add_edge(a, b, weight=w)
+        pos = nx.spring_layout(G, seed=0, weight="weight")
+        fig, ax = plt.subplots(figsize=(6, 5))
+        nx.draw_networkx_edges(
+            G, pos, ax=ax, width=[2 + 8 * G[u][v]["weight"] for u, v in G.edges],
+            edge_color="#b0b0b0",
+        )
+        nx.draw_networkx_nodes(
+            G, pos, ax=ax, node_size=[80 + 40 * G.nodes[n]["size"] for n in G.nodes],
+            node_color=[mod_colors[n] for n in G.nodes],
+        )
+        nx.draw_networkx_labels(G, pos, ax=ax, font_size=9, font_weight="bold")
+        ax.axis("off"); ax.set_title("Module interaction network", fontsize=11)
+        reg.save(
+            fig, "module_network", SECTION_MODULES, "Module interaction network",
+            "Modules (nodes, sized by number of member TFs) linked by their "
+            "TF-TF regulatory connectivity (edge width).",
+        )
+
+    # TF-hub network: top hubs, coloured by module.
+    edges = results.tf_edges
+    hubs = results.hubs
+    if not edges.empty and not hubs.empty:
+        top_hubs = set(hubs.head(40)["target_gene"])
+        H = nx.DiGraph()
+        mod_of = results.modules.set_index("target_gene")["module"].to_dict()
+        hub_size = hubs.set_index("target_gene")["n_de_genes"].to_dict()
+        for _, e in edges.iterrows():
+            if e["source"] in top_hubs and e["target"] in top_hubs:
+                H.add_edge(e["source"], e["target"], sign=e["sign"])
+        if H.number_of_nodes() >= 2:
+            pos = nx.spring_layout(H, seed=0)
+            fig, ax = plt.subplots(figsize=(7, 6))
+            ecolors = ["#c0392b" if H[u][v]["sign"] == "positive" else "#2c6fbb"
+                       for u, v in H.edges]
+            nx.draw_networkx_edges(H, pos, ax=ax, edge_color=ecolors, alpha=0.5,
+                                   arrowsize=8, width=0.8)
+            nx.draw_networkx_nodes(
+                H, pos, ax=ax,
+                node_size=[40 + 12 * hub_size.get(n, 1) for n in H.nodes],
+                node_color=[mod_colors.get(mod_of.get(n, ""), "#999999") for n in H.nodes],
+            )
+            nx.draw_networkx_labels(H, pos, ax=ax, font_size=6)
+            ax.axis("off")
+            ax.set_title("TF regulatory network (hubs)\nred = activation, blue = repression",
+                         fontsize=11)
+            reg.save(
+                fig, "tf_hub_network", SECTION_MODULES, "TF hub network",
+                "Regulatory edges between the top hub TFs (node size = number of "
+                "DE genes it perturbs; colour = its module). Red = activating, "
+                "blue = repressing edge.",
+            )
+
+
+def plot_modules(expr, results, reg: FigureRegistry, cfg: Config) -> None:
+    """All co-functional-module / gene-program figures."""
+    if results is None or results.effect_matrix.empty:
+        return
+    _plot_effect_heatmap(results, reg, cfg)
+    _plot_module_program(results, reg, cfg)
+    _plot_alluvial(results, reg, cfg)
+    _plot_module_correlation(results, reg, cfg)
+    _plot_program_activity(results, reg, cfg)
+    _plot_program_umaps(expr, results, reg, cfg)
+    _plot_networks(results, reg, cfg)
+    logger.info(
+        "Wrote module/program figures (%d modules, %d programs)",
+        results.n_modules, results.n_programs,
     )

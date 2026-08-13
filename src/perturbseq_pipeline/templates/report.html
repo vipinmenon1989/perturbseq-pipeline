@@ -84,6 +84,7 @@
   {% if enrichment %}<a href="#enrichment">4. Cluster enrichment</a>{% endif %}
   {% if ps %}<a href="#ps">5. Per-cell response</a>{% endif %}
   {% if lochness %}<a href="#lochness">6. lochNESS</a>{% endif %}
+  {% if modules %}<a href="#modules">7. Modules &amp; programs</a>{% endif %}
   <a href="#outputs">Outputs</a>
 </p>
 
@@ -397,6 +398,59 @@
   <code>{{ lochness_dir }}</code>:
   <div class="filelist">
     {% for name in lochness_extra_names %}<div>{{ name }}</div>{% endfor %}
+  </div>
+</div>
+{% endif %}
+{% endif %}
+
+<!-- ===================== 7. Modules & programs ===================== -->
+{% if modules %}
+<h2 id="modules">7. Co-functional modules &amp; gene programs</h2>
+<p class="lede">
+  The "regulome" map. A {{ modules.n_perturbations }} &times; {{ modules.n_genes }}
+  perturbation&times;gene matrix of log2FC vs {{ modules.control_label }} is clustered on
+  both axes: perturbations into <b>{{ modules.n_modules }} co-functional modules</b>
+  ({{ modules.module_correlation }}-correlation) and downstream genes into
+  <b>{{ modules.n_programs }} co-regulated programs</b> ({{ modules.program_correlation }}-correlation,
+  {{ modules.linkage }} linkage). Module (M) and program (P) ids are arbitrary cluster labels — see
+  the tables for their member TFs / top genes; they are not biological names.
+</p>
+
+<div class="note">
+  <b>How the effect is measured.</b> Each entry is a pseudobulk mean-difference log2FC of a gene
+  between a perturbation's cells and the {{ modules.control_label }} control (the same quantity the
+  perturbation test reports). Gene selection uses cluster markers. The number of modules/programs is
+  a chosen parameter, not inferred — read the clusters as an exploratory grouping.
+</div>
+
+<div class="cards">
+  <div class="card"><div class="v">{{ modules.n_modules }}</div><div class="k">Co-functional modules</div></div>
+  <div class="card"><div class="v">{{ modules.n_programs }}</div><div class="k">Gene programs</div></div>
+  <div class="card"><div class="v">{{ modules.n_perturbations }}</div><div class="k">Perturbations</div></div>
+  <div class="card"><div class="v">{{ modules.top_hub }}</div><div class="k">Top hub TF ({{ modules.top_hub_n }} DE genes)</div></div>
+</div>
+
+<h3>7.1 The regulome map</h3>
+{% for f in figures.modules %}{{ render_figure(f) }}{% endfor %}
+
+<h3>7.2 Co-functional modules (perturbations)</h3>
+<div class="scroll">{{ tables.cofunctional_modules }}</div>
+
+<h3>7.3 Gene programs</h3>
+<div class="scroll">{{ tables.gene_programs }}</div>
+
+<h3>7.4 Module &rarr; program strength</h3>
+<div class="scroll">{{ tables.module_program_strength }}</div>
+
+<h3>7.5 Hub transcription factors</h3>
+<div class="scroll">{{ tables.tf_hubs }}</div>
+
+{% if modules_extras %}
+<div class="note">
+  <b>{{ modules_extras|length }} further module/program figures</b> are in
+  <code>{{ modules_dir }}</code>:
+  <div class="filelist">
+    {% for name in modules_extra_names %}<div>{{ name }}</div>{% endfor %}
   </div>
 </div>
 {% endif %}

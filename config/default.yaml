@@ -69,10 +69,6 @@ cluster:
   batch_key: null
   regress_out: []
   scale_max_value: 10.0
-  # Run the analysis on guide-assigned singlets only. All QC-passing cells are
-  # still embedded, clustered, plotted and written first (see
-  # output.write_unfiltered_h5ad); the singlets are then re-embedded on their
-  # own, so multiplets shape neither the PCA space nor the clusters.
   assigned_only: false
 perturbation:
   controls:
@@ -102,6 +98,26 @@ enrichment:
   guide_concordance: true
   min_cells_per_guide: 5
   permutations: 1000
+  top_n_report: 12
+modules:
+  enabled: true
+  cluster_key: leiden
+  gene_selection: cluster_markers
+  n_marker_genes_per_cluster: 100
+  marker_method: wilcoxon
+  min_cells_per_perturbation: 20
+  control: ntc
+  program_correlation: pearson
+  module_correlation: spearman
+  linkage_method: average
+  n_programs: 4
+  n_modules: 9
+  cluster_distance_threshold: 0.7
+  score_programs: true
+  hub_lfc_threshold: 0.5
+  draw_networks: true
+  min_perturbations: 5
+  min_genes: 10
   top_n_report: 12
 ps_score:
   enabled: true
@@ -138,8 +154,6 @@ report:
 output:
   h5ad_name: processed.h5ad
   report_name: report.html
-  # Only used with cluster.assigned_only: also write the pre-filter object (all
-  # QC-passing cells, own embedding) beside the analysed one. Doubles matrices.
   write_unfiltered_h5ad: true
   unfiltered_h5ad_name: null
   large_file_dir: null

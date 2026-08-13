@@ -30,6 +30,9 @@ dependencies = [
 [project.optional-dependencies]
 harmony = ["harmonypy>=0.0.9"]
 demo = ["gdown>=5.1"]
+# Network graphs for the co-functional module / gene program stage (Fig 1f/g style).
+# The heatmaps and alluvial are drawn without it; only the graph layouts need networkx.
+networks = ["networkx>=3.0"]
 # Per-cell perturbation scores, from the lab's PS_python repository.
 ps = [
     "pertps @ git+https://github.com/weili-lab/PS_python.git#subdirectory=pertps_project",

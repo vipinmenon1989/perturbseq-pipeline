@@ -31,6 +31,7 @@ from .plots import (
     SECTION_PERTURBATION,
     SECTION_LOCHNESS,
     SECTION_LOCHNESS_PER_TARGET,
+    SECTION_MODULES,
     SECTION_PS,
     SECTION_PS_LDA,
     SECTION_PS_PER_TARGET,
@@ -52,6 +53,7 @@ class ReportInputs:
     registry: FigureRegistry
     perturbation: PerturbationResults
     enrichment: object = None
+    modules: object = None
     ps: object = None
     lochness: object = None
     tables: Dict[str, pd.DataFrame] = field(default_factory=dict)
@@ -125,6 +127,7 @@ def build_report(inputs: ReportInputs, path: Path) -> Path:
         "ps_lda": reg.by_section(SECTION_PS_LDA),
         "lochness": reg.by_section(SECTION_LOCHNESS),
         "lochness_per_target": reg.by_section(SECTION_LOCHNESS_PER_TARGET),
+        "modules": reg.by_section(SECTION_MODULES),
     }
     extras = reg.extras(SECTION_PER_GENE)
     enrich_extras = reg.extras(SECTION_ENRICH_PER_TARGET)
@@ -142,6 +145,10 @@ def build_report(inputs: ReportInputs, path: Path) -> Path:
             "enrichment",
             "ps_score",
             "lochness",
+            "cofunctional_modules",
+            "gene_programs",
+            "module_program_strength",
+            "tf_hubs",
         )
     }
     tables_html["outputs"] = _df_to_html(
@@ -181,6 +188,29 @@ def build_report(inputs: ReportInputs, path: Path) -> Path:
                 else {}
             ),
         }
+
+    mods = inputs.modules
+    modules_ctx = None
+    if mods is not None and not mods.effect_matrix.empty:
+        top_hub = mods.hubs.iloc[0].to_dict() if not mods.hubs.empty else {}
+        modules_ctx = {
+            "n_modules": mods.n_modules,
+            "n_programs": mods.n_programs,
+            "n_perturbations": int(mods.effect_matrix.shape[0]),
+            "n_genes": int(mods.effect_matrix.shape[1]),
+            "control_label": CONTROL_LABELS.get(mods.control, mods.control),
+            "module_correlation": mods.module_correlation,
+            "program_correlation": mods.program_correlation,
+            "linkage": mods.linkage_method,
+            "hub_lfc": cfg.modules.hub_lfc_threshold,
+            "top_hub": top_hub.get("target_gene", ""),
+            "top_hub_n": int(top_hub.get("n_de_genes", 0)),
+            "n_tf_edges": int(len(mods.tf_edges)),
+            "program_genes": {
+                p: mods.program_genes.get(p, [])[:10] for p in mods.program_labels
+            },
+        }
+    modules_extras = reg.extras(SECTION_MODULES)
 
     ps = inputs.ps
     ps_ctx = None
@@ -272,6 +302,12 @@ def build_report(inputs: ReportInputs, path: Path) -> Path:
             f"{r.name}.{cfg.report.figure_format}" for r in loch_extras
         ],
         lochness_dir=str(reg.figdir / SECTION_LOCHNESS_PER_TARGET),
+        modules=modules_ctx,
+        modules_extras=modules_extras,
+        modules_extra_names=[
+            f"{r.name}.{cfg.report.figure_format}" for r in modules_extras
+        ],
+        modules_dir=str(reg.figdir / SECTION_MODULES),
         enrichment=enrichment_ctx,
         enrichment_extras=enrich_extras,
         enrichment_extra_names=[
