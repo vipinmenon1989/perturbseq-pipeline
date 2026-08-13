@@ -115,6 +115,7 @@ modules:
   cluster_distance_threshold: 0.7
   score_programs: true
   hub_lfc_threshold: 0.5
+  de_fdr_alpha: 0.05
   draw_networks: true
   min_perturbations: 5
   min_genes: 10

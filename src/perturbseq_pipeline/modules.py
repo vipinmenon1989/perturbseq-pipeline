@@ -150,26 +150,36 @@ def select_genes(expr: ad.AnnData, cfg: Config) -> List[str]:
 # ---------------------------------------------------------------------------
 
 
-def _dense_expm1(expr: ad.AnnData, gene_idx: np.ndarray) -> np.ndarray:
-    """Linear-space (de-logged) expression for the selected genes: cells x genes."""
+def _dense_layer(expr: ad.AnnData, gene_idx: np.ndarray) -> np.ndarray:
+    """Log-normalized expression for the selected genes as a dense cells x genes array."""
     layer = expr.layers[LOGNORM_LAYER] if LOGNORM_LAYER in expr.layers else expr.X
     sub = layer[:, gene_idx]
     if sparse.issparse(sub):
         sub = sub.toarray()
-    return np.expm1(np.asarray(sub, dtype=np.float64))
+    return np.asarray(sub, dtype=np.float64)
 
 
 def build_effect_matrix(
     expr: ad.AnnData, genes: List[str], targets: List[str], cfg: Config
-) -> Tuple[pd.DataFrame, str]:
-    """Perturbation x gene log2FC vs control, and the control actually used.
+) -> Tuple[pd.DataFrame, str, pd.DataFrame]:
+    """Perturbation x gene log2FC vs control, the control used, and a DE mask.
 
     log2FC is computed on de-logged group means (like
     :func:`perturbation.compare_groups`): ``log2((mean_perturbed + eps) /
     (mean_control + eps))``. Control is NTC when available, else all
     other-target cells (leave-the-target-out), matching ``perturbation`` /
     ``enrichment`` semantics.
+
+    The DE mask marks genes that are BOTH large (|log2FC| > hub_lfc_threshold)
+    AND significant (per-gene Welch t-test on the log-normalized values,
+    BH-corrected within the perturbation, FDR < de_fdr_alpha). The significance
+    gate is what stops low-cell-count perturbations from looking like hubs on
+    noise alone — hub sizes and TF-network edges use this mask, not raw |log2FC|.
     """
+    from scipy.stats import t as _tdist
+
+    from .perturbation import benjamini_hochberg
+
     base = control_masks(expr, cfg)
     control = cfg.modules.control
     if control == CONTROL_NTC and not base[CONTROL_NTC].any():
@@ -180,10 +190,10 @@ def build_effect_matrix(
         control = CONTROL_OTHER
 
     gene_idx = np.array([expr.var_names.get_loc(g) for g in genes])
-    lin = _dense_expm1(expr, gene_idx)  # cells x genes, de-logged
+    log = _dense_layer(expr, gene_idx)  # cells x genes, log-normalized
+    lin = np.expm1(log)  # de-logged, for the fold change
 
     obs_targets = expr.obs[OBS_TARGET].astype(str).to_numpy()
-    # One-hot indicator (n_targets x cells) over each perturbation's cells.
     target_pos = {t: i for i, t in enumerate(targets)}
     rows, cols = [], []
     for cell, t in enumerate(obs_targets):
@@ -194,26 +204,55 @@ def build_effect_matrix(
     ind = sparse.csr_matrix(
         (np.ones(len(rows)), (rows, cols)), shape=(len(targets), expr.n_obs)
     )
-    n_per_target = np.asarray(ind.sum(axis=1)).ravel()  # cells per perturbation
-    sum_per_target = ind @ lin  # (n_targets x genes) summed de-logged expression
-    mean_perturbed = sum_per_target / n_per_target[:, None]
+    n_p = np.asarray(ind.sum(axis=1)).ravel()  # cells per perturbation
+    n_p_col = n_p[:, None]
+    sum_lin = ind @ lin
+    mean_perturbed = sum_lin / n_p_col  # de-logged, for log2FC
+    # Log-space moments (for the t-test).
+    s_log = ind @ log
+    ss_log = ind @ (log * log)
+    mean_p = s_log / n_p_col
+    var_p = (ss_log - s_log * mean_p) / np.clip(n_p_col - 1, 1, None)
 
     if control == CONTROL_NTC:
         ntc = base[CONTROL_NTC]
-        mean_control = lin[ntc].mean(axis=0)[None, :]  # broadcast to all targets
-        mean_control = np.repeat(mean_control, len(targets), axis=0)
+        mean_control = lin[ntc].mean(axis=0)[None, :]  # broadcasts to all targets
+        log_c = log[ntc]
+        mean_c = log_c.mean(axis=0)[None, :]
+        var_c = log_c.var(axis=0, ddof=1)[None, :]
+        n_c = np.array([[max(int(ntc.sum()), 1)]], dtype=float)
     else:
-        # 'other' = every targeting cell except the perturbation's own cells.
         targeting = base[CONTROL_OTHER]  # class == targeting
-        tot_sum = lin[targeting].sum(axis=0)
         n_tot = int(targeting.sum())
-        mean_control = (tot_sum[None, :] - sum_per_target) / np.clip(
-            n_tot - n_per_target[:, None], 1, None
-        )
+        tot_lin = lin[targeting].sum(axis=0)
+        mean_control = (tot_lin[None, :] - sum_lin) / np.clip(n_tot - n_p_col, 1, None)
+        tot_log = log[targeting].sum(axis=0)
+        tot_log2 = (log[targeting] ** 2).sum(axis=0)
+        n_c = np.clip(n_tot - n_p_col, 1, None).astype(float)
+        s_log_c = tot_log[None, :] - s_log
+        mean_c = s_log_c / n_c
+        var_c = (tot_log2[None, :] - ss_log - s_log_c * mean_c) / np.clip(n_c - 1, 1, None)
 
     log2fc = np.log2((mean_perturbed + _PSEUDO) / (mean_control + _PSEUDO))
+
+    # Welch's t-test, per (perturbation, gene), on the log-normalized values.
+    term_p = var_p / n_p_col
+    term_c = var_c / n_c
+    se2 = term_p + term_c
+    with np.errstate(divide="ignore", invalid="ignore"):
+        tstat = (mean_p - mean_c) / np.sqrt(se2)
+        df = se2 ** 2 / (
+            term_p ** 2 / np.clip(n_p_col - 1, 1, None)
+            + term_c ** 2 / np.clip(n_c - 1, 1, None)
+        )
+        pvals = 2.0 * _tdist.sf(np.abs(tstat), np.clip(df, 1, None))
+    pvals = np.where(np.isfinite(pvals) & (se2 > 0), pvals, 1.0)
+    fdr = np.vstack([benjamini_hochberg(pvals[i]) for i in range(pvals.shape[0])])
+
+    de = (np.abs(log2fc) > cfg.modules.hub_lfc_threshold) & (fdr < cfg.modules.de_fdr_alpha)
     effect = pd.DataFrame(log2fc, index=targets, columns=genes)
-    return effect, control
+    de_mask = pd.DataFrame(de, index=targets, columns=genes)
+    return effect, control, de_mask
 
 
 # ---------------------------------------------------------------------------
@@ -297,23 +336,29 @@ def module_program_strength(
 
 
 def tf_network(
-    effect: pd.DataFrame, perturbation_module: pd.Series, cfg: Config
+    effect: pd.DataFrame,
+    de_mask: pd.DataFrame,
+    perturbation_module: pd.Series,
+    n_cells: pd.Series,
+    cfg: Config,
 ) -> Tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame]:
     """TF->TF edges, per-TF hub size, and module-module connectivity.
 
-    An edge TF_i -> gene_j exists when |log2FC of gene_j under perturbation i| >
-    ``hub_lfc_threshold``. Hub size of TF_i = number of such DE genes. Module-module
-    connectivity = TF-TF edges between the two modules / (size_i * size_j).
+    An edge TF_i -> gene_j exists when gene_j is a **significant** DE gene of
+    perturbation i (``de_mask``: |log2FC| > threshold AND BH-FDR < alpha). Hub
+    size of TF_i = number of such DE genes. Because the mask is significance-
+    gated, a low-cell-count perturbation cannot inflate its hub size on noise.
+    Module-module connectivity = TF-TF edges between the two modules /
+    (size_i * size_j). ``n_cells`` is carried on the hub table so the reader can
+    still see how many cells each perturbation had.
     """
-    thr = cfg.modules.hub_lfc_threshold
-    de_mask = effect.abs() > thr
-
-    # Hub size: number of DE genes per perturbation.
+    # Hub size: number of significant DE genes per perturbation.
     hub_counts = de_mask.sum(axis=1)
     hubs = pd.DataFrame(
         {
             "target_gene": hub_counts.index,
             "module": perturbation_module.reindex(hub_counts.index).to_numpy(),
+            "n_cells": [int(n_cells.get(t, 0)) for t in hub_counts.index],
             "n_de_genes": hub_counts.to_numpy().astype(int),
         }
     ).sort_values("n_de_genes", ascending=False, ignore_index=True)
@@ -325,8 +370,8 @@ def tf_network(
         for tgt in tf_genes:
             if src == tgt:
                 continue
-            val = effect.at[src, tgt]
-            if abs(val) > thr:
+            if bool(de_mask.at[src, tgt]):
+                val = effect.at[src, tgt]
                 edges.append(
                     {
                         "source": src,
@@ -383,10 +428,12 @@ def compute_modules(expr: ad.AnnData, cfg: Config) -> Optional[ModulesResults]:
         )
         return None
 
-    effect, control = build_effect_matrix(expr, genes, targets, cfg)
+    effect, control, de_mask = build_effect_matrix(expr, genes, targets, cfg)
+    n_cells = pd.Series(expr.obs[OBS_TARGET].astype(str).value_counts())
     logger.info(
-        "modules: effect matrix %d perturbations x %d genes (log2FC vs %s)",
-        effect.shape[0], effect.shape[1], control,
+        "modules: effect matrix %d perturbations x %d genes (log2FC vs %s); "
+        "median %d significant DE genes/perturbation",
+        effect.shape[0], effect.shape[1], control, int(de_mask.sum(axis=1).median()),
     )
 
     # Programs (genes) and modules (perturbations).
@@ -406,7 +453,7 @@ def compute_modules(expr: ad.AnnData, cfg: Config) -> Optional[ModulesResults]:
     mp = module_program_strength(
         effect, gene_program, pert_module, program_labels, module_labels
     )
-    tf_edges, hubs, conn = tf_network(effect, pert_module, cfg)
+    tf_edges, hubs, conn = tf_network(effect, de_mask, pert_module, n_cells, cfg)
 
     # Per-cell program scores + program activity by cluster.
     score_columns: List[str] = []
@@ -428,18 +475,12 @@ def compute_modules(expr: ad.AnnData, cfg: Config) -> Optional[ModulesResults]:
             program_activity = act.T  # programs x clusters
             program_activity.index.name = "program"
 
-    n_cells = pd.Series(
-        expr.obs[OBS_TARGET].astype(str).value_counts()
-    )
     modules_tbl = pd.DataFrame(
         {
             "target_gene": pert_module.index,
             "module": pert_module.to_numpy(),
             "n_cells": [int(n_cells.get(t, 0)) for t in pert_module.index],
-            "n_de_genes": [
-                int((effect.loc[t].abs() > mcfg.hub_lfc_threshold).sum())
-                for t in pert_module.index
-            ],
+            "n_de_genes": [int(de_mask.loc[t].sum()) for t in pert_module.index],
         }
     ).sort_values(["module", "n_de_genes"], ascending=[True, False], ignore_index=True)
 

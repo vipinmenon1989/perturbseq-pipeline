@@ -341,8 +341,15 @@ class ModulesConfig:
     #: a program-activity-by-cluster table.
     score_programs: bool = True
     #: A gene counts as a "DE gene" of a perturbation (hub-size / network edges)
-    #: when |log2FC| exceeds this.
+    #: when |log2FC| exceeds this AND it is statistically significant at
+    #: ``de_fdr_alpha`` (per-gene Welch t-test, BH-corrected within the
+    #: perturbation). The significance gate matters: without it, low-cell-count
+    #: perturbations rack up spurious "DE genes" from noisy pseudobulk means and
+    #: masquerade as hubs (their DE-gene count anticorrelates with cell number).
     hub_lfc_threshold: float = 0.5
+    #: BH-FDR cutoff for calling a gene differentially expressed under a
+    #: perturbation (used for hub sizes and the TF network, not the clustering).
+    de_fdr_alpha: float = 0.05
     #: Draw the module-module and TF-hub network graphs (needs the ``networkx``
     #: extra: ``pip install -e ".[networks]"``). The connectivity heatmap is drawn
     #: regardless.
@@ -672,6 +679,8 @@ class Config:
                 "modules.linkage_method must be a scipy linkage method "
                 f"(average/complete/single/ward/weighted; got {m.linkage_method!r})"
             )
+        if not 0 < m.de_fdr_alpha < 1:
+            raise ValueError("modules.de_fdr_alpha must be in (0, 1)")
         for fld in ("n_programs", "n_modules"):
             val = getattr(m, fld)
             if val is not None and val < 2:

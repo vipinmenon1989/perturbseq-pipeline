@@ -30,6 +30,7 @@ def _planted_adata(
     n_noise_genes: int = 20,
     cells_per_pert: int = 40,
     n_ntc: int = 60,
+    add_noise_pert: int = 0,
     seed: int = 0,
 ):
     """AnnData where group g's perturbations raise gene-block g and lower the rest."""
@@ -61,6 +62,14 @@ def _planted_adata(
                 rows.append(_cell(grp, +1))
                 targets.append(name)
                 klass.append(CLASS_TARGETING)
+    # A low-cell-count perturbation with NO real effect (baseline, like NTC). A
+    # hub metric gated only on |log2FC| would still flag many "DE genes" for it
+    # from noise; the significance gate must not.
+    for _ in range(add_noise_pert):
+        v = rng.normal(1.0, 0.15, size=len(genes))
+        rows.append(np.clip(v, 0, None))
+        targets.append("PN")
+        klass.append(CLASS_TARGETING)
     for _ in range(n_ntc):  # NTC: flat baseline
         v = rng.normal(1.0, 0.15, size=len(genes))
         rows.append(np.clip(v, 0, None))
@@ -128,6 +137,26 @@ def test_modules_skips_when_underpowered():
     adata, _ = _planted_adata(n_module_groups=1, perts_per_group=3)
     cfg = _cfg(n_programs=2, n_modules=2, min_perturbations=5)
     assert compute_modules(adata, cfg) is None
+
+
+def test_hub_de_genes_are_significance_gated():
+    """A low-cell-count perturbation with no real effect must not become a hub.
+
+    Guards the cell-count confound: hub size is the number of genes that are BOTH
+    large AND significant, so noise from a small group cannot inflate it.
+    """
+    adata, _ = _planted_adata(add_noise_pert=12)
+    res = compute_modules(adata, _cfg(n_programs=2, n_modules=3, min_cells_per_perturbation=10))
+    assert res is not None
+    assert "n_cells" in res.hubs.columns, "hub table must expose n_cells"
+
+    hubs = res.hubs.set_index("target_gene")
+    assert hubs.loc["PN", "n_cells"] == 12
+    # The no-effect, low-n perturbation must have essentially no DE genes...
+    assert hubs.loc["PN", "n_de_genes"] <= 2, hubs.loc["PN", "n_de_genes"]
+    # ...while the genuine perturbations show a large DE footprint.
+    real = [f"P0_{p}" for p in range(3)] + [f"P1_{p}" for p in range(3)]
+    assert max(int(hubs.loc[r, "n_de_genes"]) for r in real) >= 10
 
 
 def test_module_program_strength_is_signed():

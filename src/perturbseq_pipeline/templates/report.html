@@ -443,6 +443,13 @@
 <div class="scroll">{{ tables.module_program_strength }}</div>
 
 <h3>7.5 Hub transcription factors</h3>
+<div class="note">
+  Hub size (<code>n_de_genes</code>) is the number of genes a perturbation changes
+  <b>significantly</b> (|log2FC| &gt; threshold <b>and</b> BH-FDR &lt; cutoff), not just by
+  effect size — this keeps a low-cell-count perturbation from looking like a hub on noise alone.
+  It is still not a pure centrality measure: read it alongside <code>n_cells</code> (shown), since
+  perturbations with more cells have more power to call DE genes.
+</div>
 <div class="scroll">{{ tables.tf_hubs }}</div>
 
 {% if modules_extras %}
