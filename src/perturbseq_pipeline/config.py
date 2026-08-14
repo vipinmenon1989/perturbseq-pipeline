@@ -291,6 +291,77 @@ class EnrichmentConfig:
 
 
 @dataclass
+class ModulesConfig:
+    """Co-functional modules and gene programs (the "regulome" map).
+
+    Reimplements the network analysis of Chen et al. (Nature 2023,
+    s41586-023-06733-x): build a perturbation x gene matrix of log2FC vs control,
+    then cluster the perturbations into **co-functional modules** and the genes
+    into **co-regulated programs**, and relate the two.
+
+    The effect values are a pseudobulk mean-difference log2FC (the same quantity
+    the paper reports as log2FC, computed like the perturbation test); gene
+    *selection* uses ``rank_genes_groups`` on the cell-state clusters. Cluster
+    counts are a chosen parameter: programs/modules are labelled numerically
+    (``P1..``/``M1..``), never given biological names.
+    """
+
+    enabled: bool = True
+    #: ``obs`` column of cell-state clusters whose markers define the gene panel.
+    cluster_key: str = "leiden"
+    #: How the downstream gene panel is chosen. ``cluster_markers`` = union of the
+    #: top markers of each cluster (the paper's approach); ``hvg`` = highly
+    #: variable genes.
+    gene_selection: str = "cluster_markers"
+    #: Top markers per cluster (ranked by log2FC) to union into the gene panel.
+    n_marker_genes_per_cluster: int = 100
+    #: ``rank_genes_groups`` method for marker selection.
+    marker_method: str = "wilcoxon"
+    #: Perturbations (target genes) with fewer assigned cells are excluded from
+    #: the effect matrix (paper used 48; lowered so single small lanes still run).
+    min_cells_per_perturbation: int = 20
+    #: Control the effect is measured against: ``ntc`` (preferred) or ``other``.
+    #: Falls back to ``other`` when the dataset has no non-targeting guides; the
+    #: control actually used is recorded in the results and report.
+    control: str = "ntc"
+    #: Correlation for clustering the gene (program) axis and the perturbation
+    #: (module) axis. The paper used Pearson for programs, Spearman for modules.
+    program_correlation: str = "pearson"
+    module_correlation: str = "spearman"
+    #: ``scipy`` linkage method for the hierarchical clustering (paper unspecified).
+    linkage_method: str = "average"
+    #: Number of programs / modules. Set either to ``null`` to cut the dendrogram
+    #: at ``cluster_distance_threshold`` instead of a fixed count.
+    n_programs: Optional[int] = 4
+    n_modules: Optional[int] = 9
+    #: Distance (1 - correlation) at which to cut the dendrogram when the count is
+    #: ``null``; ignored when a fixed count is given.
+    cluster_distance_threshold: Optional[float] = 0.7
+    #: Score every cell for each program (``sc.tl.score_genes``) → obs columns and
+    #: a program-activity-by-cluster table.
+    score_programs: bool = True
+    #: A gene counts as a "DE gene" of a perturbation (hub-size / network edges)
+    #: when |log2FC| exceeds this AND it is statistically significant at
+    #: ``de_fdr_alpha`` (per-gene Welch t-test, BH-corrected within the
+    #: perturbation). The significance gate matters: without it, low-cell-count
+    #: perturbations rack up spurious "DE genes" from noisy pseudobulk means and
+    #: masquerade as hubs (their DE-gene count anticorrelates with cell number).
+    hub_lfc_threshold: float = 0.5
+    #: BH-FDR cutoff for calling a gene differentially expressed under a
+    #: perturbation (used for hub sizes and the TF network, not the clustering).
+    de_fdr_alpha: float = 0.05
+    #: Draw the module-module and TF-hub network graphs (needs the ``networkx``
+    #: extra: ``pip install -e ".[networks]"``). The connectivity heatmap is drawn
+    #: regardless.
+    draw_networks: bool = True
+    #: Skip the whole stage when fewer than this many perturbations / genes remain
+    #: (the map is meaningless when underpowered — e.g. a single small lane).
+    min_perturbations: int = 5
+    min_genes: int = 10
+    top_n_report: int = 12
+
+
+@dataclass
 class PSScoreConfig:
     """Per-cell perturbation-response scores, via the ``pertps`` package.
 
@@ -465,6 +536,7 @@ class Config:
     cluster: ClusterConfig = field(default_factory=ClusterConfig)
     perturbation: PerturbationConfig = field(default_factory=PerturbationConfig)
     enrichment: EnrichmentConfig = field(default_factory=EnrichmentConfig)
+    modules: ModulesConfig = field(default_factory=ModulesConfig)
     ps_score: PSScoreConfig = field(default_factory=PSScoreConfig)
     lochness: LochnessConfig = field(default_factory=LochnessConfig)
     report: ReportConfig = field(default_factory=ReportConfig)
@@ -585,6 +657,39 @@ class Config:
             )
         if not 0 < self.enrichment.fdr_alpha < 1:
             raise ValueError("enrichment.fdr_alpha must be in (0, 1)")
+
+        m = self.modules
+        if m.control not in valid_controls:
+            raise ValueError(
+                f"modules.control must be one of {sorted(valid_controls)} (got {m.control!r})"
+            )
+        if m.gene_selection not in ("cluster_markers", "hvg"):
+            raise ValueError(
+                "modules.gene_selection must be 'cluster_markers' or 'hvg' "
+                f"(got {m.gene_selection!r})"
+            )
+        for fld in ("program_correlation", "module_correlation"):
+            val = getattr(m, fld)
+            if val not in ("pearson", "spearman"):
+                raise ValueError(
+                    f"modules.{fld} must be 'pearson' or 'spearman' (got {val!r})"
+                )
+        if m.linkage_method not in ("average", "complete", "single", "ward", "weighted"):
+            raise ValueError(
+                "modules.linkage_method must be a scipy linkage method "
+                f"(average/complete/single/ward/weighted; got {m.linkage_method!r})"
+            )
+        if not 0 < m.de_fdr_alpha < 1:
+            raise ValueError("modules.de_fdr_alpha must be in (0, 1)")
+        for fld in ("n_programs", "n_modules"):
+            val = getattr(m, fld)
+            if val is not None and val < 2:
+                raise ValueError(f"modules.{fld} must be >= 2 or null (got {val!r})")
+            if val is None and m.cluster_distance_threshold is None:
+                raise ValueError(
+                    f"modules.{fld} is null but modules.cluster_distance_threshold "
+                    "is also null; set one so the dendrogram can be cut."
+                )
 
         if self.lochness.n_neighbors < 2:
             raise ValueError("lochness.n_neighbors must be at least 2")

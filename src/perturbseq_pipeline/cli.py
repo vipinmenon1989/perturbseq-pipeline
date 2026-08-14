@@ -117,6 +117,7 @@ def run_pipeline(cfg: Config, verbose: bool = False) -> PipelineResult:
     from . import guides as guides_mod
     from . import io as io_mod
     from . import lochness as loch_mod
+    from . import modules as modules_mod
     from . import perturbation as pert_mod
     from . import plots as plots_mod
     from . import ps_score as ps_mod
@@ -131,13 +132,13 @@ def run_pipeline(cfg: Config, verbose: bool = False) -> PipelineResult:
     warnings: List[str] = []
 
     # --- 1. load ----------------------------------------------------------
-    logger.info("=== Stage 1/10: loading input ===")
+    logger.info("=== Stage 1/11: loading input ===")
     data = io_mod.load_data(cfg)
     expr, guides = data.expr, data.guides
     n_cells_input = expr.n_obs
 
     # --- 2. QC ------------------------------------------------------------
-    logger.info("=== Stage 2/10: quality control ===")
+    logger.info("=== Stage 2/11: quality control ===")
     expr = qc_mod.prefilter(expr, cfg)
     expr = qc_mod.compute_qc_metrics(expr, cfg)
     plots_mod.plot_qc(expr, registry, stage="before filtering")
@@ -147,7 +148,7 @@ def run_pipeline(cfg: Config, verbose: bool = False) -> PipelineResult:
     tables["qc_summary"] = qc_mod.qc_summary_table(expr)
 
     # --- 3. guide assignment ---------------------------------------------
-    logger.info("=== Stage 3/10: guide assignment ===")
+    logger.info("=== Stage 3/11: guide assignment ===")
     expr = guides_mod.assign_guides(expr, guides, cfg)
     tables["guide_qc"] = qc_mod.guide_qc_summary(expr, cfg)
     tables["guide_assignment"] = guides_mod.assignment_summary(expr, cfg)
@@ -160,7 +161,7 @@ def run_pipeline(cfg: Config, verbose: bool = False) -> PipelineResult:
     plots_mod.plot_guide_qc(expr, guides, registry, cfg)
 
     # --- 4. clustering ----------------------------------------------------
-    logger.info("=== Stage 4/10: normalization, embedding, clustering ===")
+    logger.info("=== Stage 4/11: normalization, embedding, clustering ===")
     expr = cluster_mod.normalize(expr, cfg)
 
     # With cluster.assigned_only the run embeds twice. The first pass covers
@@ -216,7 +217,7 @@ def run_pipeline(cfg: Config, verbose: bool = False) -> PipelineResult:
     plots_mod.plot_clustering(expr, registry, cfg)
 
     # --- 5. perturbation strength ----------------------------------------
-    logger.info("=== Stage 5/10: perturbation strength ===")
+    logger.info("=== Stage 5/11: perturbation strength ===")
     results = pert_mod.test_all_targets(expr, cfg)
     tables["perturbation"] = pert_mod.format_results_table(results, cfg)
     tables["perturbation_full"] = results.table
@@ -227,7 +228,7 @@ def run_pipeline(cfg: Config, verbose: bool = False) -> PipelineResult:
     # --- 6. cluster enrichment -------------------------------------------
     enrichment = None
     if cfg.enrichment.enabled:
-        logger.info("=== Stage 6/10: perturbation enrichment across clusters ===")
+        logger.info("=== Stage 6/11: perturbation enrichment across clusters ===")
         enrichment = enrich_mod.test_cluster_enrichment(expr, cfg)
         tables["enrichment"] = enrich_mod.format_enrichment_table(enrichment)
         tables["enrichment_full"] = enrichment.table
@@ -240,8 +241,38 @@ def run_pipeline(cfg: Config, verbose: bool = False) -> PipelineResult:
     else:
         logger.info("Cluster enrichment disabled (enrichment.enabled: false)")
 
-    # --- 7. per-cell perturbation scores (pertps / PS_python) -------------
-    logger.info("=== Stage 7/10: per-cell perturbation scores ===")
+    # --- 7. co-functional modules & gene programs ------------------------
+    modules_result = None
+    if cfg.modules.enabled:
+        logger.info("=== Stage 7/11: co-functional modules & gene programs ===")
+        modules_result = modules_mod.compute_modules(expr, cfg)
+        if modules_result is not None:
+            tables["effect_matrix"] = modules_result.effect_matrix.reset_index(
+                names="target_gene"
+            )
+            tables["gene_programs"] = modules_result.gene_programs
+            tables["cofunctional_modules"] = modules_result.modules
+            tables["module_program_strength"] = modules_result.module_program.reset_index(
+                names="module"
+            )
+            if not modules_result.program_activity.empty:
+                tables["program_activity_by_cluster"] = (
+                    modules_result.program_activity.reset_index()
+                )
+            if not modules_result.hubs.empty:
+                tables["tf_hubs"] = modules_result.hubs
+            if not modules_result.tf_edges.empty:
+                tables["tf_edges"] = modules_result.tf_edges
+            if not modules_result.module_connectivity.empty:
+                tables["module_connectivity"] = (
+                    modules_result.module_connectivity.reset_index(names="module")
+                )
+            plots_mod.plot_modules(expr, modules_result, registry, cfg)
+    else:
+        logger.info("Modules/programs disabled (modules.enabled: false)")
+
+    # --- 8. per-cell perturbation scores (pertps / PS_python) -------------
+    logger.info("=== Stage 8/11: per-cell perturbation scores ===")
     ps_results = ps_mod.compute_ps_scores(expr, cfg)
     if ps_results is not None and not ps_results.summary.empty:
         expr = ps_mod.attach_scores(expr, ps_results)
@@ -267,7 +298,7 @@ def run_pipeline(cfg: Config, verbose: bool = False) -> PipelineResult:
     # --- 8. lochNESS ------------------------------------------------------
     lochness = None
     if cfg.lochness.enabled:
-        logger.info("=== Stage 8/10: lochNESS neighbourhood enrichment ===")
+        logger.info("=== Stage 9/11: lochNESS neighbourhood enrichment ===")
         lochness = loch_mod.compute_lochness(expr, cfg)
         if lochness is not None and not lochness.summary.empty:
             expr = loch_mod.attach_scores(expr, lochness)
@@ -285,7 +316,7 @@ def run_pipeline(cfg: Config, verbose: bool = False) -> PipelineResult:
         logger.info("lochNESS disabled (lochness.enabled: false)")
 
     # --- 9. write deliverables -------------------------------------------
-    logger.info("=== Stage 9/10: writing outputs ===")
+    logger.info("=== Stage 10/11: writing outputs ===")
     tabledir = outdir / "tables"
     tabledir.mkdir(parents=True, exist_ok=True)
     table_paths: Dict[str, Path] = {}
@@ -316,7 +347,7 @@ def run_pipeline(cfg: Config, verbose: bool = False) -> PipelineResult:
         )
 
     # --- 10. report --------------------------------------------------------
-    logger.info("=== Stage 10/10: building report ===")
+    logger.info("=== Stage 11/11: building report ===")
     n_hits = len(results.hits) if not results.table.empty else 0
     outputs = {
         "Processed h5ad": str(h5ad_path),
@@ -341,6 +372,7 @@ def run_pipeline(cfg: Config, verbose: bool = False) -> PipelineResult:
         registry=registry,
         perturbation=results,
         enrichment=enrichment,
+        modules=modules_result,
         ps=ps_results,
         lochness=lochness,
         tables=tables,
