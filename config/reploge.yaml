@@ -1,0 +1,35 @@
+run:
+  name: ReplogleWeissman2022_K562_essential
+  outdir: results/replogle
+
+input:
+  mode: h5ad
+  h5ad: ../data/ReplogleWeissman2022_K562_essential.h5ad
+  guide_obs_column: gene
+
+guides:
+  target_split_delims: []
+
+qc:
+  min_genes_per_cell: null
+  min_cells_per_gene: null
+  min_genes_final: null
+  max_pct_mt: null
+  max_pct_hb: null
+  min_counts_per_cell: null
+
+cluster:
+  batch_key: batch
+
+ps_score:
+  enabled: false
+
+modules:
+  enabled: false
+
+lochness:
+  enabled: false
+
+output:
+  write_unfiltered_h5ad: false
+  archive: false
