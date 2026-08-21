@@ -97,17 +97,6 @@ NEIGHBORS_KEY = "lochness_nn"
 
 # ---------------------------------------------------------------------------
 # Scalability safeguards
-# ---------------------------------------------------------------------------
-
-# Either threshold activates self-score-only mode.
-#
-# The target threshold is deliberately separate from the cell threshold:
-# even a few hundred thousand cells can become expensive when thousands of
-# perturbations would otherwise be materialised.
-LARGE_DATASET_N_CELLS = 500_000
-LARGE_DATASET_N_TARGETS = 1_000
-
-
 @dataclass
 class LochnessResults:
     """Per-cell lochNESS scores and their per-target summaries."""
@@ -844,10 +833,10 @@ def compute_lochness(
     )
 
     large_mode = (
-        expr.n_obs
-        >= LARGE_DATASET_N_CELLS
-        or n_targets
-        >= LARGE_DATASET_N_TARGETS
+        cfg.use_large_mode(
+            expr.n_obs,
+            n_perturbations=n_targets,
+        )
     )
 
     logger.info(

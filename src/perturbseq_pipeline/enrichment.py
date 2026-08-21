@@ -97,20 +97,6 @@ from .perturbation import (
 logger = logging.getLogger(__name__)
 
 
-# ---------------------------------------------------------------------------
-# Large-dataset thresholds
-# ---------------------------------------------------------------------------
-
-# Either condition activates the aggregated implementation.
-#
-# Replogle (~310k cells) therefore keeps the original path unless its target
-# count is extremely large. KOLF (~2.66M cells) automatically enters large
-# mode.
-LARGE_DATASET_N_CELLS = 1_000_000
-
-# Target count can independently make repeated cell-level masking expensive.
-LARGE_DATASET_N_TARGETS = 5_000
-
 # The omnibus permutation is a global exploratory diagnostic. It does not
 # determine the pairwise Fisher/CMH significance calls.
 LARGE_DATASET_MAX_OMNIBUS_PERMUTATIONS = 100
@@ -241,18 +227,6 @@ def _odds_ratio(
             (b + pseudo)
             * (c + pseudo)
         )
-    )
-
-
-def _is_large_dataset(
-    n_cells: int,
-    n_targets: int,
-) -> bool:
-    """Determine automatically whether aggregated execution is required."""
-
-    return (
-        n_cells >= LARGE_DATASET_N_CELLS
-        or n_targets >= LARGE_DATASET_N_TARGETS
     )
 
 
@@ -2513,9 +2487,9 @@ def test_cluster_enrichment(
         ).sum()
     )
 
-    large_mode = _is_large_dataset(
+    large_mode = cfg.use_large_mode(
         expr.n_obs,
-        n_testable_targets,
+        n_perturbations=n_testable_targets,
     )
 
     logger.info(
@@ -2527,10 +2501,10 @@ def test_cluster_enrichment(
     if large_mode:
 
         logger.info(
-            "Large-dataset enrichment mode automatically selected "
-            "(thresholds: >=%d cells or >=%d targets)",
-            LARGE_DATASET_N_CELLS,
-            LARGE_DATASET_N_TARGETS,
+            "Large-dataset enrichment mode selected "
+            "(%d cells, %d targets)",
+            expr.n_obs,
+            n_testable_targets,
         )
 
         return _test_cluster_enrichment_large(

@@ -92,27 +92,6 @@ logger = logging.getLogger(__name__)
 _PSEUDO = 1e-9
 
 
-# ---------------------------------------------------------------------------
-# Adaptive execution thresholds
-# ---------------------------------------------------------------------------
-
-# Replogle (~310k cells) therefore remains STANDARD.
-# KOLF (~2.66m cells) automatically becomes LARGE.
-LARGE_DATASET_N_CELLS = 1_000_000
-
-# A very large perturbation collection can independently trigger LARGE mode.
-LARGE_DATASET_N_PERTURBATIONS = 5_000
-
-# Marker discovery does not need all 2.6m cells. The final effect matrix still
-# uses every cell.
-LARGE_MARKER_MAX_CELLS = 200_000
-
-# Number of selected genes processed at once when constructing sufficient
-# statistics in LARGE mode.
-#
-# 256 is conservative. Increasing to 512 may be faster on a high-memory node.
-LARGE_EFFECT_GENE_CHUNK = 256
-
 # Internal matrices produced after aggregation are small enough for float64,
 # which also preserves numerical agreement with the STANDARD implementation.
 LARGE_EFFECT_DTYPE = np.float64
@@ -176,29 +155,6 @@ class ModulesResults:
     execution_mode: str = "standard"
 
     note: str = ""
-
-
-# ---------------------------------------------------------------------------
-# Execution mode
-# ---------------------------------------------------------------------------
-
-
-def _is_large_dataset(
-    expr: ad.AnnData,
-    n_perturbations: Optional[int] = None,
-) -> bool:
-    """Automatically choose the scalable implementation."""
-
-    if expr.n_obs >= LARGE_DATASET_N_CELLS:
-        return True
-
-    if (
-        n_perturbations is not None
-        and n_perturbations >= LARGE_DATASET_N_PERTURBATIONS
-    ):
-        return True
-
-    return False
 
 
 # ---------------------------------------------------------------------------
@@ -693,7 +649,7 @@ def _select_genes_large(
         _stratified_marker_sample(
             expr,
             key,
-            LARGE_MARKER_MAX_CELLS,
+            cfg.scaling.marker_max_cells,
             cfg.run.seed,
         )
     )
@@ -786,7 +742,6 @@ def _select_genes_large(
         )
 
     del sample
-
     gc.collect()
 
     seen: Dict[
@@ -809,6 +764,74 @@ def _select_genes_large(
 
     selected = list(
         seen
+    )
+
+    return selected
+
+
+def _select_genes_large(
+    expr: ad.AnnData,
+    cfg: Config,
+) -> List[str]:
+    """Scalable candidate-gene selection for large perturbation screens."""
+
+    mcfg = (
+        cfg.modules
+    )
+
+    selected: List[
+        str
+    ] = []
+
+    if (
+        mcfg.use_hvg
+        and "highly_variable"
+        in expr.var
+    ):
+
+        selected.extend(
+            expr.var_names[
+                expr.var[
+                    "highly_variable"
+                ]
+                .to_numpy()
+            ].tolist()
+        )
+
+    if (
+        mcfg.use_cluster_markers
+        and CLUSTER_KEY
+        in expr.obs
+    ):
+
+        selected.extend(
+            _select_markers_large(
+                expr,
+                CLUSTER_KEY,
+                mcfg.n_markers_per_group,
+                cfg,
+            )
+        )
+
+    if (
+        mcfg.use_perturbation_markers
+        and OBS_TARGET
+        in expr.obs
+    ):
+
+        selected.extend(
+            _select_markers_large(
+                expr,
+                OBS_TARGET,
+                mcfg.n_markers_per_group,
+                cfg,
+            )
+        )
+
+    selected = sorted(
+        set(
+            selected
+        )
     )
 
     logger.info(
@@ -834,8 +857,8 @@ def select_genes(
     if large_mode is None:
 
         large_mode = (
-            _is_large_dataset(
-                expr
+            cfg.use_large_mode(
+                expr.n_obs
             )
         )
 
@@ -1602,7 +1625,7 @@ def _build_effect_matrix_large(
         "in chunks of %d genes",
         n_targets,
         n_genes,
-        LARGE_EFFECT_GENE_CHUNK,
+        cfg.scaling.effect_gene_chunk,
     )
 
     indicator, n_p = (
@@ -1686,15 +1709,17 @@ def _build_effect_matrix_large(
         targeting_mask.sum()
     )
 
+    gene_chunk = cfg.scaling.effect_gene_chunk
+
     for start in range(
         0,
         n_genes,
-        LARGE_EFFECT_GENE_CHUNK,
+        gene_chunk,
     ):
 
         stop = min(
             start
-            + LARGE_EFFECT_GENE_CHUNK,
+            + gene_chunk,
             n_genes,
         )
 
@@ -2235,9 +2260,9 @@ def build_effect_matrix(
     """Build perturbation x gene effect matrix using adaptive execution."""
 
     large_mode = (
-        _is_large_dataset(
-            expr,
-            len(
+        cfg.use_large_mode(
+            expr.n_obs,
+            n_perturbations=len(
                 targets
             ),
         )
@@ -2935,17 +2960,20 @@ def compute_modules(
 
         return None
 
-    large_mode = _is_large_dataset(
-        expr,
-        len(
+    large_mode = cfg.use_large_mode(
+        expr.n_obs,
+        n_perturbations=len(
             targets
         ),
     )
 
     execution_mode = (
-        "large"
-        if large_mode
-        else "standard"
+        cfg.execution_mode(
+            expr.n_obs,
+            n_perturbations=len(
+                targets
+            ),
+        )
     )
 
     logger.info(
@@ -3220,7 +3248,7 @@ def compute_modules(
         else (
             "LARGE mode: marker discovery used a bounded cluster-stratified "
             "cell sample; perturbation effects used all cells through sparse, "
-            f"{LARGE_EFFECT_GENE_CHUNK}-gene chunked sufficient statistics."
+            f"{cfg.scaling.effect_gene_chunk}-gene chunked sufficient statistics."
         )
     )
 

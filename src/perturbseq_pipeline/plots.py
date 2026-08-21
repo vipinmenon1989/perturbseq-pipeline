@@ -326,8 +326,12 @@ class FigureRegistry:
 def _is_large_plot_dataset(
     expr,
     n_targets: Optional[int] = None,
+    cfg: Optional[Config] = None,
 ) -> bool:
     """Return True when bounded plotting should be used."""
+
+    if cfg is not None:
+        return cfg.use_large_mode(expr.n_obs, n_perturbations=n_targets)
 
     return (
         expr.n_obs
@@ -6001,7 +6005,120 @@ def plot_lochness(
     )
 
     # --------------------------------------------------------------
-    # 2. target × cluster heatmap
+    # 2. score distribution per target (standard mode only)
+    # --------------------------------------------------------------
+
+    if not large_mode and results.scores:
+
+        top = list(
+            summary[
+                "target_gene"
+            ].head(
+                30
+            )
+        )
+
+        top_available = [
+            g
+            for g
+            in top
+            if g
+            in results.scores
+        ]
+
+        if top_available:
+
+            long_df = pd.DataFrame(
+                {
+                    "lochNESS": np.concatenate(
+                        [
+                            results.scores[
+                                g
+                            ]
+                            for g
+                            in top_available
+                        ]
+                    ),
+                    "target": np.concatenate(
+                        [
+                            [g]
+                            * len(
+                                results.scores[
+                                    g
+                                ]
+                            )
+                            for g
+                            in top_available
+                        ]
+                    ),
+                }
+            )
+
+            fig, ax = plt.subplots(
+                figsize=(
+                    max(
+                        6,
+                        0.34
+                        * len(
+                            top_available
+                        ),
+                    ),
+                    4.2,
+                )
+            )
+
+            sns.violinplot(
+                data=long_df,
+                x="target",
+                y="lochNESS",
+                ax=ax,
+                cut=0,
+                inner=None,
+                linewidth=0.5,
+                order=top_available,
+            )
+
+            ax.axhline(
+                0,
+                color="black",
+                lw=0.8,
+            )
+
+            ax.tick_params(
+                axis="x",
+                rotation=90,
+                labelsize=6,
+            )
+
+            ax.set_xlabel(
+                ""
+            )
+
+            ax.set_title(
+                "lochNESS across all cells, per perturbation (top 30)",
+                fontsize=10,
+            )
+
+            sns.despine(
+                ax=ax
+            )
+
+            fig.tight_layout()
+
+            reg.save(
+                fig,
+                "lochness_distributions",
+                SECTION_LOCHNESS,
+                "lochNESS distribution per perturbation",
+                (
+                    "Each violin is one perturbation's score across every cell. "
+                    "A long upper tail means a subset of the manifold is strongly "
+                    "enriched for it, even when most cells sit at background."
+                ),
+            )
+
+    # --------------------------------------------------------------
+    # 3. target × cluster heatmap
     # --------------------------------------------------------------
 
     if not results.by_cluster.empty:

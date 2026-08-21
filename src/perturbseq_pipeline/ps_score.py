@@ -130,24 +130,8 @@ QUADRANT_COLORS = {
 }
 
 
-# ---------------------------------------------------------------------------
-# Automatic scaling thresholds
-# ---------------------------------------------------------------------------
-
-# Replogle (~310k) remains standard.
-# KOLF (~2.66M) automatically enters large mode.
-LARGE_DATASET_N_CELLS = 1_000_000
-
-# A very large perturbation collection can independently trigger large mode.
-LARGE_DATASET_N_TARGETS = 5_000
-
 # Maximum NTC cells passed to one PS_python target-specific analysis.
-#
-# The perturbed population is NEVER sampled here: all target cells are retained.
 LARGE_PS_MAX_CONTROLS = 50_000
-
-# Optional large-data LDA visualization is restricted to this many cells.
-LARGE_LDA_MAX_CELLS = 150_000
 
 
 class PertpsUnavailable(RuntimeError):
@@ -250,18 +234,6 @@ def _pertps_version() -> str:
 # ---------------------------------------------------------------------------
 # Generic helpers
 # ---------------------------------------------------------------------------
-
-
-def _is_large_dataset(
-    n_cells: int,
-    n_targets: int,
-) -> bool:
-    """Automatically determine execution mode."""
-
-    return (
-        n_cells >= LARGE_DATASET_N_CELLS
-        or n_targets >= LARGE_DATASET_N_TARGETS
-    )
 
 
 def _expression_layer(
@@ -1982,7 +1954,7 @@ def _compute_ps_scores_large(
             "Large-dataset mode: full PS_python LDA/UMAP was skipped because "
             "the upstream implementation scales and densifies its working "
             "matrix. Build the visualization on a bounded representative "
-            f"subset (recommended <= {LARGE_LDA_MAX_CELLS:,} cells)."
+            f"subset (recommended <= {pcfg.lda_large_max_cells:,} cells)."
         )
 
         logger.warning(
@@ -2370,9 +2342,9 @@ def compute_ps_scores(
         ).sum()
     )
 
-    large_mode = _is_large_dataset(
+    large_mode = cfg.use_large_mode(
         expr.n_obs,
-        n_testable_targets,
+        n_perturbations=n_testable_targets,
     )
 
     logger.info(
@@ -2384,10 +2356,10 @@ def compute_ps_scores(
     if large_mode:
 
         logger.info(
-            "Large-dataset PS mode automatically selected "
-            "(thresholds: >=%d cells or >=%d targets)",
-            LARGE_DATASET_N_CELLS,
-            LARGE_DATASET_N_TARGETS,
+            "Large-dataset PS mode selected "
+            "(%d cells, %d targets)",
+            expr.n_obs,
+            n_testable_targets,
         )
 
         return _compute_ps_scores_large(

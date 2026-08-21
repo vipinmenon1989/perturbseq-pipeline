@@ -86,36 +86,6 @@ CLASS_AMBIGUOUS = "ambiguous"
 CLASS_UNASSIGNED = "unassigned"
 
 
-# ---------------------------------------------------------------------------
-# Large-data thresholds
-# ---------------------------------------------------------------------------
-
-# Replogle (~310k cells) therefore remains on standard behaviour.
-# KOLF (~2.66m cells) automatically uses large-data behaviour.
-LARGE_DATASET_N_CELLS = 1_000_000
-
-# Standard dense-chunk implementation.
-STANDARD_TOP2_CHUNK_SIZE = 20_000
-
-# A dense block above this many elements is avoided even below one million
-# cells. This protects datasets with unusually large guide libraries.
-MAX_DENSE_GUIDE_BLOCK_ELEMENTS = 20_000_000
-
-
-# ---------------------------------------------------------------------------
-# Execution-mode helper
-# ---------------------------------------------------------------------------
-
-
-def _is_large_dataset(
-    expr: ad.AnnData,
-) -> bool:
-    """Return True when memory-aware guide handling should be used."""
-
-    return (
-        expr.n_obs
-        >= LARGE_DATASET_N_CELLS
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -356,7 +326,7 @@ def _is_non_targeting_unique(
 
 def _top_two_guides_dense_chunked(
     X,
-    chunk_size: int = STANDARD_TOP2_CHUNK_SIZE,
+    chunk_size: int = 20_000,
 ) -> Tuple[
     np.ndarray,
     np.ndarray,
@@ -968,7 +938,8 @@ def _detected_guides_csr(
 
 def top_two_guides(
     X,
-    chunk_size: int = STANDARD_TOP2_CHUNK_SIZE,
+    chunk_size: int = 20_000,
+    max_dense_elements: int = 20_000_000,
     *,
     force_sparse: bool = False,
 ) -> Tuple[
@@ -995,15 +966,13 @@ def top_two_guides(
         )
         and (
             force_sparse
-            or n_obs
-            >= LARGE_DATASET_N_CELLS
             or (
                 chunk_size
                 * max(
                     n_vars,
                     1,
                 )
-                > MAX_DENSE_GUIDE_BLOCK_ELEMENTS
+                > max_dense_elements
             )
         )
     )
@@ -1093,8 +1062,8 @@ def _assign_from_matrix(
     )
 
     large_mode = (
-        _is_large_dataset(
-            expr
+        cfg.use_large_mode(
+            expr.n_obs
         )
     )
 
@@ -1221,7 +1190,9 @@ def _assign_from_matrix(
             top_val,
             second_val,
         ) = top_two_guides(
-            X
+            X,
+            chunk_size=cfg.scaling.guide_chunk_size,
+            max_dense_elements=cfg.scaling.guide_max_dense_elements,
         )
 
         total = np.asarray(
@@ -1456,8 +1427,8 @@ def _assign_from_labels(
         )
 
     large_mode = (
-        _is_large_dataset(
-            expr
+        cfg.use_large_mode(
+            expr.n_obs
         )
     )
 

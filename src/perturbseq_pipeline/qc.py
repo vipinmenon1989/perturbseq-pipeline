@@ -85,13 +85,6 @@ CELL_QC_METRICS = [
 ]
 
 
-# ---------------------------------------------------------------------------
-# Large-dataset settings
-# ---------------------------------------------------------------------------
-
-LARGE_DATASET_N_CELLS = 1_000_000
-
-
 # QC columns sufficient for most downstream reporting/filtering.
 _REQUIRED_CELL_QC = {
     "n_genes_by_counts",
@@ -105,17 +98,6 @@ _REQUIRED_CELL_QC = {
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
-
-
-def _is_large_dataset(
-    expr: ad.AnnData,
-) -> bool:
-    """Return True when memory-aware QC should be used."""
-
-    return (
-        expr.n_obs
-        >= LARGE_DATASET_N_CELLS
-    )
 
 
 def _has_existing_qc_metrics(
@@ -257,8 +239,8 @@ def compute_qc_metrics(
     )
 
     large_mode = (
-        _is_large_dataset(
-            expr
+        cfg.use_large_mode(
+            expr.n_obs
         )
     )
 
@@ -907,8 +889,8 @@ def filter_cells_and_genes(
     implementation and the large-data memory-aware implementation.
     """
 
-    if _is_large_dataset(
-        expr
+    if cfg.use_large_mode(
+        expr.n_obs
     ):
 
         logger.info(

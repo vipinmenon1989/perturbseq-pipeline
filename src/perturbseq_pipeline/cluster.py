@@ -40,23 +40,6 @@ LOGNORM_LAYER = "lognorm"
 CLUSTER_KEY = "leiden"
 
 
-# ---------------------------------------------------------------------
-# Large dataset settings
-# ---------------------------------------------------------------------
-
-# Above this number of cells, switch to memory-aware behaviour.
-LARGE_DATASET_N_CELLS = 500_000
-
-# Number of cells used to estimate HVGs in a very large dataset.
-# 200k is already far more than is usually necessary for stable HVG ranking.
-HVG_SAMPLE_N_CELLS = 200_000
-
-
-def _is_large_dataset(expr: ad.AnnData) -> bool:
-    """Return True when the AnnData should use memory-aware processing."""
-    return expr.n_obs >= LARGE_DATASET_N_CELLS
-
-
 def normalize(expr: ad.AnnData, cfg: Config) -> ad.AnnData:
     """Library-size normalize and log1p-transform while preserving raw counts.
 
@@ -66,7 +49,7 @@ def normalize(expr: ad.AnnData, cfg: Config) -> ad.AnnData:
     This is critical for matrices containing millions of cells.
     """
 
-    is_large = _is_large_dataset(expr)
+    is_large = cfg.use_large_mode(expr.n_obs)
 
     # --------------------------------------------------------------
     # Already normalized
@@ -166,7 +149,7 @@ def _select_hvgs(expr: ad.AnnData, cfg: Config) -> None:
     c = cfg.cluster
     n_top = min(c.n_top_genes, expr.n_vars)
 
-    if not _is_large_dataset(expr):
+    if not cfg.use_large_mode(expr.n_obs):
         sc.pp.highly_variable_genes(
             expr,
             n_top_genes=n_top,
@@ -182,7 +165,7 @@ def _select_hvgs(expr: ad.AnnData, cfg: Config) -> None:
     # --------------------------------------------------------------
     # Large dataset HVG estimation
     # --------------------------------------------------------------
-    n_sample = min(HVG_SAMPLE_N_CELLS, expr.n_obs)
+    n_sample = min(cfg.scaling.marker_max_cells, expr.n_obs)
 
     logger.info(
         "Large dataset detected: %d cells x %d genes",
@@ -449,7 +432,7 @@ def embed_and_cluster(expr: ad.AnnData, cfg: Config) -> ad.AnnData:
     #
     # For a large dataset, avoid another enormous copy.
     if LOGNORM_LAYER in expr.layers:
-        if _is_large_dataset(expr):
+        if cfg.use_large_mode(expr.n_obs):
             expr.X = expr.layers[LOGNORM_LAYER]
 
             logger.info(

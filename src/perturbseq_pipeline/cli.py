@@ -56,24 +56,7 @@ logger = logging.getLogger(
 )
 
 
-# ---------------------------------------------------------------------------
-# Adaptive execution
-# ---------------------------------------------------------------------------
 
-# Replogle (~310k) stays STANDARD.
-# KOLF (~2.66M) enters LARGE mode.
-LARGE_DATASET_N_CELLS = 1_000_000
-
-
-def _is_large_dataset(
-    expr,
-) -> bool:
-    """Return True when memory-aware orchestration should be used."""
-
-    return (
-        expr.n_obs
-        >= LARGE_DATASET_N_CELLS
-    )
 
 
 # ---------------------------------------------------------------------------
@@ -221,11 +204,15 @@ def setup_logging(
 
 def _log_memory(
     label: str,
+    cfg: Optional[Config] = None,
 ) -> None:
     """Log resident memory when psutil is available.
 
     The dependency is optional; absence never affects the run.
     """
+
+    if cfg is not None and not cfg.scaling.log_memory:
+        return
 
     try:
 
@@ -253,18 +240,24 @@ def _log_memory(
 
 
 def _collect(
-    label: Optional[
-        str
-    ] = None,
+    label: Optional[str] = None,
+    cfg: Optional[Config] = None,
+    large_mode: bool = False,
 ) -> None:
     """Release unreachable Python objects between expensive stages."""
 
-    gc.collect()
+    should_collect = True
+    if cfg is not None and large_mode:
+        should_collect = cfg.scaling.collect_between_stages
+
+    if should_collect:
+        gc.collect()
 
     if label:
 
         _log_memory(
-            label
+            label,
+            cfg=cfg,
         )
 
 
@@ -517,8 +510,8 @@ def _write_unfiltered_object(
         )
 
     large_mode = (
-        _is_large_dataset(
-            expr
+        cfg.use_large_mode(
+            expr.n_obs
         )
     )
 
@@ -541,7 +534,7 @@ def _write_unfiltered_object(
 
         del work
 
-        _collect()
+        _collect(cfg=cfg, large_mode=large_mode)
 
         return io_mod.relocate_if_large(
             path,
@@ -567,22 +560,38 @@ def _write_unfiltered_object(
         else None
     )
 
+    had_names = (
+        "guide_names"
+        in expr.uns
+    )
+
     old_names = (
-        expr.uns.get(
+        expr.uns[
             "guide_names"
-        )
+        ]
+        if had_names
+        else None
+    )
+
+    had_targets = (
+        "guide_target_genes"
+        in expr.uns
     )
 
     old_targets = (
-        expr.uns.get(
+        expr.uns[
             "guide_target_genes"
-        )
+        ]
+        if had_targets
+        else None
     )
 
-    expr = io_mod.merge_guides_into_expr(
-        expr,
-        guides,
-        cfg,
+    expr = (
+        io_mod.merge_guides_into_expr(
+            expr,
+            guides,
+            cfg,
+        )
     )
 
     path = io_mod.write_h5ad(
@@ -631,7 +640,9 @@ def _write_unfiltered_object(
         ] = old_targets
 
     _collect(
-        "large all-cell h5ad write"
+        "large all-cell h5ad write",
+        cfg=cfg,
+        large_mode=large_mode,
     )
 
     return io_mod.relocate_if_large(
@@ -800,14 +811,16 @@ def run_pipeline(
         expr.n_obs
     )
 
-    large_mode = _is_large_dataset(
-        expr
+    large_mode = (
+        cfg.use_large_mode(
+            expr.n_obs
+        )
     )
 
     execution_mode = (
-        "large"
-        if large_mode
-        else "standard"
+        cfg.execution_mode(
+            expr.n_obs
+        )
     )
 
     logger.info(
@@ -818,7 +831,8 @@ def run_pipeline(
     )
 
     _log_memory(
-        "input loading"
+        "input loading",
+        cfg=cfg,
     )
 
     # =====================================================================
@@ -887,7 +901,9 @@ def run_pipeline(
     )
 
     _collect(
-        "QC"
+        "QC",
+        cfg=cfg,
+        large_mode=large_mode,
     )
 
     # =====================================================================
@@ -996,7 +1012,9 @@ def run_pipeline(
     )
 
     _collect(
-        "guide assignment"
+        "guide assignment",
+        cfg=cfg,
+        large_mode=large_mode,
     )
 
     # =====================================================================
@@ -1129,7 +1147,9 @@ def run_pipeline(
         del singlets
 
         _collect(
-            "assigned-only subset"
+            "assigned-only subset",
+            cfg=cfg,
+            large_mode=large_mode,
         )
 
     expr = cluster_mod.embed_and_cluster(
@@ -1161,7 +1181,9 @@ def run_pipeline(
     )
 
     _collect(
-        "clustering"
+        "clustering",
+        cfg=cfg,
+        large_mode=large_mode,
     )
 
     # =====================================================================
@@ -1214,6 +1236,7 @@ def run_pipeline(
         "perturbation_full",
         results.table,
         large_mode=large_mode,
+        max_rows_large=cfg.scaling.report_preview_rows,
     )
 
     if (
@@ -1226,6 +1249,7 @@ def run_pipeline(
             "skipped",
             results.skipped,
             large_mode=large_mode,
+            max_rows_large=cfg.scaling.report_preview_rows,
         )
 
     plots_mod.plot_perturbation_overview(
@@ -1242,7 +1266,9 @@ def run_pipeline(
     )
 
     _collect(
-        "perturbation strength"
+        "perturbation strength",
+        cfg=cfg,
+        large_mode=large_mode,
     )
 
     # =====================================================================
@@ -1309,6 +1335,7 @@ def run_pipeline(
             "enrichment_full",
             enrichment.table,
             large_mode=large_mode,
+            max_rows_large=cfg.scaling.report_preview_rows,
         )
 
         _table_for_report(
@@ -1316,6 +1343,7 @@ def run_pipeline(
             "enrichment_effect_magnitude",
             enrichment.effect_magnitude,
             large_mode=large_mode,
+            max_rows_large=cfg.scaling.report_preview_rows,
         )
 
         plots_mod.plot_enrichment(
@@ -1333,7 +1361,9 @@ def run_pipeline(
         )
 
         _collect(
-            "cluster enrichment"
+            "cluster enrichment",
+            cfg=cfg,
+            large_mode=large_mode,
         )
 
     else:
@@ -1473,6 +1503,7 @@ def run_pipeline(
                     "tf_hubs",
                     modules_result.hubs,
                     large_mode=large_mode,
+                    max_rows_large=cfg.scaling.report_preview_rows,
                 )
 
             if (
@@ -1492,7 +1523,9 @@ def run_pipeline(
             )
 
             _collect(
-                "modules/programs"
+                "modules/programs",
+                cfg=cfg,
+                large_mode=large_mode,
             )
 
     else:
@@ -1578,6 +1611,7 @@ def run_pipeline(
                 "ps_skipped",
                 ps_results.skipped,
                 large_mode=large_mode,
+                max_rows_large=cfg.scaling.report_preview_rows,
             )
 
         comparison = (
@@ -1617,7 +1651,9 @@ def run_pipeline(
         )
 
         _collect(
-            "PS score"
+            "PS score",
+            cfg=cfg,
+            large_mode=large_mode,
         )
 
     elif (
@@ -1703,6 +1739,7 @@ def run_pipeline(
                     "lochness_skipped",
                     lochness.skipped,
                     large_mode=large_mode,
+                    max_rows_large=cfg.scaling.report_preview_rows,
                 )
 
             plots_mod.plot_lochness(
@@ -1713,7 +1750,9 @@ def run_pipeline(
             )
 
             _collect(
-                "lochNESS"
+                "lochNESS",
+                cfg=cfg,
+                large_mode=large_mode,
             )
 
         elif (
@@ -1798,7 +1837,9 @@ def run_pipeline(
     )
 
     _collect(
-        "processed h5ad write"
+        "processed h5ad write",
+        cfg=cfg,
+        large_mode=large_mode,
     )
 
     # --------------------------------------------------------------
@@ -1877,7 +1918,9 @@ def run_pipeline(
         )
 
     _collect(
-        "output matrices"
+        "output matrices",
+        cfg=cfg,
+        large_mode=large_mode,
     )
 
     # =====================================================================

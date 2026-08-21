@@ -549,3 +549,9 @@ tests/                     synthetic data generator + end-to-end tests
 ```
 
 `CLAUDE.md` records the project conventions, including where large files belong.
+
+---
+
+## Development notes
+
+For implementation details, scaling behavior, and documentation of the extended Perturb-seq analyses, see [`docs/PIPELINE_DEVELOPMENT.md`](docs/PIPELINE_DEVELOPMENT.md).

@@ -173,3 +173,14 @@ output:
   write_guide_table: true
   guide_table_name: null
   guide_table_min_umi: 3
+scaling:
+  mode: auto
+  large_n_cells: 1000000
+  large_n_perturbations: 5000
+  marker_max_cells: 200000
+  effect_gene_chunk: 256
+  guide_chunk_size: 20000
+  guide_max_dense_elements: 20000000
+  collect_between_stages: true
+  log_memory: true
+  report_preview_rows: 500

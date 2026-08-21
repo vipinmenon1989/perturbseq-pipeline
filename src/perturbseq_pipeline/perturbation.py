@@ -92,17 +92,6 @@ CONTROL_LABELS = {
 _PSEUDOCOUNT = 0.01
 
 
-# ---------------------------------------------------------------------------
-# Large-dataset safeguards
-# ---------------------------------------------------------------------------
-
-# KOLF enters large mode; Replogle does not.
-LARGE_DATASET_N_CELLS = 1_000_000
-
-# An extremely large perturbation collection can independently activate
-# scalable execution.
-LARGE_DATASET_N_TARGETS = 5_000
-
 # Maximum control population used for KS/MWU in large-data mode.
 #
 # 100k controls already gives vastly more statistical power than normally
@@ -149,18 +138,6 @@ class PerturbationResults:
 # ---------------------------------------------------------------------------
 # Generic helpers
 # ---------------------------------------------------------------------------
-
-
-def _is_large_dataset(
-    n_cells: int,
-    n_targets: int,
-) -> bool:
-    """Automatically select scalable execution."""
-
-    return (
-        n_cells >= LARGE_DATASET_N_CELLS
-        or n_targets >= LARGE_DATASET_N_TARGETS
-    )
 
 
 def control_masks(
@@ -1539,9 +1516,9 @@ def test_all_targets(
         ).sum()
     )
 
-    large_mode = _is_large_dataset(
+    large_mode = cfg.use_large_mode(
         expr.n_obs,
-        n_testable_targets,
+        n_perturbations=n_testable_targets,
     )
 
     logger.info(
@@ -1554,11 +1531,10 @@ def test_all_targets(
     if large_mode:
 
         logger.info(
-            "Large-dataset perturbation-strength mode "
-            "automatically selected "
-            "(thresholds: >=%d cells or >=%d targets)",
-            LARGE_DATASET_N_CELLS,
-            LARGE_DATASET_N_TARGETS,
+            "Large-dataset perturbation-strength mode selected "
+            "(%d cells, %d targets)",
+            expr.n_obs,
+            n_testable_targets,
         )
 
         return _test_all_targets_large(
