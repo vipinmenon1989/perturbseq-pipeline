@@ -1,16 +1,48 @@
 """Guide calling: assign each cell to a guide, then to a target gene.
 
 The prototype notebooks looped over every cell in Python to find the top two
-guide counts. That is replaced here by a chunked, vectorized top-2 search, and
-the assignment rule is stated once with named thresholds:
+guide counts. The standard implementation replaces that with a chunked,
+vectorized top-2 search.
 
-* no guide counts at all              -> ``unassigned``
-* top >= ``min_umi``, top > ``dominance_ratio`` x second, and (optionally)
-  second <= ``max_second_umi``        -> assigned
-* anything else                       -> ``ambiguous``
+Assignment rule
+---------------
+* no guide counts at all
+      -> ``unassigned``
 
-Both failure categories are kept in the object and reported; they are never
-silently dropped.
+* top >= ``min_umi``, top > ``dominance_ratio`` x second, and optionally
+  second <= ``max_second_umi``
+      -> assigned
+
+* anything else
+      -> ``ambiguous``
+
+Both failure categories are retained and reported.
+
+Adaptive large-data execution
+-----------------------------
+For ordinary datasets, the original behaviour is preserved.
+
+For million-cell datasets such as KOLF, several operations become unnecessarily
+expensive if performed once per cell:
+
+* parsing guide/target strings;
+* regular-expression NTC detection;
+* converting sparse guide matrices into dense 20k-row blocks;
+* copying an already aligned guide matrix.
+
+Large-data mode therefore changes implementation, not biological semantics:
+
+LABEL INPUT
+    Unique guide labels are parsed exactly once and then mapped back to cells.
+    For example, 2.6 million cells carrying ~12,000 distinct labels require
+    ~12,000 parsing operations rather than 2.6 million.
+
+GUIDE-MATRIX INPUT
+    Sparse CSR guide matrices use a sparse row-wise top-two implementation,
+    optionally accelerated with Numba. No dense cells x guides block is created.
+
+The assignment thresholds and output columns are identical in standard and
+large modes.
 """
 
 from __future__ import annotations
@@ -29,16 +61,25 @@ from .io import RAW_GUIDE_LABEL
 
 logger = logging.getLogger(__name__)
 
-#: ``obs`` columns written by :func:`assign_guides`.
+
+# ---------------------------------------------------------------------------
+# Output columns
+# ---------------------------------------------------------------------------
+
 OBS_TARGET = "target_gene"
 OBS_GUIDE = "guide_id"
 OBS_CLASS = "perturbation_class"
+
 OBS_TOP = "top_guide_count"
 OBS_SECOND = "second_guide_count"
 OBS_TOTAL = "total_guide_counts"
 OBS_NDETECTED = "n_guides_detected"
 
-#: Values of :data:`OBS_CLASS`.
+
+# ---------------------------------------------------------------------------
+# Perturbation classes
+# ---------------------------------------------------------------------------
+
 CLASS_TARGETING = "targeting"
 CLASS_NTC = "non-targeting"
 CLASS_AMBIGUOUS = "ambiguous"
@@ -46,223 +87,1754 @@ CLASS_UNASSIGNED = "unassigned"
 
 
 # ---------------------------------------------------------------------------
+# Large-data thresholds
+# ---------------------------------------------------------------------------
+
+# Replogle (~310k cells) therefore remains on standard behaviour.
+# KOLF (~2.66m cells) automatically uses large-data behaviour.
+LARGE_DATASET_N_CELLS = 1_000_000
+
+# Standard dense-chunk implementation.
+STANDARD_TOP2_CHUNK_SIZE = 20_000
+
+# A dense block above this many elements is avoided even below one million
+# cells. This protects datasets with unusually large guide libraries.
+MAX_DENSE_GUIDE_BLOCK_ELEMENTS = 20_000_000
+
+
+# ---------------------------------------------------------------------------
+# Execution-mode helper
+# ---------------------------------------------------------------------------
+
+
+def _is_large_dataset(
+    expr: ad.AnnData,
+) -> bool:
+    """Return True when memory-aware guide handling should be used."""
+
+    return (
+        expr.n_obs
+        >= LARGE_DATASET_N_CELLS
+    )
+
+
+# ---------------------------------------------------------------------------
 # Target-gene parsing
 # ---------------------------------------------------------------------------
 
 
-def parse_target_genes(guide_ids: Sequence[str], gcfg: GuideConfig) -> np.ndarray:
+def parse_target_genes(
+    guide_ids: Sequence[str],
+    gcfg: GuideConfig,
+) -> np.ndarray:
     """Map guide identifiers to target gene symbols.
 
-    With the default settings the identifier is split on ``_``, ``-`` and ``.``
-    and the first field is taken, which handles both library conventions seen so
-    far: ``AFF4_P1P2_1`` (10x features file) and ``AFF4-P1P2.2`` (Seurat
-    ``genotype`` column) both give ``AFF4``. Set ``guides.target_regex`` when a
-    library uses target names that themselves contain a delimiter.
+    With default delimiter parsing:
+
+        AFF4_P1P2_1
+        -> AFF4
+
+        AFF4-P1P2.2
+        -> AFF4
+
+    Set ``guides.target_regex`` when target names themselves contain the
+    configured delimiters.
     """
-    ids = [str(g) for g in guide_ids]
+
+    ids = [
+        str(
+            guide
+        )
+        for guide
+        in guide_ids
+    ]
+
     if gcfg.target_regex:
-        pattern = re.compile(gcfg.target_regex)
+
+        pattern = re.compile(
+            gcfg.target_regex
+        )
+
         out = []
-        for gid in ids:
-            m = pattern.match(gid)
-            if m is None or not m.groups():
+
+        for guide_id in ids:
+
+            match = pattern.match(
+                guide_id
+            )
+
+            if (
+                match is None
+                or not match.groups()
+            ):
+
                 logger.warning(
-                    "guides.target_regex did not match guide %r; using it verbatim",
-                    gid,
+                    "guides.target_regex did not match guide %r; "
+                    "using it verbatim",
+                    guide_id,
                 )
-                out.append(gid)
+
+                out.append(
+                    guide_id
+                )
+
             else:
-                out.append(m.group(1))
-        return np.asarray(out, dtype=object)
+
+                out.append(
+                    match.group(
+                        1
+                    )
+                )
+
+        return np.asarray(
+            out,
+            dtype=object,
+        )
 
     if not gcfg.target_split_delims:
-        return np.asarray(ids, dtype=object)
-    splitter = re.compile("[" + re.escape("".join(gcfg.target_split_delims)) + "]")
-    return np.asarray([splitter.split(g)[0] for g in ids], dtype=object)
 
+        return np.asarray(
+            ids,
+            dtype=object,
+        )
 
-def is_non_targeting(labels: Sequence[str], gcfg: GuideConfig) -> np.ndarray:
-    """Boolean mask of labels matching any non-targeting control pattern."""
-    if not gcfg.ntc_patterns:
-        return np.zeros(len(labels), dtype=bool)
-    patterns = [re.compile(p, re.IGNORECASE) for p in gcfg.ntc_patterns]
+    splitter = re.compile(
+        "["
+        + re.escape(
+            "".join(
+                gcfg.target_split_delims
+            )
+        )
+        + "]"
+    )
+
     return np.asarray(
-        [any(p.search(str(x)) for p in patterns) for x in labels], dtype=bool
+        [
+            splitter.split(
+                guide
+            )[
+                0
+            ]
+            for guide
+            in ids
+        ],
+        dtype=object,
+    )
+
+
+def _parse_target_genes_unique(
+    labels: Sequence[str],
+    gcfg: GuideConfig,
+) -> np.ndarray:
+    """Parse millions of labels by operating only on unique values.
+
+    The result remains one target label per cell and is therefore semantically
+    identical to calling :func:`parse_target_genes` on every row.
+    """
+
+    labels = np.asarray(
+        labels
+    )
+
+    if labels.size == 0:
+
+        return np.asarray(
+            [],
+            dtype=object,
+        )
+
+    # np.unique also returns the inverse mapping from each cell to its unique
+    # label, so parsing is performed once per distinct guide rather than once
+    # per cell.
+    unique_labels, inverse = np.unique(
+        labels.astype(str),
+        return_inverse=True,
+    )
+
+    parsed_unique = parse_target_genes(
+        unique_labels,
+        gcfg,
+    )
+
+    return parsed_unique[
+        inverse
+    ]
+
+
+# ---------------------------------------------------------------------------
+# NTC detection
+# ---------------------------------------------------------------------------
+
+
+def is_non_targeting(
+    labels: Sequence[str],
+    gcfg: GuideConfig,
+) -> np.ndarray:
+    """Boolean mask of labels matching any non-targeting pattern."""
+
+    if not gcfg.ntc_patterns:
+
+        return np.zeros(
+            len(
+                labels
+            ),
+            dtype=bool,
+        )
+
+    patterns = [
+        re.compile(
+            pattern,
+            re.IGNORECASE,
+        )
+        for pattern
+        in gcfg.ntc_patterns
+    ]
+
+    return np.asarray(
+        [
+            any(
+                pattern.search(
+                    str(
+                        value
+                    )
+                )
+                for pattern
+                in patterns
+            )
+            for value
+            in labels
+        ],
+        dtype=bool,
+    )
+
+
+def _is_non_targeting_unique(
+    labels: Sequence[str],
+    gcfg: GuideConfig,
+) -> np.ndarray:
+    """NTC detection using one regex evaluation per unique label."""
+
+    labels = np.asarray(
+        labels
+    )
+
+    if not gcfg.ntc_patterns:
+
+        return np.zeros(
+            len(
+                labels
+            ),
+            dtype=bool,
+        )
+
+    if labels.size == 0:
+
+        return np.asarray(
+            [],
+            dtype=bool,
+        )
+
+    unique_labels, inverse = np.unique(
+        labels.astype(str),
+        return_inverse=True,
+    )
+
+    unique_mask = is_non_targeting(
+        unique_labels,
+        gcfg,
+    )
+
+    return unique_mask[
+        inverse
+    ]
+
+
+# ---------------------------------------------------------------------------
+# STANDARD top-two guide search
+# ---------------------------------------------------------------------------
+
+
+def _top_two_guides_dense_chunked(
+    X,
+    chunk_size: int = STANDARD_TOP2_CHUNK_SIZE,
+) -> Tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
+    """Original chunked/vectorized top-two implementation."""
+
+    n_obs, n_vars = (
+        X.shape
+    )
+
+    top_idx = np.zeros(
+        n_obs,
+        dtype=np.int64,
+    )
+
+    top_val = np.zeros(
+        n_obs,
+        dtype=np.float64,
+    )
+
+    second_val = np.zeros(
+        n_obs,
+        dtype=np.float64,
+    )
+
+    for start in range(
+        0,
+        n_obs,
+        chunk_size,
+    ):
+
+        stop = min(
+            start
+            + chunk_size,
+            n_obs,
+        )
+
+        block = X[
+            start:stop
+        ]
+
+        if sparse.issparse(
+            block
+        ):
+
+            dense = (
+                block
+                .toarray()
+            )
+
+        else:
+
+            dense = np.asarray(
+                block
+            )
+
+        dense = dense.astype(
+            np.float64,
+            copy=False,
+        )
+
+        if n_vars == 0:
+
+            continue
+
+        if n_vars == 1:
+
+            top_idx[
+                start:stop
+            ] = 0
+
+            top_val[
+                start:stop
+            ] = dense[
+                :,
+                0
+            ]
+
+            second_val[
+                start:stop
+            ] = 0.0
+
+            continue
+
+        # argpartition places the two largest values in the final two slots.
+        part = np.argpartition(
+            dense,
+            -2,
+            axis=1,
+        )[
+            :,
+            -2:
+        ]
+
+        rows = np.arange(
+            dense.shape[
+                0
+            ]
+        )[
+            :,
+            None
+        ]
+
+        values = dense[
+            rows,
+            part,
+        ]
+
+        order = np.argsort(
+            values,
+            axis=1,
+        )
+
+        row_flat = rows[
+            :,
+            0
+        ]
+
+        top_idx[
+            start:stop
+        ] = part[
+            row_flat,
+            order[
+                :,
+                1
+            ],
+        ]
+
+        top_val[
+            start:stop
+        ] = values[
+            row_flat,
+            order[
+                :,
+                1
+            ],
+        ]
+
+        second_val[
+            start:stop
+        ] = values[
+            row_flat,
+            order[
+                :,
+                0
+            ],
+        ]
+
+    return (
+        top_idx,
+        top_val,
+        second_val,
     )
 
 
 # ---------------------------------------------------------------------------
-# Top-2 guide search
+# LARGE sparse top-two implementation
+# ---------------------------------------------------------------------------
+
+
+def _csr_top_two_numba(
+    X: sparse.csr_matrix,
+) -> Optional[
+    Tuple[
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+    ]
+]:
+    """Numba sparse top-two implementation.
+
+    Returns None when Numba is unavailable so the caller can fall back to the
+    pure-Python sparse implementation.
+
+    Returns
+    -------
+    top_idx
+        Column index of highest-count guide.
+    top_val
+        Highest guide count.
+    second_val
+        Second-highest guide count.
+    total
+        Total guide counts per cell.
+    detected
+        Number of guides above the detection threshold is added later because
+        that threshold comes from configuration.
+    """
+
+    try:
+
+        from numba import njit
+
+    except ImportError:
+
+        return None
+
+    @njit(cache=True)
+    def _scan(
+        indptr,
+        indices,
+        data,
+        n_rows,
+    ):
+
+        top_idx = np.zeros(
+            n_rows,
+            dtype=np.int64,
+        )
+
+        top_val = np.zeros(
+            n_rows,
+            dtype=np.float64,
+        )
+
+        second_val = np.zeros(
+            n_rows,
+            dtype=np.float64,
+        )
+
+        total = np.zeros(
+            n_rows,
+            dtype=np.float64,
+        )
+
+        for row in range(
+            n_rows
+        ):
+
+            start = indptr[
+                row
+            ]
+
+            stop = indptr[
+                row + 1
+            ]
+
+            best_value = 0.0
+            second_value = 0.0
+            best_index = 0
+            row_total = 0.0
+
+            for pos in range(
+                start,
+                stop,
+            ):
+
+                value = float(
+                    data[
+                        pos
+                    ]
+                )
+
+                column = int(
+                    indices[
+                        pos
+                    ]
+                )
+
+                row_total += (
+                    value
+                )
+
+                if value > best_value:
+
+                    second_value = (
+                        best_value
+                    )
+
+                    best_value = (
+                        value
+                    )
+
+                    best_index = (
+                        column
+                    )
+
+                elif value > second_value:
+
+                    second_value = (
+                        value
+                    )
+
+            top_idx[
+                row
+            ] = (
+                best_index
+            )
+
+            top_val[
+                row
+            ] = (
+                best_value
+            )
+
+            second_val[
+                row
+            ] = (
+                second_value
+            )
+
+            total[
+                row
+            ] = (
+                row_total
+            )
+
+        return (
+            top_idx,
+            top_val,
+            second_val,
+            total,
+        )
+
+    result = _scan(
+        X.indptr,
+        X.indices,
+        X.data,
+        X.shape[
+            0
+        ],
+    )
+
+    return result
+
+
+def _csr_top_two_python(
+    X: sparse.csr_matrix,
+) -> Tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
+    """Sparse fallback when Numba is unavailable.
+
+    Memory use remains bounded, although it is slower than the Numba path.
+    """
+
+    n_obs = (
+        X.shape[
+            0
+        ]
+    )
+
+    top_idx = np.zeros(
+        n_obs,
+        dtype=np.int64,
+    )
+
+    top_val = np.zeros(
+        n_obs,
+        dtype=np.float64,
+    )
+
+    second_val = np.zeros(
+        n_obs,
+        dtype=np.float64,
+    )
+
+    total = np.zeros(
+        n_obs,
+        dtype=np.float64,
+    )
+
+    indptr = X.indptr
+    indices = X.indices
+    data = X.data
+
+    for row in range(
+        n_obs
+    ):
+
+        start = (
+            indptr[
+                row
+            ]
+        )
+
+        stop = (
+            indptr[
+                row + 1
+            ]
+        )
+
+        if start == stop:
+
+            continue
+
+        row_values = (
+            data[
+                start:stop
+            ]
+        )
+
+        row_indices = (
+            indices[
+                start:stop
+            ]
+        )
+
+        total[
+            row
+        ] = float(
+            row_values.sum()
+        )
+
+        if len(
+            row_values
+        ) == 1:
+
+            top_idx[
+                row
+            ] = int(
+                row_indices[
+                    0
+                ]
+            )
+
+            top_val[
+                row
+            ] = float(
+                row_values[
+                    0
+                ]
+            )
+
+            continue
+
+        # Guide matrices are normally extremely sparse, so sorting the few
+        # non-zero entries in a row is inexpensive.
+        largest = np.argpartition(
+            row_values,
+            -2,
+        )[
+            -2:
+        ]
+
+        values = (
+            row_values[
+                largest
+            ]
+        )
+
+        order = np.argsort(
+            values
+        )
+
+        second_pos = (
+            largest[
+                order[
+                    0
+                ]
+            ]
+        )
+
+        top_pos = (
+            largest[
+                order[
+                    1
+                ]
+            ]
+        )
+
+        top_idx[
+            row
+        ] = int(
+            row_indices[
+                top_pos
+            ]
+        )
+
+        top_val[
+            row
+        ] = float(
+            row_values[
+                top_pos
+            ]
+        )
+
+        second_val[
+            row
+        ] = float(
+            row_values[
+                second_pos
+            ]
+        )
+
+    return (
+        top_idx,
+        top_val,
+        second_val,
+        total,
+    )
+
+
+def _detected_guides_csr(
+    X: sparse.csr_matrix,
+    threshold: float,
+) -> np.ndarray:
+    """Count guides above threshold without constructing ``X > threshold``."""
+
+    n_obs = (
+        X.shape[
+            0
+        ]
+    )
+
+    detected = np.zeros(
+        n_obs,
+        dtype=np.int32,
+    )
+
+    try:
+
+        from numba import njit
+
+        @njit(cache=True)
+        def _count(
+            indptr,
+            data,
+            threshold_value,
+            n_rows,
+        ):
+
+            out = np.zeros(
+                n_rows,
+                dtype=np.int32,
+            )
+
+            for row in range(
+                n_rows
+            ):
+
+                count = 0
+
+                for pos in range(
+                    indptr[
+                        row
+                    ],
+                    indptr[
+                        row + 1
+                    ],
+                ):
+
+                    if (
+                        data[
+                            pos
+                        ]
+                        > threshold_value
+                    ):
+
+                        count += 1
+
+                out[
+                    row
+                ] = count
+
+            return out
+
+        return _count(
+            X.indptr,
+            X.data,
+            float(
+                threshold
+            ),
+            n_obs,
+        )
+
+    except ImportError:
+
+        for row in range(
+            n_obs
+        ):
+
+            start = (
+                X.indptr[
+                    row
+                ]
+            )
+
+            stop = (
+                X.indptr[
+                    row + 1
+                ]
+            )
+
+            detected[
+                row
+            ] = int(
+                np.count_nonzero(
+                    X.data[
+                        start:stop
+                    ]
+                    > threshold
+                )
+            )
+
+        return detected
+
+
+# ---------------------------------------------------------------------------
+# Public top-two API
 # ---------------------------------------------------------------------------
 
 
 def top_two_guides(
-    X, chunk_size: int = 20_000
-) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    X,
+    chunk_size: int = STANDARD_TOP2_CHUNK_SIZE,
+    *,
+    force_sparse: bool = False,
+) -> Tuple[
+    np.ndarray,
+    np.ndarray,
+    np.ndarray,
+]:
     """Return ``(top_index, top_value, second_value)`` per cell.
 
-    Works on sparse or dense matrices and densifies at most ``chunk_size`` rows
-    at a time, so memory stays bounded for large guide libraries.
+    STANDARD
+        Chunked dense/vectorized algorithm.
+
+    LARGE sparse matrix
+        CSR algorithm, optionally Numba accelerated.
     """
-    n_obs, n_vars = X.shape
-    top_idx = np.zeros(n_obs, dtype=np.int64)
-    top_val = np.zeros(n_obs, dtype=np.float64)
-    second_val = np.zeros(n_obs, dtype=np.float64)
 
-    for start in range(0, n_obs, chunk_size):
-        stop = min(start + chunk_size, n_obs)
-        block = X[start:stop]
-        dense = np.asarray(block.todense()) if sparse.issparse(block) else np.asarray(block)
-        dense = dense.astype(np.float64, copy=False)
+    n_obs, n_vars = (
+        X.shape
+    )
 
-        if n_vars == 1:
-            top_idx[start:stop] = 0
-            top_val[start:stop] = dense[:, 0]
-            second_val[start:stop] = 0.0
-            continue
+    use_sparse = (
+        sparse.issparse(
+            X
+        )
+        and (
+            force_sparse
+            or n_obs
+            >= LARGE_DATASET_N_CELLS
+            or (
+                chunk_size
+                * max(
+                    n_vars,
+                    1,
+                )
+                > MAX_DENSE_GUIDE_BLOCK_ELEMENTS
+            )
+        )
+    )
 
-        # argpartition puts the two largest values in the last two slots.
-        part = np.argpartition(dense, -2, axis=1)[:, -2:]
-        rows = np.arange(dense.shape[0])[:, None]
-        vals = dense[rows, part]
-        order = np.argsort(vals, axis=1)  # ascending: [second, top]
-        top_idx[start:stop] = part[rows[:, 0], order[:, 1]]
-        top_val[start:stop] = vals[rows[:, 0], order[:, 1]]
-        second_val[start:stop] = vals[rows[:, 0], order[:, 0]]
+    if use_sparse:
 
-    return top_idx, top_val, second_val
+        csr = sparse.csr_matrix(
+            X
+        )
+
+        result = _csr_top_two_numba(
+            csr
+        )
+
+        if result is not None:
+
+            top_idx, top_val, second_val, _ = (
+                result
+            )
+
+            return (
+                top_idx,
+                top_val,
+                second_val,
+            )
+
+        top_idx, top_val, second_val, _ = (
+            _csr_top_two_python(
+                csr
+            )
+        )
+
+        return (
+            top_idx,
+            top_val,
+            second_val,
+        )
+
+    return _top_two_guides_dense_chunked(
+        X,
+        chunk_size,
+    )
 
 
 # ---------------------------------------------------------------------------
-# Assignment
+# Assignment entry point
 # ---------------------------------------------------------------------------
 
 
 def assign_guides(
-    expr: ad.AnnData, guides: Optional[ad.AnnData], cfg: Config
+    expr: ad.AnnData,
+    guides: Optional[
+        ad.AnnData
+    ],
+    cfg: Config,
 ) -> ad.AnnData:
-    """Write guide/target assignments into ``expr.obs``.
+    """Write guide/target assignments into ``expr.obs``."""
 
-    When ``guides`` is ``None`` the input only carried a per-cell label
-    (``obs['guide_id_raw']``); the label is then parsed directly and the
-    count-based diagnostics are unavailable.
-    """
     if guides is None:
-        return _assign_from_labels(expr, cfg)
-    return _assign_from_matrix(expr, guides, cfg)
 
+        return _assign_from_labels(
+            expr,
+            cfg,
+        )
 
-def _assign_from_matrix(expr: ad.AnnData, guides: ad.AnnData, cfg: Config) -> ad.AnnData:
-    gcfg = cfg.guides
-    guides = guides[expr.obs_names].copy()
-
-    X = guides.layers["counts"] if "counts" in guides.layers else guides.X
-    top_idx, top_val, second_val = top_two_guides(X)
-
-    total = np.asarray(X.sum(axis=1)).ravel()
-    detected = np.asarray((X > gcfg.detection_threshold).sum(axis=1)).ravel()
-
-    guide_ids = guides.var_names.to_numpy().astype(str)
-    guide_targets = parse_target_genes(guide_ids, gcfg)
-
-    assigned = (top_val >= max(gcfg.min_umi, 1)) & (
-        top_val > gcfg.dominance_ratio * second_val
+    return _assign_from_matrix(
+        expr,
+        guides,
+        cfg,
     )
-    if gcfg.max_second_umi is not None and gcfg.max_second_umi >= 0:
-        # Multiplet gate: real counts of a runner-up guide mean two cells in the
-        # droplet, which the ratio alone misses at high depth.
-        n_before = int(assigned.sum())
-        assigned &= second_val <= gcfg.max_second_umi
+
+
+# ---------------------------------------------------------------------------
+# Guide-matrix assignment
+# ---------------------------------------------------------------------------
+
+
+def _assign_from_matrix(
+    expr: ad.AnnData,
+    guides: ad.AnnData,
+    cfg: Config,
+) -> ad.AnnData:
+    """Assign cells from a guide count matrix."""
+
+    gcfg = (
+        cfg.guides
+    )
+
+    large_mode = (
+        _is_large_dataset(
+            expr
+        )
+    )
+
+    # Avoid copying an already cell-aligned guide matrix.
+    if (
+        len(
+            guides.obs_names
+        )
+        == len(
+            expr.obs_names
+        )
+        and guides.obs_names.equals(
+            expr.obs_names
+        )
+    ):
+
+        aligned_guides = (
+            guides
+        )
+
+    else:
+
         logger.info(
-            "Multiplet gate (second guide <= %d UMIs): %d -> %d assigned cells",
+            "Aligning guide matrix to expression cells"
+        )
+
+        aligned_guides = (
+            guides[
+                expr.obs_names
+            ]
+            .copy()
+        )
+
+    X = (
+        aligned_guides.layers[
+            "counts"
+        ]
+        if "counts"
+        in aligned_guides.layers
+        else aligned_guides.X
+    )
+
+    # --------------------------------------------------------------
+    # Large sparse execution
+    # --------------------------------------------------------------
+
+    if (
+        large_mode
+        and sparse.issparse(
+            X
+        )
+    ):
+
+        logger.info(
+            "Guide assignment mode: LARGE sparse (%d cells x %d guides)",
+            X.shape[
+                0
+            ],
+            X.shape[
+                1
+            ],
+        )
+
+        X_csr = sparse.csr_matrix(
+            X
+        )
+
+        result = _csr_top_two_numba(
+            X_csr
+        )
+
+        if result is not None:
+
+            (
+                top_idx,
+                top_val,
+                second_val,
+                total,
+            ) = result
+
+            logger.info(
+                "Guide top-two search: sparse Numba implementation"
+            )
+
+        else:
+
+            (
+                top_idx,
+                top_val,
+                second_val,
+                total,
+            ) = _csr_top_two_python(
+                X_csr
+            )
+
+            logger.info(
+                "Guide top-two search: sparse Python implementation "
+                "(install numba for faster million-cell execution)"
+            )
+
+        detected = _detected_guides_csr(
+            X_csr,
+            gcfg.detection_threshold,
+        )
+
+    # --------------------------------------------------------------
+    # Standard execution
+    # --------------------------------------------------------------
+
+    else:
+
+        logger.info(
+            "Guide assignment mode: STANDARD (%d cells x %d guides)",
+            X.shape[
+                0
+            ],
+            X.shape[
+                1
+            ],
+        )
+
+        (
+            top_idx,
+            top_val,
+            second_val,
+        ) = top_two_guides(
+            X
+        )
+
+        total = np.asarray(
+            X.sum(
+                axis=1
+            )
+        ).ravel()
+
+        detected = np.asarray(
+            (
+                X
+                > gcfg.detection_threshold
+            )
+            .sum(
+                axis=1
+            )
+        ).ravel()
+
+    guide_ids = (
+        aligned_guides.var_names
+        .to_numpy()
+        .astype(str)
+    )
+
+    guide_targets = (
+        parse_target_genes(
+            guide_ids,
+            gcfg,
+        )
+    )
+
+    # --------------------------------------------------------------
+    # Assignment gate
+    # --------------------------------------------------------------
+
+    assigned = (
+        top_val
+        >= max(
+            gcfg.min_umi,
+            1,
+        )
+    ) & (
+        top_val
+        > gcfg.dominance_ratio
+        * second_val
+    )
+
+    if (
+        gcfg.max_second_umi
+        is not None
+        and gcfg.max_second_umi
+        >= 0
+    ):
+
+        n_before = int(
+            assigned.sum()
+        )
+
+        assigned &= (
+            second_val
+            <= gcfg.max_second_umi
+        )
+
+        logger.info(
+            "Multiplet gate (second guide <= %d UMIs): "
+            "%d -> %d assigned cells",
             gcfg.max_second_umi,
             n_before,
-            int(assigned.sum()),
+            int(
+                assigned.sum()
+            ),
         )
-    has_counts = top_val > 0
 
-    guide_call = np.full(expr.n_obs, gcfg.unassigned_label, dtype=object)
-    target_call = np.full(expr.n_obs, gcfg.unassigned_label, dtype=object)
-    guide_call[has_counts & ~assigned] = gcfg.ambiguous_label
-    target_call[has_counts & ~assigned] = gcfg.ambiguous_label
-    guide_call[assigned] = guide_ids[top_idx[assigned]]
-    target_call[assigned] = guide_targets[top_idx[assigned]]
+    has_counts = (
+        top_val > 0
+    )
 
-    # Store guide-level diagnostics before collapsing NTCs into one label.
-    expr.obs[OBS_TOP] = top_val
-    expr.obs[OBS_SECOND] = second_val
-    expr.obs[OBS_TOTAL] = total
-    expr.obs[OBS_NDETECTED] = detected
-    expr.obs[OBS_GUIDE] = pd.Categorical(guide_call.astype(str))
+    guide_call = np.full(
+        expr.n_obs,
+        gcfg.unassigned_label,
+        dtype=object,
+    )
 
-    _finalize_labels(expr, target_call, gcfg)
+    target_call = np.full(
+        expr.n_obs,
+        gcfg.unassigned_label,
+        dtype=object,
+    )
 
-    guides.var["target_gene"] = guide_targets
-    guides.var["is_non_targeting"] = is_non_targeting(guide_targets, gcfg)
-    guides.obs[OBS_GUIDE] = expr.obs[OBS_GUIDE].to_numpy()
-    guides.obs[OBS_TARGET] = expr.obs[OBS_TARGET].to_numpy()
+    ambiguous = (
+        has_counts
+        & ~assigned
+    )
 
-    _log_assignment(expr, cfg)
+    guide_call[
+        ambiguous
+    ] = (
+        gcfg.ambiguous_label
+    )
+
+    target_call[
+        ambiguous
+    ] = (
+        gcfg.ambiguous_label
+    )
+
+    guide_call[
+        assigned
+    ] = (
+        guide_ids[
+            top_idx[
+                assigned
+            ]
+        ]
+    )
+
+    target_call[
+        assigned
+    ] = (
+        guide_targets[
+            top_idx[
+                assigned
+            ]
+        ]
+    )
+
+    # --------------------------------------------------------------
+    # Diagnostics
+    # --------------------------------------------------------------
+
+    expr.obs[
+        OBS_TOP
+    ] = top_val
+
+    expr.obs[
+        OBS_SECOND
+    ] = second_val
+
+    expr.obs[
+        OBS_TOTAL
+    ] = total
+
+    expr.obs[
+        OBS_NDETECTED
+    ] = detected
+
+    expr.obs[
+        OBS_GUIDE
+    ] = pd.Categorical(
+        guide_call.astype(
+            str
+        )
+    )
+
+    _finalize_labels(
+        expr,
+        target_call,
+        gcfg,
+        large_mode=large_mode,
+    )
+
+    # --------------------------------------------------------------
+    # Guide metadata
+    # --------------------------------------------------------------
+
+    aligned_guides.var[
+        "target_gene"
+    ] = (
+        guide_targets
+    )
+
+    aligned_guides.var[
+        "is_non_targeting"
+    ] = is_non_targeting(
+        guide_targets,
+        gcfg,
+    )
+
+    aligned_guides.obs[
+        OBS_GUIDE
+    ] = (
+        expr.obs[
+            OBS_GUIDE
+        ]
+        .to_numpy()
+    )
+
+    aligned_guides.obs[
+        OBS_TARGET
+    ] = (
+        expr.obs[
+            OBS_TARGET
+        ]
+        .to_numpy()
+    )
+
+    _log_assignment(
+        expr,
+        cfg,
+    )
+
     return expr
 
 
-def _assign_from_labels(expr: ad.AnnData, cfg: Config) -> ad.AnnData:
-    """Assignment path for inputs that already carry a per-cell guide label."""
-    gcfg = cfg.guides
-    if RAW_GUIDE_LABEL not in expr.obs.columns:
+# ---------------------------------------------------------------------------
+# Label-based assignment
+# ---------------------------------------------------------------------------
+
+
+def _assign_from_labels(
+    expr: ad.AnnData,
+    cfg: Config,
+) -> ad.AnnData:
+    """Assignment path for pre-computed per-cell guide labels.
+
+    This is the path used by datasets such as Replogle and KOLF when the H5AD
+    already provides one perturbation/guide identity per cell.
+    """
+
+    gcfg = (
+        cfg.guides
+    )
+
+    if (
+        RAW_GUIDE_LABEL
+        not in expr.obs.columns
+    ):
+
         raise ValueError(
             f"No guide matrix and no obs['{RAW_GUIDE_LABEL}'] column; "
             "cannot determine perturbations."
         )
-    raw = expr.obs[RAW_GUIDE_LABEL].astype(str).to_numpy()
-    target_call = parse_target_genes(raw, gcfg).astype(object)
 
-    # Honour labels that already encode the two failure modes.
-    for label in (gcfg.unassigned_label, gcfg.ambiguous_label, "NA", "nan", "None", ""):
-        target_call[np.char.lower(raw.astype(str)) == label.lower()] = (
-            gcfg.ambiguous_label if label == gcfg.ambiguous_label else gcfg.unassigned_label
+    large_mode = (
+        _is_large_dataset(
+            expr
+        )
+    )
+
+    raw_series = (
+        expr.obs[
+            RAW_GUIDE_LABEL
+        ]
+    )
+
+    # --------------------------------------------------------------
+    # LARGE: parse each unique label only once
+    # --------------------------------------------------------------
+
+    if large_mode:
+
+        # Categorical representation is especially efficient for KOLF, where
+        # millions of cells share only ~12k perturbation labels.
+        categorical = pd.Categorical(
+            raw_series.astype(
+                str
+            )
         )
 
-    expr.obs[OBS_GUIDE] = pd.Categorical(raw)
-    _finalize_labels(expr, target_call, gcfg)
-    _log_assignment(expr, cfg)
+        categories = np.asarray(
+            categorical.categories.astype(
+                str
+            ),
+            dtype=str,
+        )
+
+        codes = (
+            categorical.codes
+        )
+
+        parsed_categories = parse_target_genes(
+            categories,
+            gcfg,
+        ).astype(
+            object
+        )
+
+        target_call = np.empty(
+            expr.n_obs,
+            dtype=object,
+        )
+
+        valid = (
+            codes >= 0
+        )
+
+        target_call[
+            valid
+        ] = (
+            parsed_categories[
+                codes[
+                    valid
+                ]
+            ]
+        )
+
+        target_call[
+            ~valid
+        ] = (
+            gcfg.unassigned_label
+        )
+
+        raw = np.empty(
+            expr.n_obs,
+            dtype=object,
+        )
+
+        raw[
+            valid
+        ] = (
+            categories[
+                codes[
+                    valid
+                ]
+            ]
+        )
+
+        raw[
+            ~valid
+        ] = (
+            ""
+        )
+
+        logger.info(
+            "Guide label parsing mode: LARGE — "
+            "%d cells mapped through %d unique labels",
+            expr.n_obs,
+            len(
+                categories
+            ),
+        )
+
+    # --------------------------------------------------------------
+    # STANDARD: original direct parsing
+    # --------------------------------------------------------------
+
+    else:
+
+        raw = (
+            raw_series
+            .astype(str)
+            .to_numpy()
+        )
+
+        target_call = (
+            parse_target_genes(
+                raw,
+                gcfg,
+            )
+            .astype(
+                object
+            )
+        )
+
+    # --------------------------------------------------------------
+    # Explicit failure labels
+    # --------------------------------------------------------------
+
+    raw_str = (
+        np.asarray(
+            raw
+        )
+        .astype(str)
+    )
+
+    raw_lower = np.char.lower(
+        raw_str
+    )
+
+    failure_labels = (
+        (
+            gcfg.unassigned_label,
+            gcfg.unassigned_label,
+        ),
+        (
+            gcfg.ambiguous_label,
+            gcfg.ambiguous_label,
+        ),
+        (
+            "NA",
+            gcfg.unassigned_label,
+        ),
+        (
+            "nan",
+            gcfg.unassigned_label,
+        ),
+        (
+            "None",
+            gcfg.unassigned_label,
+        ),
+        (
+            "",
+            gcfg.unassigned_label,
+        ),
+    )
+
+    for source_label, replacement in (
+        failure_labels
+    ):
+
+        target_call[
+            raw_lower
+            == source_label.lower()
+        ] = replacement
+
+    expr.obs[
+        OBS_GUIDE
+    ] = pd.Categorical(
+        raw_str
+    )
+
+    _finalize_labels(
+        expr,
+        target_call,
+        gcfg,
+        large_mode=large_mode,
+    )
+
+    _log_assignment(
+        expr,
+        cfg,
+    )
+
     return expr
 
 
-def _finalize_labels(expr: ad.AnnData, target_call: np.ndarray, gcfg: GuideConfig) -> None:
-    """Collapse non-targeting guides to one label and set the class column."""
-    ntc_mask = is_non_targeting(target_call, gcfg)
-    special = {gcfg.unassigned_label, gcfg.ambiguous_label}
-    ntc_mask &= ~np.isin(target_call.astype(str), list(special))
-    target_call = target_call.copy()
-    target_call[ntc_mask] = gcfg.ntc_label
+# ---------------------------------------------------------------------------
+# Label finalization
+# ---------------------------------------------------------------------------
 
-    klass = np.full(len(target_call), CLASS_TARGETING, dtype=object)
-    klass[ntc_mask] = CLASS_NTC
-    klass[target_call == gcfg.ambiguous_label] = CLASS_AMBIGUOUS
-    klass[target_call == gcfg.unassigned_label] = CLASS_UNASSIGNED
 
-    expr.obs[OBS_TARGET] = pd.Categorical(target_call.astype(str))
-    expr.obs[OBS_CLASS] = pd.Categorical(
-        klass.astype(str),
-        categories=[CLASS_TARGETING, CLASS_NTC, CLASS_AMBIGUOUS, CLASS_UNASSIGNED],
+def _finalize_labels(
+    expr: ad.AnnData,
+    target_call: np.ndarray,
+    gcfg: GuideConfig,
+    *,
+    large_mode: bool = False,
+) -> None:
+    """Collapse NTC guides and assign perturbation class."""
+
+    if large_mode:
+
+        ntc_mask = (
+            _is_non_targeting_unique(
+                target_call,
+                gcfg,
+            )
+        )
+
+    else:
+
+        ntc_mask = (
+            is_non_targeting(
+                target_call,
+                gcfg,
+            )
+        )
+
+    special = {
+        gcfg.unassigned_label,
+        gcfg.ambiguous_label,
+    }
+
+    ntc_mask &= ~np.isin(
+        target_call.astype(
+            str
+        ),
+        list(
+            special
+        ),
+    )
+
+    target_call = (
+        target_call.copy()
+    )
+
+    target_call[
+        ntc_mask
+    ] = (
+        gcfg.ntc_label
+    )
+
+    # An object array of 2.6m entries is still manageable, but keep it only for
+    # this short construction step and immediately convert the final result to
+    # pandas categoricals.
+    klass = np.full(
+        len(
+            target_call
+        ),
+        CLASS_TARGETING,
+        dtype=object,
+    )
+
+    klass[
+        ntc_mask
+    ] = (
+        CLASS_NTC
+    )
+
+    klass[
+        target_call
+        == gcfg.ambiguous_label
+    ] = (
+        CLASS_AMBIGUOUS
+    )
+
+    klass[
+        target_call
+        == gcfg.unassigned_label
+    ] = (
+        CLASS_UNASSIGNED
+    )
+
+    expr.obs[
+        OBS_TARGET
+    ] = pd.Categorical(
+        target_call.astype(
+            str
+        )
+    )
+
+    expr.obs[
+        OBS_CLASS
+    ] = pd.Categorical(
+        klass.astype(
+            str
+        ),
+        categories=[
+            CLASS_TARGETING,
+            CLASS_NTC,
+            CLASS_AMBIGUOUS,
+            CLASS_UNASSIGNED,
+        ],
     )
 
 
-def _log_assignment(expr: ad.AnnData, cfg: Config) -> None:
-    counts = expr.obs[OBS_CLASS].value_counts()
-    n = expr.n_obs
+# ---------------------------------------------------------------------------
+# Logging
+# ---------------------------------------------------------------------------
+
+
+def _log_assignment(
+    expr: ad.AnnData,
+    cfg: Config,
+) -> None:
+    """Log assignment statistics."""
+
+    counts = (
+        expr.obs[
+            OBS_CLASS
+        ]
+        .value_counts()
+    )
+
+    n = (
+        expr.n_obs
+    )
+
+    n_targeting = int(
+        counts.get(
+            CLASS_TARGETING,
+            0,
+        )
+    )
+
+    n_ntc = int(
+        counts.get(
+            CLASS_NTC,
+            0,
+        )
+    )
+
+    n_ambiguous = int(
+        counts.get(
+            CLASS_AMBIGUOUS,
+            0,
+        )
+    )
+
+    n_unassigned = int(
+        counts.get(
+            CLASS_UNASSIGNED,
+            0,
+        )
+    )
+
     logger.info(
-        "Guide assignment: %d targeting (%.1f%%), %d non-targeting, "
-        "%d ambiguous, %d unassigned",
-        counts.get(CLASS_TARGETING, 0),
-        100 * counts.get(CLASS_TARGETING, 0) / max(n, 1),
-        counts.get(CLASS_NTC, 0),
-        counts.get(CLASS_AMBIGUOUS, 0),
-        counts.get(CLASS_UNASSIGNED, 0),
+        "Guide assignment: %d targeting (%.1f%%), "
+        "%d non-targeting, %d ambiguous, %d unassigned",
+        n_targeting,
+        100
+        * n_targeting
+        / max(
+            n,
+            1,
+        ),
+        n_ntc,
+        n_ambiguous,
+        n_unassigned,
     )
-    n_targets = target_genes(expr, cfg).size
-    logger.info("%d distinct target genes assigned", n_targets)
+
+    n_targets = (
+        target_genes(
+            expr,
+            cfg,
+        )
+        .size
+    )
+
+    logger.info(
+        "%d distinct target genes assigned",
+        n_targets,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -270,71 +1842,319 @@ def _log_assignment(expr: ad.AnnData, cfg: Config) -> None:
 # ---------------------------------------------------------------------------
 
 
-def target_genes(expr: ad.AnnData, cfg: Config) -> np.ndarray:
-    """Sorted array of real target genes (excludes NTC/ambiguous/unassigned)."""
-    obs = expr.obs
-    mask = obs[OBS_CLASS] == CLASS_TARGETING
-    return np.array(sorted(obs.loc[mask, OBS_TARGET].astype(str).unique()))
+def target_genes(
+    expr: ad.AnnData,
+    cfg: Config,
+) -> np.ndarray:
+    """Sorted real target genes excluding controls/failure classes."""
+
+    obs = (
+        expr.obs
+    )
+
+    mask = (
+        obs[
+            OBS_CLASS
+        ]
+        == CLASS_TARGETING
+    )
+
+    return np.array(
+        sorted(
+            obs.loc[
+                mask,
+                OBS_TARGET,
+            ]
+            .astype(str)
+            .unique()
+        )
+    )
 
 
-def assignment_summary(expr: ad.AnnData, cfg: Config) -> pd.DataFrame:
-    """Per-target cell counts, flagged for downstream testability."""
-    obs = expr.obs
+def assignment_summary(
+    expr: ad.AnnData,
+    cfg: Config,
+) -> pd.DataFrame:
+    """Per-target counts and downstream testability."""
+
+    obs = (
+        expr.obs
+    )
+
     tab = (
-        obs[OBS_TARGET]
+        obs[
+            OBS_TARGET
+        ]
         .astype(str)
         .value_counts()
-        .rename_axis(OBS_TARGET)
-        .reset_index(name="n_cells")
+        .rename_axis(
+            OBS_TARGET
+        )
+        .reset_index(
+            name="n_cells"
+        )
     )
-    klass = (
-        obs.groupby(obs[OBS_TARGET].astype(str), observed=True)[OBS_CLASS]
-        .agg(lambda s: s.iloc[0])
-        .astype(str)
+
+    # Each target should have one class. Instead of an expensive Python lambda
+    # over every row, drop duplicate target/class pairs first.
+    class_map = (
+        obs[
+            [
+                OBS_TARGET,
+                OBS_CLASS,
+            ]
+        ]
+        .astype(
+            {
+                OBS_TARGET: str,
+                OBS_CLASS: str,
+            }
+        )
+        .drop_duplicates(
+            subset=[
+                OBS_TARGET
+            ]
+        )
+        .set_index(
+            OBS_TARGET
+        )[
+            OBS_CLASS
+        ]
     )
-    tab["class"] = tab[OBS_TARGET].map(klass)
-    tab["detected_in_expression"] = tab[OBS_TARGET].isin(set(expr.var_names))
-    tab["testable"] = (
-        (tab["class"] == CLASS_TARGETING)
-        & tab["detected_in_expression"]
-        & (tab["n_cells"] >= cfg.perturbation.min_cells_per_target)
+
+    tab[
+        "class"
+    ] = (
+        tab[
+            OBS_TARGET
+        ]
+        .map(
+            class_map
+        )
     )
-    return tab.sort_values("n_cells", ascending=False).reset_index(drop=True)
+
+    measured = set(
+        expr.var_names
+    )
+
+    tab[
+        "detected_in_expression"
+    ] = (
+        tab[
+            OBS_TARGET
+        ]
+        .isin(
+            measured
+        )
+    )
+
+    tab[
+        "testable"
+    ] = (
+        (
+            tab[
+                "class"
+            ]
+            == CLASS_TARGETING
+        )
+        & (
+            tab[
+                "detected_in_expression"
+            ]
+        )
+        & (
+            tab[
+                "n_cells"
+            ]
+            >= cfg.perturbation.min_cells_per_target
+        )
+    )
+
+    return (
+        tab.sort_values(
+            "n_cells",
+            ascending=False,
+        )
+        .reset_index(
+            drop=True
+        )
+    )
 
 
-def per_lane_assignment(expr: ad.AnnData, lane_key: str = "lane_id") -> pd.DataFrame:
-    """Assignment-class breakdown per lane — a common batch-failure readout."""
-    if lane_key not in expr.obs.columns:
+def per_lane_assignment(
+    expr: ad.AnnData,
+    lane_key: str = "lane_id",
+) -> pd.DataFrame:
+    """Assignment-class breakdown per lane."""
+
+    if (
+        lane_key
+        not in expr.obs.columns
+    ):
+
         return pd.DataFrame()
+
     tab = (
-        expr.obs.groupby([lane_key, OBS_CLASS], observed=True)
+        expr.obs
+        .groupby(
+            [
+                lane_key,
+                OBS_CLASS,
+            ],
+            observed=True,
+        )
         .size()
-        .unstack(fill_value=0)
+        .unstack(
+            fill_value=0
+        )
     )
-    tab["n_cells"] = tab.sum(axis=1)
-    for c in (CLASS_TARGETING, CLASS_NTC, CLASS_AMBIGUOUS, CLASS_UNASSIGNED):
-        if c in tab.columns:
-            tab[f"pct_{c}"] = 100 * tab[c] / tab["n_cells"]
-    return tab.reset_index()
+
+    tab[
+        "n_cells"
+    ] = (
+        tab.sum(
+            axis=1
+        )
+    )
+
+    for klass in (
+        CLASS_TARGETING,
+        CLASS_NTC,
+        CLASS_AMBIGUOUS,
+        CLASS_UNASSIGNED,
+    ):
+
+        if klass in tab.columns:
+
+            tab[
+                f"pct_{klass}"
+            ] = (
+                100
+                * tab[
+                    klass
+                ]
+                / tab[
+                    "n_cells"
+                ]
+            )
+
+    return (
+        tab.reset_index()
+    )
 
 
-def guide_representation(guides: Optional[ad.AnnData], expr: ad.AnnData) -> pd.DataFrame:
-    """Cells per guide — flags library skew and dropped guides."""
-    if OBS_GUIDE not in expr.obs.columns:
+def guide_representation(
+    guides: Optional[
+        ad.AnnData
+    ],
+    expr: ad.AnnData,
+) -> pd.DataFrame:
+    """Cells per guide."""
+
+    if (
+        OBS_GUIDE
+        not in expr.obs.columns
+    ):
+
         return pd.DataFrame()
-    counts = expr.obs[OBS_GUIDE].astype(str).value_counts()
-    df = counts.rename_axis("guide_id").reset_index(name="n_cells")
-    if guides is not None and "target_gene" in guides.var.columns:
-        mapping = guides.var["target_gene"].astype(str).to_dict()
-        df["target_gene"] = df["guide_id"].map(mapping)
-        missing = sorted(set(guides.var_names.astype(str)) - set(df["guide_id"]))
+
+    counts = (
+        expr.obs[
+            OBS_GUIDE
+        ]
+        .astype(str)
+        .value_counts()
+    )
+
+    df = (
+        counts
+        .rename_axis(
+            "guide_id"
+        )
+        .reset_index(
+            name="n_cells"
+        )
+    )
+
+    if (
+        guides is not None
+        and "target_gene"
+        in guides.var.columns
+    ):
+
+        mapping = (
+            guides.var[
+                "target_gene"
+            ]
+            .astype(str)
+            .to_dict()
+        )
+
+        df[
+            "target_gene"
+        ] = (
+            df[
+                "guide_id"
+            ]
+            .map(
+                mapping
+            )
+        )
+
+        present = set(
+            df[
+                "guide_id"
+            ]
+        )
+
+        missing = [
+            guide
+            for guide
+            in guides.var_names.astype(
+                str
+            )
+            if guide not in present
+        ]
+
         if missing:
+
             extra = pd.DataFrame(
                 {
-                    "guide_id": missing,
-                    "n_cells": 0,
-                    "target_gene": [mapping.get(g) for g in missing],
+                    "guide_id": (
+                        missing
+                    ),
+                    "n_cells": (
+                        np.zeros(
+                            len(
+                                missing
+                            ),
+                            dtype=int,
+                        )
+                    ),
+                    "target_gene": [
+                        mapping.get(
+                            guide
+                        )
+                        for guide
+                        in missing
+                    ],
                 }
             )
-            df = pd.concat([df, extra], ignore_index=True)
-    return df.sort_values("n_cells", ascending=False).reset_index(drop=True)
+
+            df = pd.concat(
+                [
+                    df,
+                    extra,
+                ],
+                ignore_index=True,
+            )
+
+    return (
+        df.sort_values(
+            "n_cells",
+            ascending=False,
+        )
+        .reset_index(
+            drop=True
+        )
+    )

@@ -1,6 +1,7 @@
 run:
   name: ReplogleWeissman2022_K562_essential
   outdir: results/replogle
+  seed: 0
 
 input:
   mode: h5ad
@@ -9,6 +10,8 @@ input:
 
 guides:
   target_split_delims: []
+  ntc_label: ntc
+  ntc_patterns: ["non-targeting"]
 
 qc:
   min_genes_per_cell: null
@@ -19,17 +22,54 @@ qc:
   min_counts_per_cell: null
 
 cluster:
+  n_top_genes: 3000
+  n_pcs: 50
+  n_neighbors: 15
+  leiden_resolution: 1.0
   batch_key: batch
 
+perturbation:
+  controls: ["ntc", "other"]
+  primary_control: ntc
+  min_cells_per_target: 10
+  fdr_alpha: 0.05
+  top_n_report: 12
+
+enrichment:
+  enabled: true
+  cluster_key: leiden
+  controls: ["ntc", "other"]
+  primary_control: ntc
+  fdr_alpha: 0.05
+  min_cells_per_target: 10
+  min_cells_per_cluster: 20
+
+  # Keep false because the pipeline cannot currently be told
+  # that obs["guide_id"] contains the individual guide IDs.
+  guide_concordance: false
+
+  stratify_by: batch
+  permutations: 1000
+  top_n_report: 12
+
 ps_score:
-  enabled: false
+  enabled: true
+  ps_threshold: 0.5
+  expression_cut: mean
+  top_n_report: 12
+
+lochness:
+  enabled: true
 
 modules:
   enabled: false
 
-lochness:
-  enabled: false
+report:
+  title: "Perturb-seq report — Replogle K562 Essential"
+  embed_figures: true
 
 output:
+  h5ad_name: ReplogleWeissman2022_K562_essential_processed.h5ad
+  report_name: report.html
   write_unfiltered_h5ad: false
   archive: false

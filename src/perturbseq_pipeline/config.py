@@ -2,22 +2,78 @@
 
 A run is fully described by one YAML file. Every threshold that appeared as a
 magic number in the prototype notebooks is a named key here with a documented
-default. User YAML is deep-merged onto :data:`DEFAULTS`, so a user file only
-needs to specify what it changes.
+default.
+
+Configuration philosophy
+------------------------
+Biological/statistical parameters and computational scaling parameters are kept
+separate.
+
+For example:
+
+    perturbation.min_cells_per_target
+    lochness.n_neighbors
+    modules.hub_lfc_threshold
+
+describe the analysis itself.
+
+By contrast:
+
+    scaling.mode
+    scaling.large_n_cells
+    scaling.effect_gene_chunk
+    scaling.marker_max_cells
+
+describe *how* the same analysis is executed on different dataset sizes.
+
+This distinction is important: Replogle-scale and KOLF-scale datasets should
+use the same biological definitions wherever possible, while the implementation
+changes automatically when a dense or all-cell operation would become
+impractical.
+
+Adaptive execution
+------------------
+``scaling.mode`` supports three modes:
+
+``auto``
+    Recommended default. STANDARD implementations are used below the configured
+    thresholds and LARGE implementations above them.
+
+``standard``
+    Force the original implementations regardless of dataset size. Primarily
+    useful for regression tests or reproducing an older run. This may exhaust
+    memory on million-cell datasets.
+
+``large``
+    Force the scalable implementations regardless of dataset size. Useful when
+    a dataset below one million cells is still unusually wide, has thousands of
+    perturbations, or when memory is limited.
+
+Existing configuration files remain valid because every scaling parameter has a
+default.
 """
 
 from __future__ import annotations
 
 import copy
+
 from dataclasses import dataclass, field, fields, is_dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Union, get_type_hints
+from typing import (
+    Any,
+    Dict,
+    List,
+    Optional,
+    Union,
+    get_type_hints,
+)
 
 import yaml
 
-# ---------------------------------------------------------------------------
-# Section schemas
-# ---------------------------------------------------------------------------
+
+# ===========================================================================
+# Run
+# ===========================================================================
 
 
 @dataclass
@@ -29,146 +85,230 @@ class RunConfig:
     seed: int = 0
 
 
+# ===========================================================================
+# Input
+# ===========================================================================
+
+
 @dataclass
 class InputConfig:
     """Where the data comes from.
 
-    Two entry points are supported:
+    Two entry points are supported.
 
     ``mtx``
-        One or more 10x MTX directories (``barcodes.tsv.gz``,
-        ``features.tsv.gz``, ``matrix.mtx.gz``) holding both gene-expression and
-        guide features. Provide them via :attr:`mtx_dirs` as a
-        ``{lane_id: path}`` mapping, or as a plain list (lane IDs are then
-        derived from the directory names).
+        One or more 10x MTX directories holding gene-expression and optionally
+        guide features.
 
     ``h5ad``
-        An existing ``.h5ad``. Guide information may live in ``var`` (guide
-        features alongside genes), in a companion guide ``.h5ad``
-        (:attr:`guide_h5ad`), or as a pre-computed per-cell label column in
-        ``obs`` (:attr:`guide_obs_column`, e.g. ``genotype``).
+        An existing AnnData object. Guide information may live in ``var``, in a
+        companion guide h5ad, in a long barcode/guide table, or in a
+        pre-computed ``obs`` column.
     """
 
     mode: str = "auto"  # auto | mtx | h5ad
-    mtx_dirs: Union[Dict[str, str], List[str], None] = None
-    #: Companion guide-count MTX directories, ``{lane_id: path}``, for pipelines
-    #: that quantify gene expression and guides separately (STARsolo runs
-    #: typically produce ``GEX/`` and ``sgRNA/`` side by side rather than one
-    #: matrix with a ``feature_types`` column). Keys must match
-    #: :attr:`mtx_dirs`. The guide matrix often covers the whole barcode
-    #: whitelist, so it is subset to the cells present in the expression matrix.
-    guide_mtx_dirs: Optional[Dict[str, str]] = None
+
+    mtx_dirs: Union[
+        Dict[str, str],
+        List[str],
+        None,
+    ] = None
+
+    guide_mtx_dirs: Optional[
+        Dict[str, str]
+    ] = None
+
     h5ad: Optional[str] = None
+
     guide_h5ad: Optional[str] = None
+
     guide_obs_column: Optional[str] = None
-    #: ``var`` column holding the feature class in 10x-style data.
+
     feature_type_column: str = "feature_types"
+
     gex_feature_type: str = "Gene Expression"
+
     guide_feature_types: List[str] = field(
-        default_factory=lambda: ["Custom", "CRISPR Guide Capture"]
+        default_factory=lambda: [
+            "Custom",
+            "CRISPR Guide Capture",
+        ]
     )
-    #: 10x has two name columns; ``gene_symbols`` matches the prototype
-    #: notebooks (``sc.read_10x_mtx`` default).
+
     var_names: str = "gene_symbols"
+
     cache_mtx: bool = True
-    #: h5ad mode only. Name of the layer holding raw counts, when they are not
-    #: in ``X`` (Seurat exports often put counts in ``X`` and log-normalized
-    #: values in ``layers['logcounts']``).
+
+    #: h5ad layer containing raw counts.
     counts_layer: Optional[str] = None
-    #: h5ad mode only. Name of a layer that already holds log-normalized values.
-    #: When set, the pipeline uses it instead of re-normalizing.
+
+    #: h5ad layer already containing log-normalized expression.
     normalized_layer: Optional[str] = None
-    #: Path to a barcode -> guide table (CSV/TSV), the layout used by
-    #: PS_python's demo: one row per detected guide per cell. When several rows
-    #: share a barcode the pipeline applies the same dominance rule as the
-    #: matrix path rather than taking whichever row came last.
+
+    #: Optional long barcode -> guide table.
     guide_table: Optional[str] = None
-    #: Column names within that table.
+
     guide_table_cell_column: str = "cell"
+
     guide_table_gene_column: str = "gene"
-    guide_table_guide_column: Optional[str] = "sgrna"
-    guide_table_count_column: Optional[str] = "umi_count"
-    #: Library prefixes such as ``S1L1_`` are stripped from the barcode before
-    #: matching against the matrix.
+
+    guide_table_guide_column: Optional[
+        str
+    ] = "sgrna"
+
+    guide_table_count_column: Optional[
+        str
+    ] = "umi_count"
+
     guide_table_strip_prefix: bool = True
 
-    def resolved_mtx_dirs(self) -> Dict[str, str]:
-        """Return ``{lane_id: path}`` regardless of how the user spelled it."""
+    def resolved_mtx_dirs(
+        self,
+    ) -> Dict[str, str]:
+        """Return ``{lane_id: path}`` regardless of input spelling."""
+
         if not self.mtx_dirs:
             return {}
-        if isinstance(self.mtx_dirs, dict):
-            return dict(self.mtx_dirs)
-        out: Dict[str, str] = {}
-        for p in self.mtx_dirs:
-            lane = Path(p).name
-            for prefix in ("filtered_feature_bc_matrix_", "raw_feature_bc_matrix_"):
-                if lane.startswith(prefix):
-                    lane = lane[len(prefix) :]
-            out[lane or Path(p).name] = p
+
+        if isinstance(
+            self.mtx_dirs,
+            dict,
+        ):
+            return dict(
+                self.mtx_dirs
+            )
+
+        out: Dict[
+            str,
+            str,
+        ] = {}
+
+        for path in (
+            self.mtx_dirs
+        ):
+
+            lane = (
+                Path(
+                    path
+                ).name
+            )
+
+            for prefix in (
+                "filtered_feature_bc_matrix_",
+                "raw_feature_bc_matrix_",
+            ):
+
+                if lane.startswith(
+                    prefix
+                ):
+
+                    lane = lane[
+                        len(
+                            prefix
+                        ):
+                    ]
+
+            out[
+                lane
+                or Path(
+                    path
+                ).name
+            ] = path
+
         return out
+
+
+# ===========================================================================
+# Metadata
+# ===========================================================================
 
 
 @dataclass
 class MetadataConfig:
-    """Per-lane sample metadata.
-
-    Required whenever a run spans more than one lane; every column is merged
-    into ``adata.obs`` and travels with the output ``.h5ad``.
-    """
+    """Per-lane sample metadata."""
 
     file: Optional[str] = None
-    #: Column in the metadata file that matches the lane ID.
+
     key_column: str = "lane_id"
-    #: Fail (rather than warn) when a multi-lane run has no metadata file.
+
     require_for_multilane: bool = True
+
+
+# ===========================================================================
+# QC
+# ===========================================================================
 
 
 @dataclass
 class QCConfig:
     """Standard single-cell QC thresholds."""
 
-    min_genes_per_cell: int = 200
-    min_cells_per_gene: int = 3
-    #: Applied after the QC figures are drawn, so the plots show the raw picture.
-    min_genes_final: int = 1000
-    max_pct_mt: float = 20.0
-    max_pct_hb: Optional[float] = None
-    min_counts_per_cell: Optional[int] = None
+    min_genes_per_cell: Optional[
+        int
+    ] = 200
+
+    min_cells_per_gene: Optional[
+        int
+    ] = 3
+
+    min_genes_final: Optional[
+        int
+    ] = 1000
+
+    max_pct_mt: Optional[
+        float
+    ] = 20.0
+
+    max_pct_hb: Optional[
+        float
+    ] = None
+
+    min_counts_per_cell: Optional[
+        int
+    ] = None
+
     mito_prefix: str = "MT-"
-    ribo_prefix: List[str] = field(default_factory=lambda: ["RPS", "RPL"])
+
+    ribo_prefix: List[str] = field(
+        default_factory=lambda: [
+            "RPS",
+            "RPL",
+        ]
+    )
+
     hb_pattern: str = "^HB[^(P)]"
+
+
+# ===========================================================================
+# Guide calling
+# ===========================================================================
 
 
 @dataclass
 class GuideConfig:
-    """Guide-calling rules.
-
-    A cell is assigned to its top guide when that guide has at least
-    :attr:`min_umi` counts *and* dominates the runner-up by
-    :attr:`dominance_ratio`. Otherwise the cell is ``ambiguous``; with no guide
-    counts at all it is ``unassigned``. Both categories are reported, never
-    silently dropped.
-    """
+    """Guide-calling rules."""
 
     min_umi: int = 3
+
     dominance_ratio: float = 2.0
-    #: Hard cap on the runner-up guide's UMI count. A cell carrying real counts
-    #: of a second guide is usually a droplet multiplet, and the dominance ratio
-    #: alone will not catch it: at ratio 2.0 a cell with 1,000 and 100 UMIs
-    #: passes, though 100 UMIs of a second guide is signal, not ambient. The
-    #: ratio scales with depth; this does not.
-    #:
-    #: ``-1`` disables the gate, which is the default so existing runs are
-    #: unaffected. Cells failing it become ``ambiguous``.
+
+    #: -1 disables the runner-up UMI gate.
     max_second_umi: int = -1
-    #: Guide counts above this are considered "detected" for MOI statistics.
+
     detection_threshold: int = 3
-    #: Regex whose first group is the target gene. When null, the guide ID is
-    #: split on :attr:`target_split_delims` and the first field is taken
-    #: (``AFF4_P1P2_1`` and ``AFF4-P1P2.2`` both give ``AFF4``).
-    target_regex: Optional[str] = None
-    target_split_delims: List[str] = field(default_factory=lambda: ["_", "-", "."])
-    #: Case-insensitive regexes marking non-targeting control guides.
+
+    target_regex: Optional[
+        str
+    ] = None
+
+    target_split_delims: List[str] = field(
+        default_factory=lambda: [
+            "_",
+            "-",
+            ".",
+        ]
+    )
+
     ntc_patterns: List[str] = field(
         default_factory=lambda: [
             r"^non[-_.]?targeting",
@@ -178,284 +318,341 @@ class GuideConfig:
             r"^safe[-_.]?harbor",
         ]
     )
-    #: Labels used in ``obs['target_gene']`` for the two failure modes.
+
     unassigned_label: str = "unassigned"
+
     ambiguous_label: str = "ambiguous"
+
     ntc_label: str = "non-targeting"
+
+
+# ===========================================================================
+# Clustering
+# ===========================================================================
 
 
 @dataclass
 class ClusterConfig:
-    """Normalization, embedding and clustering."""
+    """Normalization, dimensionality reduction and clustering."""
 
-    target_sum: Optional[float] = None  # None => median library size
+    target_sum: Optional[
+        float
+    ] = None
+
     n_top_genes: int = 3000
+
     n_pcs: int = 50
+
     n_neighbors: int = 15
+
     leiden_resolution: float = 1.0
+
     umap_min_dist: float = 0.5
-    #: Set to an ``obs`` column (e.g. ``lane_id``) to run Harmony batch
-    #: correction; requires the ``harmony`` extra.
-    batch_key: Optional[str] = None
-    regress_out: List[str] = field(default_factory=list)
-    scale_max_value: Optional[float] = 10.0
-    #: Cluster (and run every downstream analysis) on guide-assigned singlets
-    #: only — cells whose ``perturbation_class`` is ``targeting`` or
-    #: ``non-targeting``. Droplet multiplets flagged ``ambiguous`` by the
-    #: ``guides.max_second_umi`` gate otherwise survive QC and fragment the
-    #: embedding into many small clusters (they are excluded from enrichment /
-    #: perturbation / lochNESS anyway).
-    #:
-    #: Nothing is discarded: the run embeds and clusters *all* QC-passing cells
-    #: first, writes that object as its own ``.h5ad`` with its own UMAPs (where
-    #: the ambiguous and unassigned cells stay visible), and only then filters
-    #: to the singlets and re-embeds them for the analysis. See
-    #: ``output.write_unfiltered_h5ad``. Off by default.
+
+    batch_key: Optional[
+        str
+    ] = None
+
+    regress_out: List[str] = field(
+        default_factory=list
+    )
+
+    scale_max_value: Optional[
+        float
+    ] = 10.0
+
     assigned_only: bool = False
+
+
+# ===========================================================================
+# Perturbation strength
+# ===========================================================================
 
 
 @dataclass
 class PerturbationConfig:
-    """Perturbation-strength testing.
+    """Target-gene perturbation-strength testing."""
 
-    For every target gene that is also measured in the expression matrix, the
-    gene's own expression in perturbed cells is compared against control cells.
-    Both control definitions are reported side by side (see CLAUDE.md).
-    """
+    controls: List[str] = field(
+        default_factory=lambda: [
+            "ntc",
+            "other",
+        ]
+    )
 
-    #: ``ntc``  = cells carrying non-targeting guides.
-    #: ``other`` = cells assigned to a *different* target gene.
-    controls: List[str] = field(default_factory=lambda: ["ntc", "other"])
-    #: Which control drives ranking, the effective-perturbation call and the
-    #: representative figures. Falls back to the other one if unavailable.
     primary_control: str = "ntc"
+
     min_cells_per_target: int = 10
+
     min_control_cells: int = 10
-    #: A gene that is not expressed in control cells cannot be shown to be
-    #: knocked down, and its fold change is numerically meaningless. Targets
-    #: whose control cells fall below this detection rate (percent of control
-    #: cells with non-zero expression) are reported as untestable instead.
+
     min_pct_expressing_control: float = 1.0
+
     fdr_alpha: float = 0.05
-    #: A target is called effectively perturbed at FDR < alpha *and* a log
-    #: fold-change below this (i.e. expression genuinely lower).
+
     max_log2fc_for_hit: float = 0.0
-    #: Number of strongest effects shown inline in the report; every target
-    #: still gets its figures written to the per-gene folder.
+
     top_n_report: int = 12
-    #: Subsample fraction of background cells drawn in per-target UMAPs.
+
     umap_background_fraction: float = 0.1
+
+
+# ===========================================================================
+# Cluster enrichment
+# ===========================================================================
 
 
 @dataclass
 class EnrichmentConfig:
-    """Enrichment of each perturbation across the clusters.
-
-    Asks a different question from :class:`PerturbationConfig`: not "did the
-    guide knock its target down" but "did losing this gene push cells into a
-    particular transcriptional state".
-    """
+    """Enrichment/depletion of perturbations across cell-state clusters."""
 
     enabled: bool = True
-    #: ``obs`` column holding the cluster labels.
+
     cluster_key: str = "leiden"
-    #: Same two definitions as the perturbation test.
-    controls: List[str] = field(default_factory=lambda: ["ntc", "other"])
-    #: Defaults to ``other`` here, unlike the perturbation test: non-targeting
-    #: cells are a small group, and in rare clusters they contribute only a
-    #: handful of cells, which leaves no power and unstable odds ratios exactly
-    #: where the strongest effects live.
+
+    controls: List[str] = field(
+        default_factory=lambda: [
+            "ntc",
+            "other",
+        ]
+    )
+
     primary_control: str = "other"
+
     fdr_alpha: float = 0.05
+
     min_cells_per_target: int = 10
-    #: Clusters smaller than this are not tested (they cannot support a result).
+
     min_cells_per_cluster: int = 20
-    #: Below this many reference cells in a cluster, the pair is flagged as
-    #: low-power rather than silently trusted.
+
     min_reference_cells: int = 10
-    #: Haldane-Anscombe correction keeping odds ratios finite at zero counts.
+
     odds_pseudocount: float = 0.5
-    #: ``obs`` column to stratify on (e.g. ``lane_id``), enabling a
-    #: Cochran-Mantel-Haenszel test that controls for differences in cluster
-    #: composition between lanes. Null means a plain pooled Fisher test.
-    stratify_by: Optional[str] = None
-    #: Report how many of a target's guides independently show each hit; a real
-    #: phenotype should appear across several, a single-guide artefact will not.
+
+    stratify_by: Optional[
+        str
+    ] = None
+
     guide_concordance: bool = True
-    #: Guides with fewer cells than this are ignored in the concordance count.
+
     min_cells_per_guide: int = 5
-    #: Permutations for the omnibus null (0 disables; the chi-square screen is
-    #: unreliable here because many expected counts are small).
+
     permutations: int = 1000
+
     top_n_report: int = 12
+
+
+# ===========================================================================
+# Regulome / modules
+# ===========================================================================
 
 
 @dataclass
 class ModulesConfig:
-    """Co-functional modules and gene programs (the "regulome" map).
-
-    Reimplements the network analysis of Chen et al. (Nature 2023,
-    s41586-023-06733-x): build a perturbation x gene matrix of log2FC vs control,
-    then cluster the perturbations into **co-functional modules** and the genes
-    into **co-regulated programs**, and relate the two.
-
-    The effect values are a pseudobulk mean-difference log2FC (the same quantity
-    the paper reports as log2FC, computed like the perturbation test); gene
-    *selection* uses ``rank_genes_groups`` on the cell-state clusters. Cluster
-    counts are a chosen parameter: programs/modules are labelled numerically
-    (``P1..``/``M1..``), never given biological names.
-    """
+    """Co-functional modules and co-regulated gene programs."""
 
     enabled: bool = True
-    #: ``obs`` column of cell-state clusters whose markers define the gene panel.
+
     cluster_key: str = "leiden"
-    #: How the downstream gene panel is chosen. ``cluster_markers`` = union of the
-    #: top markers of each cluster (the paper's approach); ``hvg`` = highly
-    #: variable genes.
+
     gene_selection: str = "cluster_markers"
-    #: Top markers per cluster (ranked by log2FC) to union into the gene panel.
+
     n_marker_genes_per_cluster: int = 100
-    #: ``rank_genes_groups`` method for marker selection.
+
     marker_method: str = "wilcoxon"
-    #: Perturbations (target genes) with fewer assigned cells are excluded from
-    #: the effect matrix (paper used 48; lowered so single small lanes still run).
+
     min_cells_per_perturbation: int = 20
-    #: Control the effect is measured against: ``ntc`` (preferred) or ``other``.
-    #: Falls back to ``other`` when the dataset has no non-targeting guides; the
-    #: control actually used is recorded in the results and report.
+
     control: str = "ntc"
-    #: Correlation for clustering the gene (program) axis and the perturbation
-    #: (module) axis. The paper used Pearson for programs, Spearman for modules.
+
     program_correlation: str = "pearson"
+
     module_correlation: str = "spearman"
-    #: ``scipy`` linkage method for the hierarchical clustering (paper unspecified).
+
     linkage_method: str = "average"
-    #: Number of programs / modules. Set either to ``null`` to cut the dendrogram
-    #: at ``cluster_distance_threshold`` instead of a fixed count.
-    n_programs: Optional[int] = 4
-    n_modules: Optional[int] = 9
-    #: Distance (1 - correlation) at which to cut the dendrogram when the count is
-    #: ``null``; ignored when a fixed count is given.
-    cluster_distance_threshold: Optional[float] = 0.7
-    #: Score every cell for each program (``sc.tl.score_genes``) → obs columns and
-    #: a program-activity-by-cluster table.
+
+    n_programs: Optional[
+        int
+    ] = 4
+
+    n_modules: Optional[
+        int
+    ] = 9
+
+    cluster_distance_threshold: Optional[
+        float
+    ] = 0.7
+
+    #: Per-cell program scoring is useful but expensive at very large scale.
     score_programs: bool = True
-    #: A gene counts as a "DE gene" of a perturbation (hub-size / network edges)
-    #: when |log2FC| exceeds this AND it is statistically significant at
-    #: ``de_fdr_alpha`` (per-gene Welch t-test, BH-corrected within the
-    #: perturbation). The significance gate matters: without it, low-cell-count
-    #: perturbations rack up spurious "DE genes" from noisy pseudobulk means and
-    #: masquerade as hubs (their DE-gene count anticorrelates with cell number).
+
     hub_lfc_threshold: float = 0.5
-    #: BH-FDR cutoff for calling a gene differentially expressed under a
-    #: perturbation (used for hub sizes and the TF network, not the clustering).
+
     de_fdr_alpha: float = 0.05
-    #: Draw the module-module and TF-hub network graphs (needs the ``networkx``
-    #: extra: ``pip install -e ".[networks]"``). The connectivity heatmap is drawn
-    #: regardless.
+
     draw_networks: bool = True
-    #: Skip the whole stage when fewer than this many perturbations / genes remain
-    #: (the map is meaningless when underpowered — e.g. a single small lane).
+
     min_perturbations: int = 5
+
     min_genes: int = 10
+
     top_n_report: int = 12
+
+
+# ===========================================================================
+# PS score
+# ===========================================================================
 
 
 @dataclass
 class PSScoreConfig:
-    """Per-cell perturbation-response scores, via the ``pertps`` package.
-
-    Delegates to the lab's PS_python implementation
-    (https://github.com/weili-lab/PS_python) of the scMAGeCK perturbation score:
-    for each target it learns the expression signature of the perturbation, then
-    projects every cell onto it. Combined with the target's own expression this
-    separates cells that were genuinely knocked down from escapers.
-
-    ``pertps`` is an optional dependency; install with ``pip install -e ".[ps]"``.
-    """
+    """Per-cell perturbation-response scoring through ``pertps``."""
 
     enabled: bool = True
-    #: Fail rather than skip when ``pertps`` is not installed. Left false so a
-    #: run without the optional extra still completes; the report states that
-    #: the section was skipped and why.
+
     require: bool = False
-    #: Genes used to build the perturbation signature (``top_n`` upstream).
+
     top_n_biomarkers: int = 100
-    #: Upper bound on the raw score before normalization (``scale_factor``).
+
     scale_factor: float = 3.0
-    #: Scores at or above this count as "high"; the vertical cut of the quadrant
-    #: plot. 0.5 matches the PS_python demo.
+
     ps_threshold: float = 0.5
-    #: How the horizontal (expression) cut is placed within the control cells.
-    #: ``mean`` is the default rather than PS_python's ``median`` because
-    #: single-cell counts are zero-inflated: on the demo lane the control median
-    #: is exactly 0 for 35 of 46 targets, which collapses "low expression" into
-    #: "exactly zero". The mean is never degenerate there and moves the net
-    #: signal by ~0.1 percentage points.
-    expression_cut: str = "mean"  # mean | median | quantile
-    #: Quantile of control expression used when ``expression_cut`` is quantile.
+
+    expression_cut: str = "mean"
+
     expression_cut_quantile: float = 0.75
+
     min_cells_per_target: int = 10
+
     min_control_cells: int = 10
-    #: Number of targets whose quadrant plots are embedded in the report; every
-    #: scored target still gets a figure on disk.
+
     top_n_report: int = 12
-    #: Build the supervised LDA embedding from PS_python. Linear discriminant
-    #: analysis is trained on the perturbation labels, so unlike the
-    #: unsupervised UMAP in section 2 the axes are chosen to separate
-    #: perturbations, and the per-cell scores are shown in that space.
-    #: Costly: it scales the full matrix (densifying it), runs PCA, LDA and a
-    #: second UMAP, so expect a few extra minutes and a few GB of memory.
+
     compute_lda_umap: bool = True
-    #: Principal components fed to the LDA.
+
     lda_n_pcs: int = 40
-    #: Genes handed to the LDA step. ``pertps.compute_lda_umap`` scales whatever
-    #: it is given, which densifies the matrix — on a 134k-cell run the full
-    #: gene set would need tens of GB. Restricting to this many highly variable
-    #: genes first keeps it affordable; the step then picks its own 2,000 from
-    #: them, so the embedding is materially unchanged. Null disables the cap.
-    lda_max_genes: Optional[int] = 5000
-    #: Cells scoring at least this are highlighted as high-confidence
-    #: knockdowns on the global LDA summary.
+
+    lda_max_genes: Optional[
+        int
+    ] = 5000
+
     lda_highlight_threshold: float = 0.8
+
+    #: LARGE-mode LDA visualization is restricted to this many cells.
+    #: The PS score itself does not need to use this subset.
+    lda_large_max_cells: int = 200_000
+
+    #: In LARGE mode choose the visualization subset with approximately
+    #: perturbation/control-stratified sampling.
+    lda_large_stratified: bool = True
+
+
+# ===========================================================================
+# lochNESS
+# ===========================================================================
 
 
 @dataclass
 class LochnessConfig:
-    """lochNESS: local neighbourhood enrichment of each perturbation.
-
-    Ported from pertTF. For every cell and perturbation it reports the share of
-    that cell's neighbours carrying the perturbation, divided by the
-    perturbation's overall share, minus one — so 0 is background frequency and
-    positive means locally over-represented.
-
-    Complements the cluster-enrichment section: that one tests discrete Leiden
-    clusters, this one is continuous and cluster-free, so it also sees structure
-    within or across clusters.
-    """
+    """Local neighbourhood enrichment of each perturbation."""
 
     enabled: bool = True
-    #: ``obs`` column holding the perturbation identity.
+
     genotype_key: str = "target_gene"
-    #: Neighbourhood size. The clustering graph (k=15) is far too small: with
-    #: dozens of targets a neighbourhood would be expected to hold a fraction of
-    #: a cell of any one perturbation. pertTF uses 300.
+
     n_neighbors: int = 300
-    #: Components used for the neighbour search.
+
     n_pcs: int = 20
-    #: Embedding to search in. Null prefers the batch-corrected ``X_pca_harmony``
-    #: when present, so neighbourhoods are not defined by lane.
-    use_rep: Optional[str] = None
+
+    use_rep: Optional[
+        str
+    ] = None
+
     recompute_neighbors: bool = True
+
     min_cells_per_target: int = 10
-    #: A cell counts as "enriched" for a perturbation above this score.
+
     enrichment_cut: float = 0.5
-    #: Gaussian noise added to the score. pertTF uses 1e-4 to stabilise model
-    #: training; left at 0 here, where the scores are read rather than trained on.
+
     noise_delta: float = 0.0
-    #: Targets whose per-cell maps are embedded in the report; every scored
-    #: target still gets a figure on disk.
+
     top_n_report: int = 12
+
+    #: Number of perturbations processed together by LARGE implementations.
+    target_chunk_size: int = 128
+
+    #: Whether one ``lochness_<TARGET>`` column is added for every target.
+    #: Fine for small screens, but impossible for 10k-target million-cell runs.
+    store_all_target_scores: bool = True
+
+    #: In AUTO/LARGE execution, individual target columns should not be written
+    #: into obs above this many targets. ``lochness_self`` remains available.
+    max_targets_in_obs: int = 500
+
+
+# ===========================================================================
+# Adaptive scaling
+# ===========================================================================
+
+
+@dataclass
+class ScalingConfig:
+    """Computational scaling policy.
+
+    These options change how an analysis is executed, not what biological
+    quantity is being measured.
+
+    ``mode = auto``
+        Automatically use LARGE implementations above the configured
+        thresholds.
+
+    ``mode = standard``
+        Force the original implementations. Useful for regression testing but
+        potentially unsafe for very large objects.
+
+    ``mode = large``
+        Force memory-aware implementations even below the normal threshold.
+        This is useful for machines with limited RAM, unusually wide matrices,
+        or screens containing thousands of perturbations.
+    """
+
+    mode: str = "auto"
+
+    #: Main global cell-count trigger.
+    large_n_cells: int = 1_000_000
+
+    #: Modules/regulome may independently need LARGE handling because an
+    #: enormous number of perturbations creates a large correlation matrix.
+    large_n_perturbations: int = 5_000
+
+    #: Maximum cells used for feature/marker discovery in LARGE mode.
+    #: Full effect estimation still uses all cells.
+    marker_max_cells: int = 200_000
+
+    #: Gene chunk size for LARGE perturbation x gene calculations.
+    effect_gene_chunk: int = 256
+
+    #: Standard guide-calling chunk size.
+    guide_chunk_size: int = 20_000
+
+    #: A dense guide block larger than this many scalar values should instead
+    #: use the sparse guide implementation.
+    guide_max_dense_elements: int = 20_000_000
+
+    #: Call Python garbage collection between expensive stages in LARGE mode.
+    collect_between_stages: bool = True
+
+    #: Log process resident memory when psutil is available.
+    log_memory: bool = True
+
+    #: Maximum rows of a huge table retained for HTML report assembly. The
+    #: complete table remains written to disk.
+    report_preview_rows: int = 500
+
+
+# ===========================================================================
+# Report
+# ===========================================================================
 
 
 @dataclass
@@ -463,301 +660,1175 @@ class ReportConfig:
     """HTML report assembly."""
 
     title: str = "Perturb-seq analysis report"
-    #: Inline every figure as base64 so the HTML is a single portable file.
+
     embed_figures: bool = True
+
     figure_format: str = "png"
+
     figure_dpi: int = 150
+
     max_table_rows: int = 100
+
+
+# ===========================================================================
+# Outputs
+# ===========================================================================
 
 
 @dataclass
 class OutputConfig:
-    """Where deliverables land.
-
-    Large artifacts (the processed ``.h5ad`` above
-    :attr:`large_file_threshold_mb`) are moved to :attr:`large_file_dir` when
-    set — on Colab that is the Drive folder named in CLAUDE.md — so they never
-    end up staged for git.
-    """
+    """Output files and artifact handling."""
 
     h5ad_name: str = "processed.h5ad"
+
     report_name: str = "report.html"
-    #: With ``cluster.assigned_only``, also write the pre-filter object — every
-    #: QC-passing cell, with its own embedding and clustering — beside the
-    #: analysed one. That is where ambiguous/unassigned cells remain visible on
-    #: a UMAP. Ignored when ``cluster.assigned_only`` is false, since the single
-    #: processed ``.h5ad`` already holds every cell. Doubles the matrix storage.
+
     write_unfiltered_h5ad: bool = True
-    #: Defaults to ``<h5ad_name stem>_all_cells.h5ad``.
-    unfiltered_h5ad_name: Optional[str] = None
-    large_file_dir: Optional[str] = None
+
+    unfiltered_h5ad_name: Optional[
+        str
+    ] = None
+
+    large_file_dir: Optional[
+        str
+    ] = None
+
     large_file_threshold_mb: float = 50.0
-    #: Store the guide count matrix inside the processed ``.h5ad`` rather than
-    #: beside it, as ``obsm['guide_counts']`` with the guide names in
-    #: ``uns['guide_names']``. Sparse, so it costs a few MB, and it keeps the
-    #: guides aligned to the cells by construction.
+
     merge_guides_into_h5ad: bool = True
-    #: Key used for the merged guide matrix.
+
     guide_obsm_key: str = "guide_counts"
-    #: Also write the guide count matrix as its own ``.h5ad``. Redundant once
-    #: the guides are merged, so off by default.
+
     write_guide_h5ad: bool = False
+
     save_figures_pdf: bool = False
-    #: Bundle the run outputs into a single ``.tar.gz`` for sharing. The
-    #: matrices are excluded by default (see :attr:`archive_exclude`), so the
-    #: archive stays small enough to attach to an email or a GitHub release.
+
     archive: bool = True
-    #: Archive filename. When null, ``<run.name>_results.tar.gz`` is used.
-    archive_name: Optional[str] = None
-    #: Glob patterns (matched against paths relative to the run directory)
-    #: excluded from the archive.
+
+    archive_name: Optional[
+        str
+    ] = None
+
     archive_exclude: List[str] = field(
-        default_factory=lambda: ["*.h5ad", "*.h5", "*.loom", "*.tar.gz"]
+        default_factory=lambda: [
+            "*.h5ad",
+            "*.h5",
+            "*.loom",
+            "*.tar.gz",
+        ]
     )
-    #: Write the guide count matrix as a long barcode -> guide table, the
-    #: format PS_python consumes. Generated from the matrix itself, so it is
-    #: reproducible rather than a hand-maintained side file.
+
     write_guide_table: bool = True
-    guide_table_name: Optional[str] = None
-    #: Guides below this many UMIs in a cell are omitted, matching how the
-    #: existing BARCODE_10x_Merged.txt was produced.
+
+    guide_table_name: Optional[
+        str
+    ] = None
+
     guide_table_min_umi: int = 3
+
+
+# ===========================================================================
+# Full configuration
+# ===========================================================================
 
 
 @dataclass
 class Config:
-    """The full run configuration."""
+    """Complete pipeline configuration."""
 
-    run: RunConfig = field(default_factory=RunConfig)
-    input: InputConfig = field(default_factory=InputConfig)
-    metadata: MetadataConfig = field(default_factory=MetadataConfig)
-    qc: QCConfig = field(default_factory=QCConfig)
-    guides: GuideConfig = field(default_factory=GuideConfig)
-    cluster: ClusterConfig = field(default_factory=ClusterConfig)
-    perturbation: PerturbationConfig = field(default_factory=PerturbationConfig)
-    enrichment: EnrichmentConfig = field(default_factory=EnrichmentConfig)
-    modules: ModulesConfig = field(default_factory=ModulesConfig)
-    ps_score: PSScoreConfig = field(default_factory=PSScoreConfig)
-    lochness: LochnessConfig = field(default_factory=LochnessConfig)
-    report: ReportConfig = field(default_factory=ReportConfig)
-    output: OutputConfig = field(default_factory=OutputConfig)
+    run: RunConfig = field(
+        default_factory=RunConfig
+    )
 
-    # -- construction -------------------------------------------------------
+    input: InputConfig = field(
+        default_factory=InputConfig
+    )
+
+    metadata: MetadataConfig = field(
+        default_factory=MetadataConfig
+    )
+
+    qc: QCConfig = field(
+        default_factory=QCConfig
+    )
+
+    guides: GuideConfig = field(
+        default_factory=GuideConfig
+    )
+
+    cluster: ClusterConfig = field(
+        default_factory=ClusterConfig
+    )
+
+    perturbation: PerturbationConfig = field(
+        default_factory=PerturbationConfig
+    )
+
+    enrichment: EnrichmentConfig = field(
+        default_factory=EnrichmentConfig
+    )
+
+    modules: ModulesConfig = field(
+        default_factory=ModulesConfig
+    )
+
+    ps_score: PSScoreConfig = field(
+        default_factory=PSScoreConfig
+    )
+
+    lochness: LochnessConfig = field(
+        default_factory=LochnessConfig
+    )
+
+    # Central scaling policy.
+    scaling: ScalingConfig = field(
+        default_factory=ScalingConfig
+    )
+
+    report: ReportConfig = field(
+        default_factory=ReportConfig
+    )
+
+    output: OutputConfig = field(
+        default_factory=OutputConfig
+    )
+
+    # ------------------------------------------------------------------
+    # Construction
+    # ------------------------------------------------------------------
 
     @classmethod
-    def from_dict(cls, data: Optional[Dict[str, Any]]) -> "Config":
-        """Build a config from a (partial) nested dict, validating keys."""
-        return _build(cls, data or {}, path="")
+    def from_dict(
+        cls,
+        data: Optional[
+            Dict[str, Any]
+        ],
+    ) -> "Config":
+        """Build from a partial nested mapping, rejecting unknown keys."""
+
+        return _build(
+            cls,
+            data or {},
+            path="",
+        )
 
     @classmethod
-    def from_yaml(cls, path: Union[str, Path]) -> "Config":
-        """Load a YAML file into a validated :class:`Config`."""
-        path = Path(path)
+    def from_yaml(
+        cls,
+        path: Union[
+            str,
+            Path,
+        ],
+    ) -> "Config":
+        """Load and validate a YAML configuration."""
+
+        path = Path(
+            path
+        )
+
         if not path.is_file():
-            raise FileNotFoundError(f"Config file not found: {path}")
-        with open(path) as fh:
-            data = yaml.safe_load(fh) or {}
-        if not isinstance(data, dict):
-            raise ValueError(f"Config file must contain a YAML mapping: {path}")
-        cfg = cls.from_dict(data)
+
+            raise FileNotFoundError(
+                f"Config file not found: {path}"
+            )
+
+        with open(
+            path
+        ) as handle:
+
+            data = (
+                yaml.safe_load(
+                    handle
+                )
+                or {}
+            )
+
+        if not isinstance(
+            data,
+            dict,
+        ):
+
+            raise ValueError(
+                f"Config file must contain a YAML mapping: {path}"
+            )
+
+        cfg = cls.from_dict(
+            data
+        )
+
         cfg.validate()
+
         return cfg
 
-    # -- serialization ------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Serialization
+    # ------------------------------------------------------------------
 
-    def to_dict(self) -> Dict[str, Any]:
-        """Return the configuration as a plain nested dict."""
-        return _asdict(self)
+    def to_dict(
+        self,
+    ) -> Dict[str, Any]:
+        """Return configuration as a nested plain dictionary."""
 
-    def dump_yaml(self, path: Union[str, Path]) -> None:
-        """Write the fully-resolved configuration next to the run outputs."""
-        Path(path).parent.mkdir(parents=True, exist_ok=True)
-        with open(path, "w") as fh:
-            yaml.safe_dump(self.to_dict(), fh, sort_keys=False, default_flow_style=False)
+        return _asdict(
+            self
+        )
 
-    # -- validation ---------------------------------------------------------
+    def dump_yaml(
+        self,
+        path: Union[
+            str,
+            Path,
+        ],
+    ) -> None:
+        """Write the fully resolved configuration."""
 
-    def validate(self) -> None:
-        """Check internal consistency; raises :class:`ValueError` on problems."""
-        inp = self.input
-        if inp.mode not in ("auto", "mtx", "h5ad"):
-            raise ValueError(
-                f"input.mode must be one of 'auto', 'mtx', 'h5ad' (got {inp.mode!r})"
+        path = Path(
+            path
+        )
+
+        path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        with open(
+            path,
+            "w",
+        ) as handle:
+
+            yaml.safe_dump(
+                self.to_dict(),
+                handle,
+                sort_keys=False,
+                default_flow_style=False,
             )
 
-        has_mtx = bool(inp.resolved_mtx_dirs())
-        has_h5ad = bool(inp.h5ad)
-        if inp.mode == "mtx" and not has_mtx:
-            raise ValueError("input.mode is 'mtx' but input.mtx_dirs is empty")
+    # ------------------------------------------------------------------
+    # Validation
+    # ------------------------------------------------------------------
 
-        if inp.guide_mtx_dirs:
-            missing = set(inp.resolved_mtx_dirs()) - set(inp.guide_mtx_dirs)
-            if missing:
-                raise ValueError(
-                    "input.guide_mtx_dirs must cover every lane in input.mtx_dirs; "
-                    f"missing {sorted(missing)}"
-                )
-            extra = set(inp.guide_mtx_dirs) - set(inp.resolved_mtx_dirs())
-            if extra:
-                raise ValueError(
-                    f"input.guide_mtx_dirs has lane(s) not in input.mtx_dirs: "
-                    f"{sorted(extra)}"
-                )
-        if inp.mode == "h5ad" and not has_h5ad:
-            raise ValueError("input.mode is 'h5ad' but input.h5ad is not set")
-        if inp.mode == "auto":
-            if has_mtx and has_h5ad:
+    def validate(
+        self,
+    ) -> None:
+        """Check internal consistency."""
+
+        # ==============================================================
+        # Input
+        # ==============================================================
+
+        inp = (
+            self.input
+        )
+
+        if inp.mode not in (
+            "auto",
+            "mtx",
+            "h5ad",
+        ):
+
+            raise ValueError(
+                "input.mode must be one of "
+                "'auto', 'mtx', 'h5ad' "
+                f"(got {inp.mode!r})"
+            )
+
+        has_mtx = bool(
+            inp.resolved_mtx_dirs()
+        )
+
+        has_h5ad = bool(
+            inp.h5ad
+        )
+
+        if (
+            inp.mode == "mtx"
+            and not has_mtx
+        ):
+
+            raise ValueError(
+                "input.mode is 'mtx' but input.mtx_dirs is empty"
+            )
+
+        if (
+            inp.mode == "h5ad"
+            and not has_h5ad
+        ):
+
+            raise ValueError(
+                "input.mode is 'h5ad' but input.h5ad is not set"
+            )
+
+        if (
+            inp.mode == "auto"
+        ):
+
+            if (
+                has_mtx
+                and has_h5ad
+            ):
+
                 raise ValueError(
                     "Both input.mtx_dirs and input.h5ad are set; "
-                    "set input.mode explicitly to choose one."
+                    "set input.mode explicitly."
                 )
-            if not has_mtx and not has_h5ad:
+
+            if (
+                not has_mtx
+                and not has_h5ad
+            ):
+
                 raise ValueError(
-                    "No input given: set input.mtx_dirs (10x MTX mode) "
-                    "or input.h5ad (h5ad mode)."
+                    "No input given: set input.mtx_dirs or input.h5ad."
                 )
 
-        if self.guides.dominance_ratio < 1:
-            raise ValueError("guides.dominance_ratio must be >= 1")
-        if self.guides.min_umi < 0:
-            raise ValueError("guides.min_umi must be >= 0")
+        if inp.guide_mtx_dirs:
 
-        valid_controls = {"ntc", "other"}
-        bad = set(self.perturbation.controls) - valid_controls
-        if bad:
-            raise ValueError(
-                f"perturbation.controls may only contain {sorted(valid_controls)}; "
-                f"got extra {sorted(bad)}"
+            lanes = set(
+                inp.resolved_mtx_dirs()
             )
+
+            guide_lanes = set(
+                inp.guide_mtx_dirs
+            )
+
+            missing = (
+                lanes
+                - guide_lanes
+            )
+
+            if missing:
+
+                raise ValueError(
+                    "input.guide_mtx_dirs must cover every lane; "
+                    f"missing {sorted(missing)}"
+                )
+
+            extra = (
+                guide_lanes
+                - lanes
+            )
+
+            if extra:
+
+                raise ValueError(
+                    "input.guide_mtx_dirs contains lanes not in mtx_dirs: "
+                    f"{sorted(extra)}"
+                )
+
+        # ==============================================================
+        # Guides
+        # ==============================================================
+
+        if (
+            self.guides.dominance_ratio
+            < 1
+        ):
+
+            raise ValueError(
+                "guides.dominance_ratio must be >= 1"
+            )
+
+        if (
+            self.guides.min_umi
+            < 0
+        ):
+
+            raise ValueError(
+                "guides.min_umi must be >= 0"
+            )
+
+        if (
+            self.guides.detection_threshold
+            < 0
+        ):
+
+            raise ValueError(
+                "guides.detection_threshold must be >= 0"
+            )
+
+        # ==============================================================
+        # Clustering
+        # ==============================================================
+
+        if (
+            self.cluster.n_top_genes
+            < 1
+        ):
+
+            raise ValueError(
+                "cluster.n_top_genes must be >= 1"
+            )
+
+        if (
+            self.cluster.n_pcs
+            < 2
+        ):
+
+            raise ValueError(
+                "cluster.n_pcs must be >= 2"
+            )
+
+        if (
+            self.cluster.n_neighbors
+            < 2
+        ):
+
+            raise ValueError(
+                "cluster.n_neighbors must be >= 2"
+            )
+
+        # ==============================================================
+        # Control definitions
+        # ==============================================================
+
+        valid_controls = {
+            "ntc",
+            "other",
+        }
+
+        bad = (
+            set(
+                self.perturbation.controls
+            )
+            - valid_controls
+        )
+
+        if bad:
+
+            raise ValueError(
+                "perturbation.controls may only contain "
+                f"{sorted(valid_controls)}; got {sorted(bad)}"
+            )
+
         if not self.perturbation.controls:
-            raise ValueError("perturbation.controls must not be empty")
-        if self.perturbation.primary_control not in self.perturbation.controls:
+
             raise ValueError(
-                f"perturbation.primary_control ({self.perturbation.primary_control!r}) "
-                f"must be one of perturbation.controls ({self.perturbation.controls})"
+                "perturbation.controls must not be empty"
             )
 
-        if not 0 < self.perturbation.fdr_alpha < 1:
-            raise ValueError("perturbation.fdr_alpha must be in (0, 1)")
-        if not 0 < self.perturbation.umap_background_fraction <= 1:
-            raise ValueError("perturbation.umap_background_fraction must be in (0, 1]")
+        if (
+            self.perturbation.primary_control
+            not in self.perturbation.controls
+        ):
 
-        bad = set(self.enrichment.controls) - valid_controls
+            raise ValueError(
+                "perturbation.primary_control must occur in "
+                "perturbation.controls"
+            )
+
+        if not (
+            0
+            < self.perturbation.fdr_alpha
+            < 1
+        ):
+
+            raise ValueError(
+                "perturbation.fdr_alpha must be in (0, 1)"
+            )
+
+        if not (
+            0
+            < self.perturbation.umap_background_fraction
+            <= 1
+        ):
+
+            raise ValueError(
+                "perturbation.umap_background_fraction must be in (0, 1]"
+            )
+
+        # ==============================================================
+        # Enrichment
+        # ==============================================================
+
+        bad = (
+            set(
+                self.enrichment.controls
+            )
+            - valid_controls
+        )
+
         if bad:
+
             raise ValueError(
-                f"enrichment.controls may only contain {sorted(valid_controls)}; "
-                f"got extra {sorted(bad)}"
+                "enrichment.controls may only contain "
+                f"{sorted(valid_controls)}; got {sorted(bad)}"
             )
+
         if not self.enrichment.controls:
-            raise ValueError("enrichment.controls must not be empty")
-        if self.enrichment.primary_control not in self.enrichment.controls:
-            raise ValueError(
-                f"enrichment.primary_control ({self.enrichment.primary_control!r}) "
-                f"must be one of enrichment.controls ({self.enrichment.controls})"
-            )
-        if not 0 < self.enrichment.fdr_alpha < 1:
-            raise ValueError("enrichment.fdr_alpha must be in (0, 1)")
 
-        m = self.modules
-        if m.control not in valid_controls:
             raise ValueError(
-                f"modules.control must be one of {sorted(valid_controls)} (got {m.control!r})"
+                "enrichment.controls must not be empty"
             )
-        if m.gene_selection not in ("cluster_markers", "hvg"):
+
+        if (
+            self.enrichment.primary_control
+            not in self.enrichment.controls
+        ):
+
             raise ValueError(
-                "modules.gene_selection must be 'cluster_markers' or 'hvg' "
-                f"(got {m.gene_selection!r})"
+                "enrichment.primary_control must occur in enrichment.controls"
             )
-        for fld in ("program_correlation", "module_correlation"):
-            val = getattr(m, fld)
-            if val not in ("pearson", "spearman"):
+
+        if not (
+            0
+            < self.enrichment.fdr_alpha
+            < 1
+        ):
+
+            raise ValueError(
+                "enrichment.fdr_alpha must be in (0, 1)"
+            )
+
+        # ==============================================================
+        # Modules
+        # ==============================================================
+
+        modules = (
+            self.modules
+        )
+
+        if (
+            modules.control
+            not in valid_controls
+        ):
+
+            raise ValueError(
+                "modules.control must be one of "
+                f"{sorted(valid_controls)} "
+                f"(got {modules.control!r})"
+            )
+
+        if (
+            modules.gene_selection
+            not in (
+                "cluster_markers",
+                "hvg",
+            )
+        ):
+
+            raise ValueError(
+                "modules.gene_selection must be "
+                "'cluster_markers' or 'hvg'"
+            )
+
+        for name in (
+            "program_correlation",
+            "module_correlation",
+        ):
+
+            value = getattr(
+                modules,
+                name,
+            )
+
+            if value not in (
+                "pearson",
+                "spearman",
+            ):
+
                 raise ValueError(
-                    f"modules.{fld} must be 'pearson' or 'spearman' (got {val!r})"
+                    f"modules.{name} must be 'pearson' or 'spearman'"
                 )
-        if m.linkage_method not in ("average", "complete", "single", "ward", "weighted"):
-            raise ValueError(
-                "modules.linkage_method must be a scipy linkage method "
-                f"(average/complete/single/ward/weighted; got {m.linkage_method!r})"
+
+        if (
+            modules.linkage_method
+            not in (
+                "average",
+                "complete",
+                "single",
+                "ward",
+                "weighted",
             )
-        if not 0 < m.de_fdr_alpha < 1:
-            raise ValueError("modules.de_fdr_alpha must be in (0, 1)")
-        for fld in ("n_programs", "n_modules"):
-            val = getattr(m, fld)
-            if val is not None and val < 2:
-                raise ValueError(f"modules.{fld} must be >= 2 or null (got {val!r})")
-            if val is None and m.cluster_distance_threshold is None:
+        ):
+
+            raise ValueError(
+                "modules.linkage_method must be a supported scipy "
+                "hierarchical linkage method"
+            )
+
+        if not (
+            0
+            < modules.de_fdr_alpha
+            < 1
+        ):
+
+            raise ValueError(
+                "modules.de_fdr_alpha must be in (0, 1)"
+            )
+
+        for name in (
+            "n_programs",
+            "n_modules",
+        ):
+
+            value = getattr(
+                modules,
+                name,
+            )
+
+            if (
+                value is not None
+                and value < 2
+            ):
+
                 raise ValueError(
-                    f"modules.{fld} is null but modules.cluster_distance_threshold "
-                    "is also null; set one so the dendrogram can be cut."
+                    f"modules.{name} must be >=2 or null"
                 )
 
-        if self.lochness.n_neighbors < 2:
-            raise ValueError("lochness.n_neighbors must be at least 2")
+            if (
+                value is None
+                and modules.cluster_distance_threshold
+                is None
+            ):
 
-        if self.ps_score.expression_cut not in ("mean", "median", "quantile"):
-            raise ValueError(
-                "ps_score.expression_cut must be 'mean', 'median' or 'quantile' "
-                f"(got {self.ps_score.expression_cut!r})"
+                raise ValueError(
+                    f"modules.{name} is null and "
+                    "modules.cluster_distance_threshold is null"
+                )
+
+        # ==============================================================
+        # PS
+        # ==============================================================
+
+        ps = (
+            self.ps_score
+        )
+
+        if (
+            ps.expression_cut
+            not in (
+                "mean",
+                "median",
+                "quantile",
             )
-        if not 0 < self.ps_score.expression_cut_quantile < 1:
-            raise ValueError("ps_score.expression_cut_quantile must be in (0, 1)")
+        ):
 
-    # -- convenience --------------------------------------------------------
+            raise ValueError(
+                "ps_score.expression_cut must be "
+                "'mean', 'median' or 'quantile'"
+            )
+
+        if not (
+            0
+            < ps.expression_cut_quantile
+            < 1
+        ):
+
+            raise ValueError(
+                "ps_score.expression_cut_quantile must be in (0, 1)"
+            )
+
+        if (
+            ps.lda_n_pcs
+            < 2
+        ):
+
+            raise ValueError(
+                "ps_score.lda_n_pcs must be >= 2"
+            )
+
+        if (
+            ps.lda_max_genes is not None
+            and ps.lda_max_genes < 2
+        ):
+
+            raise ValueError(
+                "ps_score.lda_max_genes must be >=2 or null"
+            )
+
+        if (
+            ps.lda_large_max_cells
+            < 10
+        ):
+
+            raise ValueError(
+                "ps_score.lda_large_max_cells must be >=10"
+            )
+
+        # ==============================================================
+        # lochNESS
+        # ==============================================================
+
+        loch = (
+            self.lochness
+        )
+
+        if (
+            loch.n_neighbors
+            < 2
+        ):
+
+            raise ValueError(
+                "lochness.n_neighbors must be >= 2"
+            )
+
+        if (
+            loch.target_chunk_size
+            < 1
+        ):
+
+            raise ValueError(
+                "lochness.target_chunk_size must be >= 1"
+            )
+
+        if (
+            loch.max_targets_in_obs
+            < 1
+        ):
+
+            raise ValueError(
+                "lochness.max_targets_in_obs must be >= 1"
+            )
+
+        # ==============================================================
+        # Scaling
+        # ==============================================================
+
+        scaling = (
+            self.scaling
+        )
+
+        if (
+            scaling.mode
+            not in (
+                "auto",
+                "standard",
+                "large",
+            )
+        ):
+
+            raise ValueError(
+                "scaling.mode must be "
+                "'auto', 'standard' or 'large' "
+                f"(got {scaling.mode!r})"
+            )
+
+        if (
+            scaling.large_n_cells
+            < 1
+        ):
+
+            raise ValueError(
+                "scaling.large_n_cells must be >= 1"
+            )
+
+        if (
+            scaling.large_n_perturbations
+            < 1
+        ):
+
+            raise ValueError(
+                "scaling.large_n_perturbations must be >= 1"
+            )
+
+        if (
+            scaling.marker_max_cells
+            < 1
+        ):
+
+            raise ValueError(
+                "scaling.marker_max_cells must be >= 1"
+            )
+
+        if (
+            scaling.effect_gene_chunk
+            < 1
+        ):
+
+            raise ValueError(
+                "scaling.effect_gene_chunk must be >= 1"
+            )
+
+        if (
+            scaling.guide_chunk_size
+            < 1
+        ):
+
+            raise ValueError(
+                "scaling.guide_chunk_size must be >= 1"
+            )
+
+        if (
+            scaling.guide_max_dense_elements
+            < 1
+        ):
+
+            raise ValueError(
+                "scaling.guide_max_dense_elements must be >= 1"
+            )
+
+        if (
+            scaling.report_preview_rows
+            < 1
+        ):
+
+            raise ValueError(
+                "scaling.report_preview_rows must be >= 1"
+            )
+
+        # ==============================================================
+        # Report / output
+        # ==============================================================
+
+        if (
+            self.report.figure_dpi
+            < 1
+        ):
+
+            raise ValueError(
+                "report.figure_dpi must be >=1"
+            )
+
+        if (
+            self.report.max_table_rows
+            < 1
+        ):
+
+            raise ValueError(
+                "report.max_table_rows must be >=1"
+            )
+
+        if (
+            self.output.large_file_threshold_mb
+            < 0
+        ):
+
+            raise ValueError(
+                "output.large_file_threshold_mb must be >=0"
+            )
+
+    # ------------------------------------------------------------------
+    # Convenience
+    # ------------------------------------------------------------------
 
     @property
-    def outdir(self) -> Path:
-        return Path(self.run.outdir)
+    def outdir(
+        self,
+    ) -> Path:
+        """Run output directory."""
 
-    def resolved_mode(self) -> str:
-        """The effective input mode after ``auto`` resolution."""
-        if self.input.mode != "auto":
-            return self.input.mode
-        return "mtx" if self.input.resolved_mtx_dirs() else "h5ad"
+        return Path(
+            self.run.outdir
+        )
+
+    def resolved_mode(
+        self,
+    ) -> str:
+        """Effective input mode after ``auto`` resolution."""
+
+        if (
+            self.input.mode
+            != "auto"
+        ):
+
+            return (
+                self.input.mode
+            )
+
+        return (
+            "mtx"
+            if self.input.resolved_mtx_dirs()
+            else "h5ad"
+        )
+
+    # ------------------------------------------------------------------
+    # Adaptive execution API
+    # ------------------------------------------------------------------
+
+    def use_large_mode(
+        self,
+        n_cells: int,
+        n_perturbations: Optional[
+            int
+        ] = None,
+    ) -> bool:
+        """Return whether LARGE implementations should be used.
+
+        Explicit mode selection has highest priority.
+
+        ``large``
+            Always True.
+
+        ``standard``
+            Always False.
+
+        ``auto``
+            True when either the global cell threshold or, when supplied, the
+            perturbation-count threshold is reached.
+
+        Examples
+        --------
+        Replogle:
+
+            cfg.use_large_mode(310_385)
+            -> False
+
+        KOLF:
+
+            cfg.use_large_mode(2_659_209)
+            -> True
+
+        Smaller dataset forced to scalable algorithms:
+
+            scaling.mode: large
+
+            cfg.use_large_mode(150_000)
+            -> True
+
+        Million-cell regression test forced through old implementation:
+
+            scaling.mode: standard
+
+            cfg.use_large_mode(2_659_209)
+            -> False
+
+        The final case is permitted deliberately but may exhaust RAM.
+        """
+
+        mode = (
+            self.scaling.mode
+        )
+
+        if (
+            mode == "large"
+        ):
+
+            return True
+
+        if (
+            mode == "standard"
+        ):
+
+            return False
+
+        if (
+            n_cells
+            >= self.scaling.large_n_cells
+        ):
+
+            return True
+
+        if (
+            n_perturbations
+            is not None
+            and n_perturbations
+            >= self.scaling.large_n_perturbations
+        ):
+
+            return True
+
+        return False
+
+    def execution_mode(
+        self,
+        n_cells: int,
+        n_perturbations: Optional[
+            int
+        ] = None,
+    ) -> str:
+        """Return ``'standard'`` or ``'large'`` for logging/provenance."""
+
+        return (
+            "large"
+            if self.use_large_mode(
+                n_cells,
+                n_perturbations,
+            )
+            else "standard"
+        )
 
 
-# ---------------------------------------------------------------------------
-# Dict <-> dataclass helpers
-# ---------------------------------------------------------------------------
+# ===========================================================================
+# Dict -> dataclass
+# ===========================================================================
 
 
-def _build(cls: type, data: Dict[str, Any], path: str) -> Any:
-    """Recursively instantiate nested dataclasses, rejecting unknown keys."""
-    known = {f.name: f for f in fields(cls)}
-    unknown = set(data) - set(known)
+def _build(
+    cls: type,
+    data: Dict[
+        str,
+        Any,
+    ],
+    path: str,
+) -> Any:
+    """Recursively instantiate nested dataclasses and reject unknown keys."""
+
+    known = {
+        item.name: item
+        for item
+        in fields(
+            cls
+        )
+    }
+
+    unknown = (
+        set(
+            data
+        )
+        - set(
+            known
+        )
+    )
+
     if unknown:
-        where = path or "<root>"
+
+        where = (
+            path
+            or "<root>"
+        )
+
         raise ValueError(
-            f"Unknown config key(s) under {where}: {sorted(unknown)}. "
+            f"Unknown config key(s) under {where}: "
+            f"{sorted(unknown)}. "
             f"Valid keys: {sorted(known)}"
         )
-    # ``from __future__ import annotations`` makes ``field.type`` a string, so
-    # resolve the real classes before testing for nested dataclasses.
-    hints = get_type_hints(cls)
-    kwargs: Dict[str, Any] = {}
-    for name in known:
-        if name not in data:
+
+    hints = (
+        get_type_hints(
+            cls
+        )
+    )
+
+    kwargs: Dict[
+        str,
+        Any,
+    ] = {}
+
+    for name in (
+        known
+    ):
+
+        if (
+            name
+            not in data
+        ):
+
             continue
-        value = data[name]
-        ftype = hints.get(name)
-        if is_dataclass(ftype) and isinstance(value, dict):
-            kwargs[name] = _build(ftype, value, f"{path}.{name}" if path else name)
+
+        value = (
+            data[
+                name
+            ]
+        )
+
+        field_type = (
+            hints.get(
+                name
+            )
+        )
+
+        if (
+            is_dataclass(
+                field_type
+            )
+            and isinstance(
+                value,
+                dict,
+            )
+        ):
+
+            kwargs[
+                name
+            ] = _build(
+                field_type,
+                value,
+                (
+                    f"{path}.{name}"
+                    if path
+                    else name
+                ),
+            )
+
         else:
-            kwargs[name] = copy.deepcopy(value)
-    return cls(**kwargs)
+
+            kwargs[
+                name
+            ] = copy.deepcopy(
+                value
+            )
+
+    return cls(
+        **kwargs
+    )
 
 
-def _asdict(obj: Any) -> Any:
-    if is_dataclass(obj):
-        return {f.name: _asdict(getattr(obj, f.name)) for f in fields(obj)}
-    if isinstance(obj, dict):
-        return {k: _asdict(v) for k, v in obj.items()}
-    if isinstance(obj, (list, tuple)):
-        return [_asdict(v) for v in obj]
-    if isinstance(obj, Path):
-        return str(obj)
+# ===========================================================================
+# Dataclass -> dict
+# ===========================================================================
+
+
+def _asdict(
+    obj: Any,
+) -> Any:
+    """Recursively turn dataclasses into YAML-safe structures."""
+
+    if is_dataclass(
+        obj
+    ):
+
+        return {
+            item.name: _asdict(
+                getattr(
+                    obj,
+                    item.name,
+                )
+            )
+            for item
+            in fields(
+                obj
+            )
+        }
+
+    if isinstance(
+        obj,
+        dict,
+    ):
+
+        return {
+            key: _asdict(
+                value
+            )
+            for key, value
+            in obj.items()
+        }
+
+    if isinstance(
+        obj,
+        (
+            list,
+            tuple,
+        ),
+    ):
+
+        return [
+            _asdict(
+                value
+            )
+            for value
+            in obj
+        ]
+
+    if isinstance(
+        obj,
+        Path,
+    ):
+
+        return str(
+            obj
+        )
+
     return obj
 
 
-#: The complete default configuration as a nested dict (used to write
-#: ``config/default.yaml`` and as the documentation source of truth).
-DEFAULTS: Dict[str, Any] = Config().to_dict()
+# ===========================================================================
+# Fully resolved defaults
+# ===========================================================================
+
+
+DEFAULTS: Dict[
+    str,
+    Any,
+] = (
+    Config()
+    .to_dict()
+)

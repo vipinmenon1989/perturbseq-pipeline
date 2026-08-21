@@ -1,17 +1,31 @@
 run:
   name: KOLF_Pan_Genome_QC_Filtered
   outdir: results/kolf
+  seed: 0
 
 input:
   mode: h5ad
   h5ad: ../data/KOLF_Pan_Genome_QC_Filtered.h5ad
+
+  # Existing perturbation assignment in the AnnData.
   guide_obs_column: gene_target
-  counts_layer: counts
+
 
 guides:
+  # gene_target already contains clean target names such as:
+  # DUX4, BBC3, ZFP3, ..., NTC
+  # Therefore do not split target names further.
   target_split_delims: []
 
+  # Convert the dataset-specific "NTC" assignment into the
+  # pipeline's internal non-targeting category "ntc".
+  ntc_label: ntc
+  ntc_patterns: ["NTC"]
+
+
 qc:
+  # This dataset is already QC-filtered.
+  # Do not apply a second arbitrary filtering pass.
   min_genes_per_cell: null
   min_cells_per_gene: null
   min_genes_final: null
@@ -19,18 +33,84 @@ qc:
   max_pct_hb: null
   min_counts_per_cell: null
 
+
 cluster:
+  n_top_genes: 3000
+  n_pcs: 50
+  n_neighbors: 15
+  leiden_resolution: 1.0
+
+  # Present in adata.obs.
   batch_key: batch
 
+
+perturbation:
+  # These are INTERNAL pipeline control classes.
+  # Do NOT put the dataset label "NTC" here.
+  controls: ["ntc", "other"]
+  primary_control: ntc
+
+  min_cells_per_target: 10
+  fdr_alpha: 0.05
+  top_n_report: 12
+
+
+enrichment:
+  enabled: true
+  cluster_key: leiden
+
+  controls: ["ntc", "other"]
+  primary_control: ntc
+
+  fdr_alpha: 0.05
+  min_cells_per_target: 10
+  min_cells_per_cluster: 20
+
+  # KOLF has obs["gRNA"], but the current config schema does not
+  # allow us to explicitly specify a guide-ID column.
+  # Therefore leave this off for now.
+  guide_concordance: false
+
+  # batch exists in adata.obs.
+  stratify_by: batch
+
+  permutations: 1000
+  top_n_report: 12
+
+
 ps_score:
-  enabled: false
+  enabled: true
+
+  # Analysis threshold for now — don't treat <0.5 as junk.
+  ps_threshold: 0.5
+
+  # Same setting as the demo.
+  expression_cut: mean
+
+  top_n_report: 12
+
+
+lochness:
+  enabled: true
+
 
 modules:
   enabled: false
 
-lochness:
-  enabled: false
+
+report:
+  title: "Perturb-seq report — KOLF Pan Genome"
+  embed_figures: true
+
 
 output:
+  h5ad_name: KOLF_Pan_Genome_processed.h5ad
+  report_name: report.html
+
   write_unfiltered_h5ad: false
+
+  # Don't archive a multi-million-cell run while debugging.
   archive: false
+
+  # Guide assignments already exist in the h5ad.
+  write_guide_table: false

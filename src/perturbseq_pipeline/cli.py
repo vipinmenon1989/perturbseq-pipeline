@@ -3,16 +3,44 @@
     perturbseq-pipeline run --config config/demo.yaml
     perturbseq-pipeline init-config my_run.yaml
 
-:func:`run_pipeline` is the same entry point the demo notebook uses, so a
-notebook run and a CLI run execute identical code.
+:func:`run_pipeline` is the same entry point used by notebooks and the CLI, so
+both execute the same analytical workflow.
+
+Adaptive execution
+------------------
+The analytical stages themselves decide whether to use STANDARD or LARGE
+implementations. This driver adds a corresponding orchestration layer.
+
+STANDARD mode
+    Used for ordinary datasets such as Replogle (~310k cells). Existing
+    behaviour is preserved as closely as possible.
+
+LARGE mode
+    Used automatically for million-cell datasets such as KOLF. The biological
+    analysis is unchanged, but object lifetime and output handling are made
+    memory-aware:
+
+    * unnecessary AnnData copies are avoided;
+    * large tables can be written immediately rather than retained twice;
+    * large DataFrames are not duplicated solely for ``reset_index``;
+    * intermediate references are released between stages;
+    * Python garbage collection is requested after expensive stages;
+    * guide matrices are only subset/copied when genuinely required;
+    * optional all-cell H5AD output never blindly copies the full object.
+
+The goal is not to alter results between STANDARD and LARGE runs, but to prevent
+the driver itself from becoming the memory bottleneck after individual
+analytical modules have been made scalable.
 """
 
 from __future__ import annotations
 
 import argparse
+import gc
 import logging
 import sys
 import time
+
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
@@ -22,7 +50,35 @@ import pandas as pd
 from . import __version__
 from .config import Config
 
-logger = logging.getLogger("perturbseq_pipeline")
+
+logger = logging.getLogger(
+    "perturbseq_pipeline"
+)
+
+
+# ---------------------------------------------------------------------------
+# Adaptive execution
+# ---------------------------------------------------------------------------
+
+# Replogle (~310k) stays STANDARD.
+# KOLF (~2.66M) enters LARGE mode.
+LARGE_DATASET_N_CELLS = 1_000_000
+
+
+def _is_large_dataset(
+    expr,
+) -> bool:
+    """Return True when memory-aware orchestration should be used."""
+
+    return (
+        expr.n_obs
+        >= LARGE_DATASET_N_CELLS
+    )
+
+
+# ---------------------------------------------------------------------------
+# Result object
+# ---------------------------------------------------------------------------
 
 
 @dataclass
@@ -33,26 +89,52 @@ class PipelineResult:
     report: Path
     h5ad: Path
     guide_h5ad: Optional[Path]
-    #: The pre-filter object (every QC-passing cell), written only under
-    #: ``cluster.assigned_only`` with ``output.write_unfiltered_h5ad``.
+
+    #: Pre-filter/all-cell object when requested.
     unfiltered_h5ad: Optional[Path] = None
-    #: ``.tar.gz`` bundle of the run outputs (None when archiving is disabled).
+
+    #: Optional .tar.gz result bundle.
     archive: Optional[Path] = None
-    tables: Dict[str, Path] = field(default_factory=dict)
-    figures_dir: Optional[Path] = None
+
+    tables: Dict[
+        str,
+        Path,
+    ] = field(
+        default_factory=dict
+    )
+
+    figures_dir: Optional[
+        Path
+    ] = None
+
     n_cells: int = 0
     n_genes: int = 0
+
     n_targets_tested: int = 0
     n_effective: int = 0
-    runtime_seconds: float = 0.0
-    #: The processed AnnData, for interactive follow-up in a notebook.
-    adata: object = None
-    perturbation_table: Optional[pd.DataFrame] = None
 
-    def summary(self) -> str:
+    runtime_seconds: float = 0.0
+
+    #: The processed AnnData for notebook follow-up.
+    adata: object = None
+
+    perturbation_table: Optional[
+        pd.DataFrame
+    ] = None
+
+    #: STANDARD / LARGE, useful for provenance.
+    execution_mode: str = "standard"
+
+    def summary(
+        self,
+    ) -> str:
+
         return (
-            f"{self.n_cells:,} cells x {self.n_genes:,} genes | "
-            f"{self.n_effective}/{self.n_targets_tested} targets effectively perturbed | "
+            f"{self.n_cells:,} cells x "
+            f"{self.n_genes:,} genes | "
+            f"{self.n_effective}/"
+            f"{self.n_targets_tested} targets effectively perturbed | "
+            f"mode: {self.execution_mode.upper()} | "
             f"report: {self.report}"
         )
 
@@ -62,25 +144,537 @@ class PipelineResult:
 # ---------------------------------------------------------------------------
 
 
-def setup_logging(outdir: Path, verbose: bool = False) -> Path:
-    """Log to both the console and ``<outdir>/logs/run.log``."""
-    logdir = Path(outdir) / "logs"
-    logdir.mkdir(parents=True, exist_ok=True)
-    logfile = logdir / "run.log"
+def setup_logging(
+    outdir: Path,
+    verbose: bool = False,
+) -> Path:
+    """Log to console and ``<outdir>/logs/run.log``."""
 
-    root = logging.getLogger("perturbseq_pipeline")
+    logdir = (
+        Path(
+            outdir
+        )
+        / "logs"
+    )
+
+    logdir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    logfile = (
+        logdir
+        / "run.log"
+    )
+
+    root = logging.getLogger(
+        "perturbseq_pipeline"
+    )
+
     root.handlers.clear()
-    root.setLevel(logging.DEBUG if verbose else logging.INFO)
+
+    root.setLevel(
+        logging.DEBUG
+        if verbose
+        else logging.INFO
+    )
+
     root.propagate = False
 
-    fmt = logging.Formatter("%(asctime)s  %(levelname)-7s %(name)s: %(message)s", "%H:%M:%S")
-    stream = logging.StreamHandler(sys.stdout)
-    stream.setFormatter(fmt)
-    root.addHandler(stream)
-    fileh = logging.FileHandler(logfile, mode="w")
-    fileh.setFormatter(fmt)
-    root.addHandler(fileh)
+    fmt = logging.Formatter(
+        "%(asctime)s  %(levelname)-7s %(name)s: %(message)s",
+        "%H:%M:%S",
+    )
+
+    stream = logging.StreamHandler(
+        sys.stdout
+    )
+
+    stream.setFormatter(
+        fmt
+    )
+
+    root.addHandler(
+        stream
+    )
+
+    file_handler = logging.FileHandler(
+        logfile,
+        mode="w",
+    )
+
+    file_handler.setFormatter(
+        fmt
+    )
+
+    root.addHandler(
+        file_handler
+    )
+
     return logfile
+
+
+# ---------------------------------------------------------------------------
+# Memory logging
+# ---------------------------------------------------------------------------
+
+
+def _log_memory(
+    label: str,
+) -> None:
+    """Log resident memory when psutil is available.
+
+    The dependency is optional; absence never affects the run.
+    """
+
+    try:
+
+        import os
+        import psutil
+
+        process = psutil.Process(
+            os.getpid()
+        )
+
+        rss_gb = (
+            process.memory_info().rss
+            / 1024**3
+        )
+
+        logger.info(
+            "Memory after %s: %.1f GB RSS",
+            label,
+            rss_gb,
+        )
+
+    except Exception:
+
+        return
+
+
+def _collect(
+    label: Optional[
+        str
+    ] = None,
+) -> None:
+    """Release unreachable Python objects between expensive stages."""
+
+    gc.collect()
+
+    if label:
+
+        _log_memory(
+            label
+        )
+
+
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+
+
+def _assigned_singlet_mask(
+    expr,
+):
+    """Boolean mask of targeting / non-targeting assigned cells."""
+
+    from .guides import (
+        CLASS_NTC,
+        CLASS_TARGETING,
+        OBS_CLASS,
+    )
+
+    if (
+        OBS_CLASS
+        not in expr.obs.columns
+    ):
+
+        return None
+
+    return (
+        expr.obs[
+            OBS_CLASS
+        ]
+        .astype(str)
+        .isin(
+            [
+                CLASS_TARGETING,
+                CLASS_NTC,
+            ]
+        )
+        .to_numpy()
+    )
+
+
+# ---------------------------------------------------------------------------
+# Table writing helpers
+# ---------------------------------------------------------------------------
+
+
+def _write_table(
+    name: str,
+    df: Optional[
+        pd.DataFrame
+    ],
+    tabledir: Path,
+    table_paths: Dict[
+        str,
+        Path,
+    ],
+) -> Optional[
+    Path
+]:
+    """Write one table without making another DataFrame copy."""
+
+    if (
+        df is None
+        or len(
+            df
+        ) == 0
+    ):
+
+        return None
+
+    path = (
+        tabledir
+        / f"{name}.csv"
+    )
+
+    df.to_csv(
+        path,
+        index=False,
+    )
+
+    table_paths[
+        name
+    ] = path
+
+    return path
+
+
+def _write_indexed_matrix(
+    name: str,
+    df: Optional[
+        pd.DataFrame
+    ],
+    index_name: str,
+    tabledir: Path,
+    table_paths: Dict[
+        str,
+        Path,
+    ],
+) -> Optional[
+    Path
+]:
+    """Write an indexed matrix directly, avoiding ``reset_index()``.
+
+    ``reset_index`` duplicates the entire matrix. For a KOLF-scale
+    perturbation x gene effect matrix that can mean hundreds of MB of
+    unnecessary extra memory.
+    """
+
+    if (
+        df is None
+        or df.empty
+    ):
+
+        return None
+
+    path = (
+        tabledir
+        / f"{name}.csv"
+    )
+
+    old_name = (
+        df.index.name
+    )
+
+    try:
+
+        df.index.name = (
+            index_name
+        )
+
+        df.to_csv(
+            path,
+            index=True,
+        )
+
+    finally:
+
+        df.index.name = (
+            old_name
+        )
+
+    table_paths[
+        name
+    ] = path
+
+    return path
+
+
+def _table_for_report(
+    tables: Dict[
+        str,
+        pd.DataFrame
+    ],
+    name: str,
+    df: Optional[
+        pd.DataFrame
+    ],
+    *,
+    large_mode: bool,
+    max_rows_large: int = 500,
+) -> None:
+    """Keep only report-sized tables in memory during LARGE runs.
+
+    Full tables are still written to disk separately. The HTML report does not
+    benefit from receiving hundreds of thousands of rows.
+    """
+
+    if (
+        df is None
+        or len(
+            df
+        ) == 0
+    ):
+
+        return
+
+    if (
+        large_mode
+        and len(
+            df
+        )
+        > max_rows_large
+    ):
+
+        tables[
+            name
+        ] = (
+            df.head(
+                max_rows_large
+            )
+            .copy()
+        )
+
+    else:
+
+        tables[
+            name
+        ] = (
+            df
+        )
+
+
+# ---------------------------------------------------------------------------
+# All-cell H5AD writing
+# ---------------------------------------------------------------------------
+
+
+def _write_unfiltered_object(
+    expr,
+    guides,
+    cfg,
+    outdir: Path,
+    io_mod,
+) -> Path:
+    """Write the all-cell object without blindly copying AnnData.
+
+    If no guide matrix exists, ``merge_guides_into_expr`` would do nothing, so
+    copying ``expr`` first would be pure memory waste.
+
+    If a guide matrix does exist, STANDARD mode retains the safe copy behaviour.
+    For LARGE mode we temporarily merge the guide matrix into the existing
+    object, write it, then remove the merged guide keys again.
+    """
+
+    uname = (
+        cfg.output.unfiltered_h5ad_name
+        or (
+            Path(
+                cfg.output.h5ad_name
+            ).stem
+            + "_all_cells.h5ad"
+        )
+    )
+
+    dest = (
+        outdir
+        / uname
+    )
+
+    if guides is None:
+
+        path = io_mod.write_h5ad(
+            expr,
+            dest,
+        )
+
+        return io_mod.relocate_if_large(
+            path,
+            cfg,
+        )
+
+    large_mode = (
+        _is_large_dataset(
+            expr
+        )
+    )
+
+    if not large_mode:
+
+        work = (
+            expr.copy()
+        )
+
+        work = io_mod.merge_guides_into_expr(
+            work,
+            guides,
+            cfg,
+        )
+
+        path = io_mod.write_h5ad(
+            work,
+            dest,
+        )
+
+        del work
+
+        _collect()
+
+        return io_mod.relocate_if_large(
+            path,
+            cfg,
+        )
+
+    # LARGE path:
+    # merge temporarily into expr itself, write, then remove merged guide keys.
+    key = (
+        cfg.output.guide_obsm_key
+    )
+
+    had_obsm = (
+        key
+        in expr.obsm
+    )
+
+    old_obsm = (
+        expr.obsm[
+            key
+        ]
+        if had_obsm
+        else None
+    )
+
+    old_names = (
+        expr.uns.get(
+            "guide_names"
+        )
+    )
+
+    old_targets = (
+        expr.uns.get(
+            "guide_target_genes"
+        )
+    )
+
+    expr = io_mod.merge_guides_into_expr(
+        expr,
+        guides,
+        cfg,
+    )
+
+    path = io_mod.write_h5ad(
+        expr,
+        dest,
+    )
+
+    # Restore pre-write state.
+    if not had_obsm:
+
+        expr.obsm.pop(
+            key,
+            None,
+        )
+
+    else:
+
+        expr.obsm[
+            key
+        ] = old_obsm
+
+    if old_names is None:
+
+        expr.uns.pop(
+            "guide_names",
+            None,
+        )
+
+    else:
+
+        expr.uns[
+            "guide_names"
+        ] = old_names
+
+    if old_targets is None:
+
+        expr.uns.pop(
+            "guide_target_genes",
+            None,
+        )
+
+    else:
+
+        expr.uns[
+            "guide_target_genes"
+        ] = old_targets
+
+    _collect(
+        "large all-cell h5ad write"
+    )
+
+    return io_mod.relocate_if_large(
+        path,
+        cfg,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Guide-output helper
+# ---------------------------------------------------------------------------
+
+
+def _aligned_guides(
+    guides,
+    expr,
+):
+    """Return guide object aligned to expr without copying when already aligned."""
+
+    if guides is None:
+
+        return None
+
+    if (
+        len(
+            guides.obs_names
+        )
+        == len(
+            expr.obs_names
+        )
+        and guides.obs_names.equals(
+            expr.obs_names
+        )
+    ):
+
+        return guides
+
+    return (
+        guides[
+            expr.obs_names
+        ]
+        .copy()
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -88,27 +682,45 @@ def setup_logging(outdir: Path, verbose: bool = False) -> Path:
 # ---------------------------------------------------------------------------
 
 
-def _assigned_singlet_mask(expr):
-    """Boolean mask of guide-assigned singlets (``targeting`` / ``non-targeting``)."""
-    from .guides import CLASS_NTC, CLASS_TARGETING, OBS_CLASS
+def run_pipeline(
+    cfg: Config,
+    verbose: bool = False,
+) -> PipelineResult:
+    """Run the full perturb-seq workflow."""
 
-    if OBS_CLASS not in expr.obs.columns:
-        return None
-    return expr.obs[OBS_CLASS].astype(str).isin([CLASS_TARGETING, CLASS_NTC]).to_numpy()
+    start = (
+        time.time()
+    )
 
-
-def run_pipeline(cfg: Config, verbose: bool = False) -> PipelineResult:
-    """Run every stage and produce the three deliverables."""
-    start = time.time()
     cfg.validate()
 
-    outdir = Path(cfg.run.outdir)
-    outdir.mkdir(parents=True, exist_ok=True)
-    setup_logging(outdir, verbose)
-    logger.info("perturbseq-pipeline v%s — run %r", __version__, cfg.run.name)
-    cfg.dump_yaml(outdir / "logs" / "resolved_config.yaml")
+    outdir = Path(
+        cfg.run.outdir
+    )
 
-    # Imports are deferred so ``--help`` does not pay the scanpy import cost.
+    outdir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    setup_logging(
+        outdir,
+        verbose,
+    )
+
+    logger.info(
+        "perturbseq-pipeline v%s — run %r",
+        __version__,
+        cfg.run.name,
+    )
+
+    cfg.dump_yaml(
+        outdir
+        / "logs"
+        / "resolved_config.yaml"
+    )
+
+    # Deferred imports keep --help fast.
     import numpy as np
     import scanpy as sc
 
@@ -122,250 +734,1268 @@ def run_pipeline(cfg: Config, verbose: bool = False) -> PipelineResult:
     from . import plots as plots_mod
     from . import ps_score as ps_mod
     from . import qc as qc_mod
-    from .report import ReportInputs, build_report
+
+    from .report import (
+        ReportInputs,
+        build_report,
+    )
 
     sc.settings.verbosity = 1
-    np.random.seed(cfg.run.seed)
 
-    registry = plots_mod.FigureRegistry(outdir=outdir, cfg=cfg)
-    tables: Dict[str, pd.DataFrame] = {}
-    warnings: List[str] = []
+    np.random.seed(
+        cfg.run.seed
+    )
 
-    # --- 1. load ----------------------------------------------------------
-    logger.info("=== Stage 1/11: loading input ===")
-    data = io_mod.load_data(cfg)
-    expr, guides = data.expr, data.guides
-    n_cells_input = expr.n_obs
+    registry = plots_mod.FigureRegistry(
+        outdir=outdir,
+        cfg=cfg,
+    )
 
-    # --- 2. QC ------------------------------------------------------------
-    logger.info("=== Stage 2/11: quality control ===")
-    expr = qc_mod.prefilter(expr, cfg)
-    expr = qc_mod.compute_qc_metrics(expr, cfg)
-    plots_mod.plot_qc(expr, registry, stage="before filtering")
-    expr, qc_steps = qc_mod.filter_cells_and_genes(expr, cfg)
-    plots_mod.plot_qc(expr, registry, stage="after filtering")
-    tables["qc_steps"] = qc_steps
-    tables["qc_summary"] = qc_mod.qc_summary_table(expr)
+    # ``tables`` is for report consumption, not necessarily every full table.
+    tables: Dict[
+        str,
+        pd.DataFrame,
+    ] = {}
 
-    # --- 3. guide assignment ---------------------------------------------
-    logger.info("=== Stage 3/11: guide assignment ===")
-    expr = guides_mod.assign_guides(expr, guides, cfg)
-    tables["guide_qc"] = qc_mod.guide_qc_summary(expr, cfg)
-    tables["guide_assignment"] = guides_mod.assignment_summary(expr, cfg)
-    per_lane = guides_mod.per_lane_assignment(expr)
+    warnings: List[
+        str
+    ] = []
+
+    tabledir = (
+        outdir
+        / "tables"
+    )
+
+    tabledir.mkdir(
+        parents=True,
+        exist_ok=True,
+    )
+
+    table_paths: Dict[
+        str,
+        Path,
+    ] = {}
+
+    # =====================================================================
+    # Stage 1: load
+    # =====================================================================
+
+    logger.info(
+        "=== Stage 1/11: loading input ==="
+    )
+
+    data = io_mod.load_data(
+        cfg
+    )
+
+    expr = (
+        data.expr
+    )
+
+    guides = (
+        data.guides
+    )
+
+    n_cells_input = (
+        expr.n_obs
+    )
+
+    large_mode = _is_large_dataset(
+        expr
+    )
+
+    execution_mode = (
+        "large"
+        if large_mode
+        else "standard"
+    )
+
+    logger.info(
+        "Pipeline execution mode: %s (%d cells x %d genes)",
+        execution_mode.upper(),
+        expr.n_obs,
+        expr.n_vars,
+    )
+
+    _log_memory(
+        "input loading"
+    )
+
+    # =====================================================================
+    # Stage 2: QC
+    # =====================================================================
+
+    logger.info(
+        "=== Stage 2/11: quality control ==="
+    )
+
+    expr = qc_mod.prefilter(
+        expr,
+        cfg,
+    )
+
+    expr = qc_mod.compute_qc_metrics(
+        expr,
+        cfg,
+    )
+
+    plots_mod.plot_qc(
+        expr,
+        registry,
+        stage="before filtering",
+    )
+
+    expr, qc_steps = (
+        qc_mod.filter_cells_and_genes(
+            expr,
+            cfg,
+        )
+    )
+
+    plots_mod.plot_qc(
+        expr,
+        registry,
+        stage="after filtering",
+    )
+
+    qc_summary = (
+        qc_mod.qc_summary_table(
+            expr
+        )
+    )
+
+    tables[
+        "qc_steps"
+    ] = qc_steps
+
+    tables[
+        "qc_summary"
+    ] = qc_summary
+
+    _write_table(
+        "qc_steps",
+        qc_steps,
+        tabledir,
+        table_paths,
+    )
+
+    _write_table(
+        "qc_summary",
+        qc_summary,
+        tabledir,
+        table_paths,
+    )
+
+    _collect(
+        "QC"
+    )
+
+    # =====================================================================
+    # Stage 3: guide assignment
+    # =====================================================================
+
+    logger.info(
+        "=== Stage 3/11: guide assignment ==="
+    )
+
+    expr = guides_mod.assign_guides(
+        expr,
+        guides,
+        cfg,
+    )
+
+    guide_qc = (
+        qc_mod.guide_qc_summary(
+            expr,
+            cfg,
+        )
+    )
+
+    guide_assignment = (
+        guides_mod.assignment_summary(
+            expr,
+            cfg,
+        )
+    )
+
+    tables[
+        "guide_qc"
+    ] = guide_qc
+
+    tables[
+        "guide_assignment"
+    ] = guide_assignment
+
+    _write_table(
+        "guide_qc",
+        guide_qc,
+        tabledir,
+        table_paths,
+    )
+
+    _write_table(
+        "guide_assignment",
+        guide_assignment,
+        tabledir,
+        table_paths,
+    )
+
+    per_lane = (
+        guides_mod.per_lane_assignment(
+            expr
+        )
+    )
+
     if not per_lane.empty:
-        tables["assignment_per_lane"] = per_lane
+
+        tables[
+            "assignment_per_lane"
+        ] = per_lane
+
+        _write_table(
+            "assignment_per_lane",
+            per_lane,
+            tabledir,
+            table_paths,
+        )
+
     if guides is not None:
-        tables["guide_representation"] = guides_mod.guide_representation(guides, expr)
-    warnings.extend(qc_mod.check_guide_qc(expr, cfg))
-    plots_mod.plot_guide_qc(expr, guides, registry, cfg)
 
-    # --- 4. clustering ----------------------------------------------------
-    logger.info("=== Stage 4/11: normalization, embedding, clustering ===")
-    expr = cluster_mod.normalize(expr, cfg)
+        guide_representation = (
+            guides_mod.guide_representation(
+                guides,
+                expr,
+            )
+        )
 
-    # With cluster.assigned_only the run embeds twice. The first pass covers
-    # every QC-passing cell: it is what the ambiguous and unassigned cells show
-    # up on, and it is written as its own .h5ad. The analysis then re-embeds the
-    # guide-assigned singlets alone, so multiplets shape neither the HVG/PCA
-    # space nor the clusters. Normalization is per-cell, so it is not repeated.
-    unfiltered_h5ad_path: Optional[Path] = None
-    singlets = _assigned_singlet_mask(expr) if cfg.cluster.assigned_only else None
-    if singlets is not None and singlets.all():
-        singlets = None  # every cell is a singlet: one pass is enough
-    if singlets is not None and not singlets.any():
+        tables[
+            "guide_representation"
+        ] = (
+            guide_representation
+        )
+
+        _write_table(
+            "guide_representation",
+            guide_representation,
+            tabledir,
+            table_paths,
+        )
+
+    warnings.extend(
+        qc_mod.check_guide_qc(
+            expr,
+            cfg,
+        )
+    )
+
+    plots_mod.plot_guide_qc(
+        expr,
+        guides,
+        registry,
+        cfg,
+    )
+
+    _collect(
+        "guide assignment"
+    )
+
+    # =====================================================================
+    # Stage 4: normalization / embedding / clustering
+    # =====================================================================
+
+    logger.info(
+        "=== Stage 4/11: normalization, embedding, clustering ==="
+    )
+
+    expr = cluster_mod.normalize(
+        expr,
+        cfg,
+    )
+
+    unfiltered_h5ad_path: Optional[
+        Path
+    ] = None
+
+    singlets = (
+        _assigned_singlet_mask(
+            expr
+        )
+        if cfg.cluster.assigned_only
+        else None
+    )
+
+    if (
+        singlets is not None
+        and singlets.all()
+    ):
+
+        # All cells already satisfy the assignment condition.
+        singlets = None
+
+    if (
+        singlets is not None
+        and not singlets.any()
+    ):
+
         raise ValueError(
-            "cluster.assigned_only left no guide-assigned singlets to cluster; "
-            "loosen guides.min_umi / guides.dominance_ratio / guides.max_second_umi."
+            "cluster.assigned_only left no guide-assigned singlets "
+            "to cluster; loosen guide assignment thresholds."
         )
 
     if singlets is not None:
-        n_all, n_keep = expr.n_obs, int(singlets.sum())
-        logger.info(
-            "cluster.assigned_only: embedding all %d QC-passing cells first, then "
-            "re-embedding the %d guide-assigned singlets for the analysis "
-            "(%d ambiguous/unassigned cells are excluded from the analysis only).",
-            n_all, n_keep, n_all - n_keep,
+
+        n_all = (
+            expr.n_obs
         )
-        expr = cluster_mod.embed_and_cluster(expr, cfg)
-        tables["clusters_all_cells"] = cluster_mod.cluster_summary(expr)
+
+        n_keep = int(
+            singlets.sum()
+        )
+
+        logger.info(
+            "cluster.assigned_only: embedding all %d QC-passing cells, "
+            "then re-embedding %d assigned singlets "
+            "(%d ambiguous/unassigned excluded from analysis).",
+            n_all,
+            n_keep,
+            n_all - n_keep,
+        )
+
+        expr = cluster_mod.embed_and_cluster(
+            expr,
+            cfg,
+        )
+
+        clusters_all = (
+            cluster_mod.cluster_summary(
+                expr
+            )
+        )
+
+        tables[
+            "clusters_all_cells"
+        ] = clusters_all
+
+        _write_table(
+            "clusters_all_cells",
+            clusters_all,
+            tabledir,
+            table_paths,
+        )
+
         plots_mod.plot_clustering(
-            expr, registry, cfg,
+            expr,
+            registry,
+            cfg,
             name_prefix="all_cells_",
             section=plots_mod.SECTION_GUIDES,
             label=" — all cells, before guide filtering",
         )
-        if cfg.output.write_unfiltered_h5ad:
-            uname = cfg.output.unfiltered_h5ad_name or (
-                Path(cfg.output.h5ad_name).stem + "_all_cells.h5ad"
+
+        if (
+            cfg.output.write_unfiltered_h5ad
+        ):
+
+            unfiltered_h5ad_path = (
+                _write_unfiltered_object(
+                    expr,
+                    guides,
+                    cfg,
+                    outdir,
+                    io_mod,
+                )
             )
-            unfiltered_h5ad_path = io_mod.write_h5ad(
-                io_mod.merge_guides_into_expr(expr.copy(), guides, cfg), outdir / uname
-            )
-            unfiltered_h5ad_path = io_mod.relocate_if_large(unfiltered_h5ad_path, cfg)
+
         warnings.append(
-            f"cluster.assigned_only: the analysis below covers the {n_keep:,} "
-            f"guide-assigned singlets. The {n_all - n_keep:,} ambiguous/unassigned "
-            f"cells are in the all-cells figures and .h5ad; their cluster labels "
-            f"come from a separate embedding and are not comparable to the ones used "
-            f"in the analysis."
+            f"cluster.assigned_only: downstream analysis covers "
+            f"{n_keep:,} guide-assigned singlets. "
+            f"{n_all - n_keep:,} ambiguous/unassigned cells remain only in "
+            "the all-cell embedding/output."
         )
-        expr = cluster_mod.reset_embedding(expr[singlets].copy())
 
-    expr = cluster_mod.embed_and_cluster(expr, cfg)
-    tables["clusters"] = cluster_mod.cluster_summary(expr)
-    plots_mod.plot_clustering(expr, registry, cfg)
+        # This is intrinsically a real subset copy because downstream analysis
+        # now requires a different set of cells. No additional copy is made.
+        expr = (
+            expr[
+                singlets
+            ]
+            .copy()
+        )
 
-    # --- 5. perturbation strength ----------------------------------------
-    logger.info("=== Stage 5/11: perturbation strength ===")
-    results = pert_mod.test_all_targets(expr, cfg)
-    tables["perturbation"] = pert_mod.format_results_table(results, cfg)
-    tables["perturbation_full"] = results.table
-    tables["skipped"] = results.skipped
-    plots_mod.plot_perturbation_overview(results, registry, cfg)
-    plots_mod.plot_per_target(expr, results, registry, cfg)
+        expr = cluster_mod.reset_embedding(
+            expr
+        )
 
-    # --- 6. cluster enrichment -------------------------------------------
+        del singlets
+
+        _collect(
+            "assigned-only subset"
+        )
+
+    expr = cluster_mod.embed_and_cluster(
+        expr,
+        cfg,
+    )
+
+    clusters = (
+        cluster_mod.cluster_summary(
+            expr
+        )
+    )
+
+    tables[
+        "clusters"
+    ] = clusters
+
+    _write_table(
+        "clusters",
+        clusters,
+        tabledir,
+        table_paths,
+    )
+
+    plots_mod.plot_clustering(
+        expr,
+        registry,
+        cfg,
+    )
+
+    _collect(
+        "clustering"
+    )
+
+    # =====================================================================
+    # Stage 5: perturbation strength
+    # =====================================================================
+
+    logger.info(
+        "=== Stage 5/11: perturbation strength ==="
+    )
+
+    results = pert_mod.test_all_targets(
+        expr,
+        cfg,
+    )
+
+    perturbation_formatted = (
+        pert_mod.format_results_table(
+            results,
+            cfg,
+        )
+    )
+
+    _write_table(
+        "perturbation",
+        perturbation_formatted,
+        tabledir,
+        table_paths,
+    )
+
+    _write_table(
+        "perturbation_full",
+        results.table,
+        tabledir,
+        table_paths,
+    )
+
+    _write_table(
+        "skipped",
+        results.skipped,
+        tabledir,
+        table_paths,
+    )
+
+    tables[
+        "perturbation"
+    ] = perturbation_formatted
+
+    _table_for_report(
+        tables,
+        "perturbation_full",
+        results.table,
+        large_mode=large_mode,
+    )
+
+    if (
+        results.skipped is not None
+        and not results.skipped.empty
+    ):
+
+        _table_for_report(
+            tables,
+            "skipped",
+            results.skipped,
+            large_mode=large_mode,
+        )
+
+    plots_mod.plot_perturbation_overview(
+        results,
+        registry,
+        cfg,
+    )
+
+    plots_mod.plot_per_target(
+        expr,
+        results,
+        registry,
+        cfg,
+    )
+
+    _collect(
+        "perturbation strength"
+    )
+
+    # =====================================================================
+    # Stage 6: enrichment
+    # =====================================================================
+
     enrichment = None
+
     if cfg.enrichment.enabled:
-        logger.info("=== Stage 6/11: perturbation enrichment across clusters ===")
-        enrichment = enrich_mod.test_cluster_enrichment(expr, cfg)
-        tables["enrichment"] = enrich_mod.format_enrichment_table(enrichment)
-        tables["enrichment_full"] = enrichment.table
-        tables["enrichment_composition"] = enrichment.composition.reset_index(
-            names="target_gene"
-        )
-        tables["enrichment_effect_magnitude"] = enrichment.effect_magnitude
-        plots_mod.plot_enrichment(expr, enrichment, registry, cfg)
-        plots_mod.plot_enrichment_per_target(expr, enrichment, registry, cfg)
-    else:
-        logger.info("Cluster enrichment disabled (enrichment.enabled: false)")
 
-    # --- 7. co-functional modules & gene programs ------------------------
+        logger.info(
+            "=== Stage 6/11: perturbation enrichment across clusters ==="
+        )
+
+        enrichment = (
+            enrich_mod.test_cluster_enrichment(
+                expr,
+                cfg,
+            )
+        )
+
+        enrichment_fmt = (
+            enrich_mod.format_enrichment_table(
+                enrichment
+            )
+        )
+
+        _write_table(
+            "enrichment",
+            enrichment_fmt,
+            tabledir,
+            table_paths,
+        )
+
+        _write_table(
+            "enrichment_full",
+            enrichment.table,
+            tabledir,
+            table_paths,
+        )
+
+        # composition is indexed by target; write directly without reset_index.
+        _write_indexed_matrix(
+            "enrichment_composition",
+            enrichment.composition,
+            "target_gene",
+            tabledir,
+            table_paths,
+        )
+
+        _write_table(
+            "enrichment_effect_magnitude",
+            enrichment.effect_magnitude,
+            tabledir,
+            table_paths,
+        )
+
+        tables[
+            "enrichment"
+        ] = enrichment_fmt
+
+        _table_for_report(
+            tables,
+            "enrichment_full",
+            enrichment.table,
+            large_mode=large_mode,
+        )
+
+        _table_for_report(
+            tables,
+            "enrichment_effect_magnitude",
+            enrichment.effect_magnitude,
+            large_mode=large_mode,
+        )
+
+        plots_mod.plot_enrichment(
+            expr,
+            enrichment,
+            registry,
+            cfg,
+        )
+
+        plots_mod.plot_enrichment_per_target(
+            expr,
+            enrichment,
+            registry,
+            cfg,
+        )
+
+        _collect(
+            "cluster enrichment"
+        )
+
+    else:
+
+        logger.info(
+            "Cluster enrichment disabled "
+            "(enrichment.enabled: false)"
+        )
+
+    # =====================================================================
+    # Stage 7: modules/programs
+    # =====================================================================
+
     modules_result = None
+
     if cfg.modules.enabled:
-        logger.info("=== Stage 7/11: co-functional modules & gene programs ===")
-        modules_result = modules_mod.compute_modules(expr, cfg)
+
+        logger.info(
+            "=== Stage 7/11: co-functional modules & gene programs ==="
+        )
+
+        modules_result = (
+            modules_mod.compute_modules(
+                expr,
+                cfg,
+            )
+        )
+
         if modules_result is not None:
-            tables["effect_matrix"] = modules_result.effect_matrix.reset_index(
-                names="target_gene"
-            )
-            tables["gene_programs"] = modules_result.gene_programs
-            tables["cofunctional_modules"] = modules_result.modules
-            tables["module_program_strength"] = modules_result.module_program.reset_index(
-                names="module"
-            )
-            if not modules_result.program_activity.empty:
-                tables["program_activity_by_cluster"] = (
-                    modules_result.program_activity.reset_index()
-                )
-            if not modules_result.hubs.empty:
-                tables["tf_hubs"] = modules_result.hubs
-            if not modules_result.tf_edges.empty:
-                tables["tf_edges"] = modules_result.tf_edges
-            if not modules_result.module_connectivity.empty:
-                tables["module_connectivity"] = (
-                    modules_result.module_connectivity.reset_index(names="module")
-                )
-            plots_mod.plot_modules(expr, modules_result, registry, cfg)
-    else:
-        logger.info("Modules/programs disabled (modules.enabled: false)")
 
-    # --- 8. per-cell perturbation scores (pertps / PS_python) -------------
-    logger.info("=== Stage 8/11: per-cell perturbation scores ===")
-    ps_results = ps_mod.compute_ps_scores(expr, cfg)
-    if ps_results is not None and not ps_results.summary.empty:
-        expr = ps_mod.attach_scores(expr, ps_results)
-        if ps_results.lda_umap is not None:
-            expr.obsm["X_lda_umap"] = ps_results.lda_umap
-            if ps_results.lda_label is not None:
-                expr.obs["lda_label"] = pd.Categorical(
-                    ps_results.lda_label.astype(str)
+            # Do NOT call reset_index() on a potentially 10k x 2k matrix.
+            _write_indexed_matrix(
+                "effect_matrix",
+                modules_result.effect_matrix,
+                "target_gene",
+                tabledir,
+                table_paths,
+            )
+
+            _write_table(
+                "gene_programs",
+                modules_result.gene_programs,
+                tabledir,
+                table_paths,
+            )
+
+            _write_table(
+                "cofunctional_modules",
+                modules_result.modules,
+                tabledir,
+                table_paths,
+            )
+
+            _write_indexed_matrix(
+                "module_program_strength",
+                modules_result.module_program,
+                "module",
+                tabledir,
+                table_paths,
+            )
+
+            if (
+                not modules_result
+                .program_activity
+                .empty
+            ):
+
+                _write_indexed_matrix(
+                    "program_activity_by_cluster",
+                    modules_result.program_activity,
+                    "program",
+                    tabledir,
+                    table_paths,
                 )
-        tables["ps_score"] = ps_results.summary
-        if not ps_results.skipped.empty:
-            tables["ps_skipped"] = ps_results.skipped
-        comparison = ps_mod.compare_with_perturbation_strength(
-            ps_results, results.table, results.primary_control
+
+            if (
+                not modules_result
+                .hubs
+                .empty
+            ):
+
+                _write_table(
+                    "tf_hubs",
+                    modules_result.hubs,
+                    tabledir,
+                    table_paths,
+                )
+
+            if (
+                not modules_result
+                .tf_edges
+                .empty
+            ):
+
+                _write_table(
+                    "tf_edges",
+                    modules_result.tf_edges,
+                    tabledir,
+                    table_paths,
+                )
+
+            if (
+                not modules_result
+                .module_connectivity
+                .empty
+            ):
+
+                _write_indexed_matrix(
+                    "module_connectivity",
+                    modules_result.module_connectivity,
+                    "module",
+                    tabledir,
+                    table_paths,
+                )
+
+            # Keep only report-friendly summaries in RAM.
+            tables[
+                "gene_programs"
+            ] = (
+                modules_result.gene_programs
+            )
+
+            tables[
+                "cofunctional_modules"
+            ] = (
+                modules_result.modules
+            )
+
+            if (
+                not modules_result
+                .hubs
+                .empty
+            ):
+
+                _table_for_report(
+                    tables,
+                    "tf_hubs",
+                    modules_result.hubs,
+                    large_mode=large_mode,
+                )
+
+            if (
+                modules_result.note
+            ):
+
+                warnings.append(
+                    "Modules: "
+                    + modules_result.note
+                )
+
+            plots_mod.plot_modules(
+                expr,
+                modules_result,
+                registry,
+                cfg,
+            )
+
+            _collect(
+                "modules/programs"
+            )
+
+    else:
+
+        logger.info(
+            "Modules/programs disabled "
+            "(modules.enabled: false)"
         )
+
+    # =====================================================================
+    # Stage 8: PS score
+    # =====================================================================
+
+    logger.info(
+        "=== Stage 8/11: per-cell perturbation scores ==="
+    )
+
+    ps_results = ps_mod.compute_ps_scores(
+        expr,
+        cfg,
+    )
+
+    if (
+        ps_results is not None
+        and not ps_results.summary.empty
+    ):
+
+        expr = ps_mod.attach_scores(
+            expr,
+            ps_results,
+        )
+
+        if (
+            ps_results.lda_umap
+            is not None
+        ):
+
+            expr.obsm[
+                "X_lda_umap"
+            ] = (
+                ps_results.lda_umap
+            )
+
+            if (
+                ps_results.lda_label
+                is not None
+            ):
+
+                expr.obs[
+                    "lda_label"
+                ] = pd.Categorical(
+                    ps_results
+                    .lda_label
+                    .astype(str)
+                )
+
+        _write_table(
+            "ps_score",
+            ps_results.summary,
+            tabledir,
+            table_paths,
+        )
+
+        tables[
+            "ps_score"
+        ] = (
+            ps_results.summary
+        )
+
+        if (
+            not ps_results.skipped.empty
+        ):
+
+            _write_table(
+                "ps_skipped",
+                ps_results.skipped,
+                tabledir,
+                table_paths,
+            )
+
+            _table_for_report(
+                tables,
+                "ps_skipped",
+                ps_results.skipped,
+                large_mode=large_mode,
+            )
+
+        comparison = (
+            ps_mod.compare_with_perturbation_strength(
+                ps_results,
+                results.table,
+                results.primary_control,
+            )
+        )
+
         if not comparison.empty:
-            tables["ps_vs_perturbation"] = comparison
-        plots_mod.plot_ps_scores(expr, ps_results, results, registry, cfg)
-        plots_mod.plot_ps_lda(expr, ps_results, registry, cfg)
-    elif ps_results is not None and ps_results.note:
-        warnings.append(ps_results.note)
 
-    # --- 8. lochNESS ------------------------------------------------------
-    lochness = None
-    if cfg.lochness.enabled:
-        logger.info("=== Stage 9/11: lochNESS neighbourhood enrichment ===")
-        lochness = loch_mod.compute_lochness(expr, cfg)
-        if lochness is not None and not lochness.summary.empty:
-            expr = loch_mod.attach_scores(expr, lochness)
-            tables["lochness"] = lochness.summary
-            if not lochness.by_cluster.empty:
-                tables["lochness_by_cluster"] = lochness.by_cluster.reset_index(
-                    names="target_gene"
-                )
-            if not lochness.skipped.empty:
-                tables["lochness_skipped"] = lochness.skipped
-            plots_mod.plot_lochness(expr, lochness, registry, cfg)
-        elif lochness is not None and lochness.note:
-            warnings.append(lochness.note)
-    else:
-        logger.info("lochNESS disabled (lochness.enabled: false)")
+            _write_table(
+                "ps_vs_perturbation",
+                comparison,
+                tabledir,
+                table_paths,
+            )
 
-    # --- 9. write deliverables -------------------------------------------
-    logger.info("=== Stage 10/11: writing outputs ===")
-    tabledir = outdir / "tables"
-    tabledir.mkdir(parents=True, exist_ok=True)
-    table_paths: Dict[str, Path] = {}
-    for name, df in tables.items():
-        if df is None or len(df) == 0:
-            continue
-        p = tabledir / f"{name}.csv"
-        df.to_csv(p, index=False)
-        table_paths[name] = p
-    tables["manifest"] = registry.manifest()
-    registry.manifest().to_csv(tabledir / "figure_manifest.csv", index=False)
+            tables[
+                "ps_vs_perturbation"
+            ] = comparison
 
-    expr = io_mod.merge_guides_into_expr(expr, guides, cfg)
-    h5ad_path = io_mod.write_h5ad(expr, outdir / cfg.output.h5ad_name)
-    h5ad_path = io_mod.relocate_if_large(h5ad_path, cfg)
-
-    guide_h5ad_path: Optional[Path] = None
-    if guides is not None and cfg.output.write_guide_h5ad:
-        gname = Path(cfg.output.h5ad_name).stem + "_guides.h5ad"
-        guide_h5ad_path = io_mod.write_h5ad(guides[expr.obs_names].copy(), outdir / gname)
-        guide_h5ad_path = io_mod.relocate_if_large(guide_h5ad_path, cfg)
-
-    guide_table_path: Optional[Path] = None
-    if guides is not None and cfg.output.write_guide_table:
-        tname = cfg.output.guide_table_name or f"{cfg.run.name}_guide_barcodes.txt"
-        guide_table_path = io_mod.write_guide_table(
-            guides[expr.obs_names].copy(), expr, cfg, outdir / tname
+        plots_mod.plot_ps_scores(
+            expr,
+            ps_results,
+            results,
+            registry,
+            cfg,
         )
 
-    # --- 10. report --------------------------------------------------------
-    logger.info("=== Stage 11/11: building report ===")
-    n_hits = len(results.hits) if not results.table.empty else 0
+        plots_mod.plot_ps_lda(
+            expr,
+            ps_results,
+            registry,
+            cfg,
+        )
+
+        _collect(
+            "PS score"
+        )
+
+    elif (
+        ps_results is not None
+        and ps_results.note
+    ):
+
+        warnings.append(
+            ps_results.note
+        )
+
+    # =====================================================================
+    # Stage 9: lochNESS
+    # =====================================================================
+
+    lochness = None
+
+    if cfg.lochness.enabled:
+
+        logger.info(
+            "=== Stage 9/11: lochNESS neighbourhood enrichment ==="
+        )
+
+        lochness = (
+            loch_mod.compute_lochness(
+                expr,
+                cfg,
+            )
+        )
+
+        if (
+            lochness is not None
+            and not lochness.summary.empty
+        ):
+
+            expr = loch_mod.attach_scores(
+                expr,
+                lochness,
+            )
+
+            _write_table(
+                "lochness",
+                lochness.summary,
+                tabledir,
+                table_paths,
+            )
+
+            tables[
+                "lochness"
+            ] = (
+                lochness.summary
+            )
+
+            if (
+                not lochness
+                .by_cluster
+                .empty
+            ):
+
+                _write_indexed_matrix(
+                    "lochness_by_cluster",
+                    lochness.by_cluster,
+                    "target_gene",
+                    tabledir,
+                    table_paths,
+                )
+
+            if (
+                not lochness
+                .skipped
+                .empty
+            ):
+
+                _write_table(
+                    "lochness_skipped",
+                    lochness.skipped,
+                    tabledir,
+                    table_paths,
+                )
+
+                _table_for_report(
+                    tables,
+                    "lochness_skipped",
+                    lochness.skipped,
+                    large_mode=large_mode,
+                )
+
+            plots_mod.plot_lochness(
+                expr,
+                lochness,
+                registry,
+                cfg,
+            )
+
+            _collect(
+                "lochNESS"
+            )
+
+        elif (
+            lochness is not None
+            and lochness.note
+        ):
+
+            warnings.append(
+                lochness.note
+            )
+
+    else:
+
+        logger.info(
+            "lochNESS disabled "
+            "(lochness.enabled: false)"
+        )
+
+    # =====================================================================
+    # Stage 10: write outputs
+    # =====================================================================
+
+    logger.info(
+        "=== Stage 10/11: writing outputs ==="
+    )
+
+    manifest = (
+        registry.manifest()
+    )
+
+    manifest_path = (
+        tabledir
+        / "figure_manifest.csv"
+    )
+
+    manifest.to_csv(
+        manifest_path,
+        index=False,
+    )
+
+    table_paths[
+        "figure_manifest"
+    ] = (
+        manifest_path
+    )
+
+    tables[
+        "manifest"
+    ] = (
+        manifest
+    )
+
+    # --------------------------------------------------------------
+    # Merge guides into final object
+    # --------------------------------------------------------------
+
+    expr = (
+        io_mod.merge_guides_into_expr(
+            expr,
+            guides,
+            cfg,
+        )
+    )
+
+    # --------------------------------------------------------------
+    # Final expression H5AD
+    # --------------------------------------------------------------
+
+    h5ad_path = (
+        io_mod.write_h5ad(
+            expr,
+            outdir
+            / cfg.output.h5ad_name,
+        )
+    )
+
+    h5ad_path = (
+        io_mod.relocate_if_large(
+            h5ad_path,
+            cfg,
+        )
+    )
+
+    _collect(
+        "processed h5ad write"
+    )
+
+    # --------------------------------------------------------------
+    # Guide H5AD
+    # --------------------------------------------------------------
+
+    guide_h5ad_path: Optional[
+        Path
+    ] = None
+
+    aligned_guides = (
+        _aligned_guides(
+            guides,
+            expr,
+        )
+        if guides is not None
+        else None
+    )
+
+    if (
+        aligned_guides is not None
+        and cfg.output.write_guide_h5ad
+    ):
+
+        gname = (
+            Path(
+                cfg.output.h5ad_name
+            ).stem
+            + "_guides.h5ad"
+        )
+
+        guide_h5ad_path = (
+            io_mod.write_h5ad(
+                aligned_guides,
+                outdir
+                / gname,
+            )
+        )
+
+        guide_h5ad_path = (
+            io_mod.relocate_if_large(
+                guide_h5ad_path,
+                cfg,
+            )
+        )
+
+    # --------------------------------------------------------------
+    # Guide barcode table
+    # --------------------------------------------------------------
+
+    guide_table_path: Optional[
+        Path
+    ] = None
+
+    if (
+        aligned_guides is not None
+        and cfg.output.write_guide_table
+    ):
+
+        tname = (
+            cfg.output.guide_table_name
+            or (
+                f"{cfg.run.name}"
+                "_guide_barcodes.txt"
+            )
+        )
+
+        guide_table_path = (
+            io_mod.write_guide_table(
+                aligned_guides,
+                expr,
+                cfg,
+                outdir
+                / tname,
+            )
+        )
+
+    _collect(
+        "output matrices"
+    )
+
+    # =====================================================================
+    # Stage 11: report
+    # =====================================================================
+
+    logger.info(
+        "=== Stage 11/11: building report ==="
+    )
+
+    n_hits = (
+        len(
+            results.hits
+        )
+        if not results.table.empty
+        else 0
+    )
+
     outputs = {
-        "Processed h5ad": str(h5ad_path),
-        "Report": str(outdir / cfg.output.report_name),
-        "Figures": str(registry.figdir),
-        "Per-target figures": str(registry.figdir / plots_mod.SECTION_PER_GENE),
-        "Tables": str(tabledir),
-        "Log": str(outdir / "logs" / "run.log"),
+        "Processed h5ad": str(
+            h5ad_path
+        ),
+        "Report": str(
+            outdir
+            / cfg.output.report_name
+        ),
+        "Figures": str(
+            registry.figdir
+        ),
+        "Per-target figures": str(
+            registry.figdir
+            / plots_mod.SECTION_PER_GENE
+        ),
+        "Tables": str(
+            tabledir
+        ),
+        "Log": str(
+            outdir
+            / "logs"
+            / "run.log"
+        ),
     }
+
     if unfiltered_h5ad_path:
-        outputs["All-cells h5ad (before guide filtering)"] = str(unfiltered_h5ad_path)
+
+        outputs[
+            "All-cells h5ad (before guide filtering)"
+        ] = str(
+            unfiltered_h5ad_path
+        )
+
     if guide_h5ad_path:
-        outputs["Guide count h5ad"] = str(guide_h5ad_path)
+
+        outputs[
+            "Guide count h5ad"
+        ] = str(
+            guide_h5ad_path
+        )
+
     if guide_table_path:
-        outputs["Guide barcode table"] = str(guide_table_path)
-    archive_name = cfg.output.archive_name or f"{cfg.run.name}_results.tar.gz"
+
+        outputs[
+            "Guide barcode table"
+        ] = str(
+            guide_table_path
+        )
+
+    archive_name = (
+        cfg.output.archive_name
+        or (
+            f"{cfg.run.name}"
+            "_results.tar.gz"
+        )
+    )
+
     if cfg.output.archive:
-        outputs["Results archive"] = str(outdir / archive_name)
+
+        outputs[
+            "Results archive"
+        ] = str(
+            outdir
+            / archive_name
+        )
+
+    summary_cards = [
+        (
+            "Cells analysed",
+            f"{expr.n_obs:,}",
+        ),
+        (
+            "Genes",
+            f"{expr.n_vars:,}",
+        ),
+        (
+            "Lanes",
+            f"{data.n_lanes}",
+        ),
+        (
+            "Target genes",
+            (
+                f"{guides_mod.target_genes(expr, cfg).size}"
+            ),
+        ),
+        (
+            "Clusters",
+            (
+                f"{expr.obs[cluster_mod.CLUSTER_KEY].nunique()}"
+            ),
+        ),
+        (
+            "Effective knockdowns",
+            f"{n_hits}",
+        ),
+        (
+            "Execution mode",
+            execution_mode.upper(),
+        ),
+    ]
 
     report_inputs = ReportInputs(
         cfg=cfg,
@@ -377,33 +2007,59 @@ def run_pipeline(cfg: Config, verbose: bool = False) -> PipelineResult:
         lochness=lochness,
         tables=tables,
         warnings=warnings,
-        summary_cards=[
-            ("Cells analysed", f"{expr.n_obs:,}"),
-            ("Genes", f"{expr.n_vars:,}"),
-            ("Lanes", f"{data.n_lanes}"),
-            ("Target genes", f"{guides_mod.target_genes(expr, cfg).size}"),
-            ("Clusters", f"{expr.obs[cluster_mod.CLUSTER_KEY].nunique()}"),
-            ("Effective knockdowns", f"{n_hits}"),
-        ],
+        summary_cards=summary_cards,
         input_mode=cfg.resolved_mode(),
-        input_source="; ".join(f"{k}: {v}" for k, v in data.lanes.items()),
-        lanes=f"{data.n_lanes} ({', '.join(data.lanes)})",
-        metadata_source=cfg.metadata.file or "",
+        input_source="; ".join(
+            f"{key}: {value}"
+            for key, value
+            in data.lanes.items()
+        ),
+        lanes=(
+            f"{data.n_lanes} "
+            f"({', '.join(data.lanes)})"
+        ),
+        metadata_source=(
+            cfg.metadata.file
+            or ""
+        ),
         guide_source_text=(
             "guide count matrix"
-            if data.guide_source == "matrix"
-            else f"pre-computed labels in obs[{cfg.input.guide_obs_column!r}]"
+            if data.guide_source
+            == "matrix"
+            else (
+                "pre-computed labels in "
+                f"obs[{cfg.input.guide_obs_column!r}]"
+            )
         ),
         outputs=outputs,
     )
-    report_path = build_report(report_inputs, outdir / cfg.output.report_name)
 
-    # Archive last, so the bundle contains the finished report.
-    archive_path = io_mod.archive_results(outdir, cfg)
+    report_path = (
+        build_report(
+            report_inputs,
+            outdir
+            / cfg.output.report_name,
+        )
+    )
 
-    runtime = time.time() - start
+    # Archive only after report generation.
+    archive_path = (
+        io_mod.archive_results(
+            outdir,
+            cfg,
+        )
+    )
+
+    runtime = (
+        time.time()
+        - start
+    )
+
     logger.info(
-        "Done in %.1f s — %d/%d input cells retained", runtime, expr.n_obs, n_cells_input
+        "Done in %.1f s — %d/%d input cells retained",
+        runtime,
+        expr.n_obs,
+        n_cells_input,
     )
 
     result = PipelineResult(
@@ -417,13 +2073,20 @@ def run_pipeline(cfg: Config, verbose: bool = False) -> PipelineResult:
         figures_dir=registry.figdir,
         n_cells=expr.n_obs,
         n_genes=expr.n_vars,
-        n_targets_tested=len(results.table),
+        n_targets_tested=len(
+            results.table
+        ),
         n_effective=n_hits,
         runtime_seconds=runtime,
         adata=expr,
         perturbation_table=results.table,
+        execution_mode=execution_mode,
     )
-    logger.info(result.summary())
+
+    logger.info(
+        result.summary()
+    )
+
     return result
 
 
@@ -433,52 +2096,162 @@ def run_pipeline(cfg: Config, verbose: bool = False) -> PipelineResult:
 
 
 def _build_parser() -> argparse.ArgumentParser:
-    p = argparse.ArgumentParser(
+    """Build command-line parser."""
+
+    parser = argparse.ArgumentParser(
         prog="perturbseq-pipeline",
-        description="Perturb-seq QC, clustering and perturbation-strength pipeline.",
+        description=(
+            "Perturb-seq QC, clustering and perturbation analysis pipeline."
+        ),
     )
-    p.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
-    sub = p.add_subparsers(dest="command", required=True)
 
-    run = sub.add_parser("run", help="run the pipeline from a config file")
-    run.add_argument("-c", "--config", required=True, help="path to the run config YAML")
-    run.add_argument("-o", "--outdir", default=None, help="override run.outdir")
-    run.add_argument("-n", "--name", default=None, help="override run.name")
-    run.add_argument("-v", "--verbose", action="store_true", help="debug-level logging")
+    parser.add_argument(
+        "--version",
+        action="version",
+        version=(
+            f"%(prog)s {__version__}"
+        ),
+    )
 
-    init = sub.add_parser("init-config", help="write a fully-commented default config")
-    init.add_argument("path", help="where to write the config YAML")
+    sub = parser.add_subparsers(
+        dest="command",
+        required=True,
+    )
 
-    return p
+    run = sub.add_parser(
+        "run",
+        help="run the pipeline from a config file",
+    )
+
+    run.add_argument(
+        "-c",
+        "--config",
+        required=True,
+        help="path to run config YAML",
+    )
+
+    run.add_argument(
+        "-o",
+        "--outdir",
+        default=None,
+        help="override run.outdir",
+    )
+
+    run.add_argument(
+        "-n",
+        "--name",
+        default=None,
+        help="override run.name",
+    )
+
+    run.add_argument(
+        "-v",
+        "--verbose",
+        action="store_true",
+        help="debug-level logging",
+    )
+
+    init = sub.add_parser(
+        "init-config",
+        help="write a default config",
+    )
+
+    init.add_argument(
+        "path",
+        help="where to write the config YAML",
+    )
+
+    return parser
 
 
-def main(argv: Optional[List[str]] = None) -> int:
-    args = _build_parser().parse_args(argv)
+def main(
+    argv: Optional[
+        List[str]
+    ] = None,
+) -> int:
+    """CLI entry point."""
 
-    if args.command == "init-config":
+    args = (
+        _build_parser()
+        .parse_args(
+            argv
+        )
+    )
+
+    if (
+        args.command
+        == "init-config"
+    ):
+
         cfg = Config()
-        cfg.dump_yaml(Path(args.path))
-        print(f"Wrote default configuration to {args.path}")
-        print("Edit input.mtx_dirs (10x mode) or input.h5ad (h5ad mode), then run:")
-        print(f"  perturbseq-pipeline run --config {args.path}")
+
+        cfg.dump_yaml(
+            Path(
+                args.path
+            )
+        )
+
+        print(
+            f"Wrote default configuration to {args.path}"
+        )
+
+        print(
+            "Edit input.mtx_dirs (10x mode) or input.h5ad (h5ad mode), then run:"
+        )
+
+        print(
+            f"  perturbseq-pipeline run --config {args.path}"
+        )
+
         return 0
 
-    cfg = Config.from_yaml(args.config)
+    cfg = Config.from_yaml(
+        args.config
+    )
+
     if args.outdir:
-        cfg.run.outdir = args.outdir
+
+        cfg.run.outdir = (
+            args.outdir
+        )
+
     if args.name:
-        cfg.run.name = args.name
+
+        cfg.run.name = (
+            args.name
+        )
 
     try:
-        result = run_pipeline(cfg, verbose=args.verbose)
-    except Exception as exc:  # surfaced as a clean message, full trace in the log
-        logger.exception("Pipeline failed: %s", exc)
-        print(f"\nERROR: {exc}", file=sys.stderr)
+
+        result = run_pipeline(
+            cfg,
+            verbose=args.verbose,
+        )
+
+    except Exception as exc:
+
+        logger.exception(
+            "Pipeline failed: %s",
+            exc,
+        )
+
+        print(
+            f"\nERROR: {exc}",
+            file=sys.stderr,
+        )
+
         return 1
 
-    print("\n" + result.summary())
+    print(
+        "\n"
+        + result.summary()
+    )
+
     return 0
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+
+    raise SystemExit(
+        main()
+    )

@@ -1,0 +1,22 @@
+2026-08-21 13:40:27,143 - harmonypy - INFO - Running Harmony
+2026-08-21 13:40:27,143 - harmonypy - INFO -   Parameters:
+2026-08-21 13:40:27,143 - harmonypy - INFO -     max_iter_harmony: 10
+2026-08-21 13:40:27,143 - harmonypy - INFO -     max_iter_kmeans: 4
+2026-08-21 13:40:27,143 - harmonypy - INFO -     epsilon_cluster: 0.001
+2026-08-21 13:40:27,143 - harmonypy - INFO -     epsilon_harmony: 0.01
+2026-08-21 13:40:27,143 - harmonypy - INFO -     nclust: 100
+2026-08-21 13:40:27,143 - harmonypy - INFO -     block_size: 0.05
+2026-08-21 13:40:27,143 - harmonypy - INFO -     lamb: dynamic (alpha=0.2)
+2026-08-21 13:40:27,144 - harmonypy - INFO -     theta: [2. 2. 2. 2. 2. 2. 2. 2. 2. 2. 2. 2. 2. 2. 2. 2. 2. 2. 2. 2. 2. 2. 2. 2.
+ 2. 2. 2. 2. 2. 2. 2. 2. 2. 2. 2. 2. 2. 2. 2. 2. 2. 2. 2. 2. 2. 2. 2. 2.]
+2026-08-21 13:40:27,144 - harmonypy - INFO -     sigma: [0.1 0.1 0.1 0.1 0.1]...
+2026-08-21 13:40:27,144 - harmonypy - INFO -     verbose: True
+2026-08-21 13:40:27,144 - harmonypy - INFO -     random_state: 0
+2026-08-21 13:40:27,144 - harmonypy - INFO -   Data: 50 PCs × 310385 cells
+2026-08-21 13:40:27,144 - harmonypy - INFO -   Batch variables: ['batch']
+2026-08-21 13:40:27,287 - harmonypy - INFO - Computing initial centroids...
+2026-08-21 13:40:32,796 - harmonypy - INFO - Initialization complete.
+2026-08-21 13:40:32,796 - harmonypy - INFO - Iteration 1 of 10
+2026-08-21 13:40:39,672 - harmonypy - INFO - Iteration 2 of 10
+2026-08-21 13:40:46,838 - harmonypy - INFO - Iteration 3 of 10
+2026-08-21 13:40:53,959 - harmonypy - INFO - Converged after 3 iterations
