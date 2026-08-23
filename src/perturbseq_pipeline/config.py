@@ -31,6 +31,23 @@ use the same biological definitions wherever possible, while the implementation
 changes automatically when a dense or all-cell operation would become
 impractical.
 
+Guide-target mapping
+--------------------
+Guide identifiers do not always encode the biological target gene.
+
+For example, 10x Flex CRISPRi libraries may contain guide identifiers such as::
+
+    TSS100020_17082653_23-ENST00000606659
+
+while the true target is stored explicitly in guide feature metadata::
+
+    var["target_gene_name"] == "CNOT7"
+
+``guides.target_feature_column`` allows such an authoritative metadata column to
+be used instead of parsing guide IDs. This is optional and therefore preserves
+historical behavior for datasets such as Replogle or conventional guide
+libraries whose IDs already encode the target.
+
 Adaptive execution
 ------------------
 ``scaling.mode`` supports three modes:
@@ -49,7 +66,7 @@ Adaptive execution
     a dataset below one million cells is still unusually wide, has thousands of
     perturbations, or when memory is limited.
 
-Existing configuration files remain valid because every scaling parameter has a
+Existing configuration files remain valid because every new parameter has a
 default.
 """
 
@@ -286,7 +303,22 @@ class QCConfig:
 
 @dataclass
 class GuideConfig:
-    """Guide-calling rules."""
+    """Guide-calling and guide-to-target mapping rules.
+
+    Two target-mapping modes are supported.
+
+    Metadata mode
+        When ``target_feature_column`` is set, that column of ``guides.var`` is
+        treated as the authoritative biological target.
+
+        This is required for libraries such as 10x Flex CRISPRi where guide IDs
+        encode TSS/genomic/transcript information rather than the target gene.
+
+    Guide-ID parsing mode
+        When ``target_feature_column`` is ``None``, historical behavior is
+        retained: ``target_regex`` or ``target_split_delims`` is used to infer
+        the target from the guide identifier.
+    """
 
     min_umi: int = 3
 
@@ -297,10 +329,45 @@ class GuideConfig:
 
     detection_threshold: int = 3
 
+    # ------------------------------------------------------------------
+    # Guide -> biological target mapping
+    # ------------------------------------------------------------------
+
+    #: Optional guides.var column containing the authoritative biological
+    #: target for each guide.
+    #:
+    #: Example for 10x Flex CRISPRi:
+    #:
+    #:     target_feature_column: target_gene_name
+    #:
+    #: Guide:
+    #:     TSS100020_17082653_23-ENST00000606659
+    #:
+    #: guides.var["target_gene_name"]:
+    #:     CNOT7
+    #:
+    #: When configured, this takes precedence over target_regex and
+    #: target_split_delims.
+    target_feature_column: Optional[str] = None
+
+    #: Metadata values which do not represent actual biological perturbation
+    #: targets. Guides carrying these annotations are treated as unassigned.
+    #:
+    #: 10x Flex libraries commonly use "Ignore".
+    ignored_target_values: List[str] = field(
+        default_factory=lambda: [
+            "Ignore",
+        ]
+    )
+
+    #: Optional regex whose first capture group is interpreted as the target.
+    #: Used only when target_feature_column is null.
     target_regex: Optional[
         str
     ] = None
 
+    #: Guide-ID delimiters used only when target_feature_column is null and
+    #: target_regex is not supplied.
     target_split_delims: List[str] = field(
         default_factory=lambda: [
             "_",
@@ -309,13 +376,21 @@ class GuideConfig:
         ]
     )
 
+    #: Case-insensitive patterns defining non-targeting controls.
+    #:
+    #: The first pattern accepts:
+    #:   Non-Targeting
+    #:   non-targeting
+    #:   non_targeting
+    #:   non.targeting
+    #:   non targeting
     ntc_patterns: List[str] = field(
         default_factory=lambda: [
-            r"^non[-_.]?targeting",
+            r"^non[-_. ]?targeting",
             r"^non$",
             r"^ntc",
             r"scramble",
-            r"^safe[-_.]?harbor",
+            r"^safe[-_. ]?harbor",
         ]
     )
 
@@ -1019,8 +1094,10 @@ class Config:
         # Guides
         # ==============================================================
 
+        guide_cfg = self.guides
+
         if (
-            self.guides.dominance_ratio
+            guide_cfg.dominance_ratio
             < 1
         ):
 
@@ -1029,7 +1106,7 @@ class Config:
             )
 
         if (
-            self.guides.min_umi
+            guide_cfg.min_umi
             < 0
         ):
 
@@ -1038,12 +1115,60 @@ class Config:
             )
 
         if (
-            self.guides.detection_threshold
+            guide_cfg.detection_threshold
             < 0
         ):
 
             raise ValueError(
                 "guides.detection_threshold must be >= 0"
+            )
+
+        if (
+            guide_cfg.target_feature_column
+            is not None
+            and not str(
+                guide_cfg.target_feature_column
+            ).strip()
+        ):
+
+            raise ValueError(
+                "guides.target_feature_column must be a non-empty "
+                "column name or null"
+            )
+
+        if any(
+            not str(
+                value
+            ).strip()
+            for value
+            in guide_cfg.ignored_target_values
+        ):
+
+            raise ValueError(
+                "guides.ignored_target_values may not contain empty values"
+            )
+
+        if (
+            guide_cfg.unassigned_label
+            == guide_cfg.ambiguous_label
+        ):
+
+            raise ValueError(
+                "guides.unassigned_label and guides.ambiguous_label "
+                "must be different"
+            )
+
+        if (
+            guide_cfg.ntc_label
+            in {
+                guide_cfg.unassigned_label,
+                guide_cfg.ambiguous_label,
+            }
+        ):
+
+            raise ValueError(
+                "guides.ntc_label must differ from the unassigned and "
+                "ambiguous labels"
             )
 
         # ==============================================================
@@ -1566,6 +1691,11 @@ class Config:
         KOLF:
 
             cfg.use_large_mode(2_659_209)
+            -> True
+
+        10x Flex 1M:
+
+            cfg.use_large_mode(1_233_421)
             -> True
 
         Smaller dataset forced to scalable algorithms:

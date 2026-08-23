@@ -45,6 +45,9 @@ guides:
   dominance_ratio: 2.0
   max_second_umi: -1
   detection_threshold: 3
+  target_feature_column: null
+  ignored_target_values:
+  - Ignore
   target_regex: null
   target_split_delims:
   - _

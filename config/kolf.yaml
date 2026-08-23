@@ -3,27 +3,39 @@ run:
   outdir: results/kolf
   seed: 0
 
+
+# -------------------------------------------------------------------------
+# INPUT
+#
+# KOLF is an existing AnnData object with:
+#   ~2.66 million cells
+#   ~37.6k genes
+#   precomputed perturbation labels in obs["gene_target"]
+#   raw counts in layers["counts"]
+# -------------------------------------------------------------------------
 input:
   mode: h5ad
   h5ad: ../data/KOLF_Pan_Genome_QC_Filtered.h5ad
 
-  # Existing perturbation assignment in the AnnData.
+  # Existing perturbation assignment.
   guide_obs_column: gene_target
 
-  # Raw counts are stored here in this object.
+  # Raw expression counts.
   counts_layer: counts
+
+  # No pre-normalized layer is explicitly supplied; the pipeline
+  # will construct log-normalized expression.
+  normalized_layer: null
 
 
 # -------------------------------------------------------------------------
-# Scaling
+# LARGE-DATA EXECUTION
 #
-# KOLF is a genuine large-data run:
-# ~2.66 million cells
-# ~37k genes
-# ~11.7k perturbation targets
+# AUTO should select LARGE because KOLF exceeds both:
+#   1,000,000 cells
+#   5,000 perturbations
 #
-# AUTO should already classify this as LARGE. Keeping AUTO rather than
-# forcing LARGE lets the centralized scaling logic remain the source of truth.
+# Keeping AUTO means the centralized scaling logic remains authoritative.
 # -------------------------------------------------------------------------
 scaling:
   mode: auto
@@ -31,75 +43,124 @@ scaling:
   large_n_cells: 1000000
   large_n_perturbations: 5000
 
+  # Used for bounded HVG / marker estimation.
   marker_max_cells: 200000
+
+  # Number of genes processed at once by the large-mode module
+  # sufficient-statistics implementation.
   effect_gene_chunk: 256
 
+  # Guide count-matrix safeguards. KOLF itself uses precomputed labels,
+  # but retaining these makes the config complete.
   guide_chunk_size: 20000
   guide_max_dense_elements: 20000000
 
+  # Useful for production monitoring.
   collect_between_stages: true
   log_memory: true
 
+  # Bound large tables embedded into the HTML report.
   report_preview_rows: 500
 
 
 # -------------------------------------------------------------------------
-# Guide labels
+# GUIDE / PERTURBATION LABELS
 #
-# gene_target already contains clean target labels such as:
-# DUX4, BBC3, ZFP3, ..., NTC
+# gene_target already contains clean labels such as:
+#   DUX4
+#   BBC3
+#   ZFP3
+#   ...
+#   NTC
 #
-# Therefore no target-name parsing is needed.
+# Do not split these target names.
 # -------------------------------------------------------------------------
 guides:
   target_split_delims: []
 
-  # Collapse dataset-specific NTC into the pipeline's internal control label.
+  # Internal canonical label used by the pipeline.
   ntc_label: ntc
 
-  # Exact-ish NTC pattern.
+  # Match KOLF's dataset-specific control label exactly.
   ntc_patterns:
     - "^NTC$"
+
+  # These are irrelevant for precomputed labels but kept at defaults
+  # for schema completeness.
+  min_umi: 3
+  dominance_ratio: 2.0
+  max_second_umi: -1
+  detection_threshold: 3
 
 
 # -------------------------------------------------------------------------
 # QC
 #
-# KOLF_Pan_Genome_QC_Filtered.h5ad is already QC filtered.
-# We therefore preserve the published/processed cell population rather than
-# imposing another arbitrary QC pass.
+# This file is already QC filtered.
+#
+# Preserve the supplied population instead of imposing a second arbitrary
+# filtering scheme. Existing valid QC columns are reused in LARGE mode.
 # -------------------------------------------------------------------------
 qc:
   min_genes_per_cell: null
   min_cells_per_gene: null
   min_genes_final: null
+
   max_pct_mt: null
   max_pct_hb: null
   min_counts_per_cell: null
 
+  mito_prefix: "MT-"
+  ribo_prefix:
+    - "RPS"
+    - "RPL"
+  hb_pattern: "^HB[^(P)]"
+
 
 # -------------------------------------------------------------------------
-# Clustering
+# CLUSTERING
 #
-# The large-mode implementation should avoid scaling/densifying the full
-# 2.66M x 37k matrix. HVG/PCA operations should use the bounded scalable path.
+# LARGE mode:
+#   - selects HVGs using a bounded 200k-cell reference
+#   - retains all cells for PCA
+#   - preserves sparse scaling with zero_center=False
+#   - PCA performs centering implicitly via sparse-compatible ARPACK
+#
+# Do NOT manually disable scale_max_value here; LARGE mode handles the
+# safe sparse behavior internally while STANDARD behavior remains unchanged.
 # -------------------------------------------------------------------------
 cluster:
+  target_sum: null
+
   n_top_genes: 3000
   n_pcs: 50
   n_neighbors: 15
+
   leiden_resolution: 1.0
+  umap_min_dist: 0.5
+
+  # KOLF carries batch annotation in obs["batch"].
   batch_key: batch
+
+  # Leave empty for the first full KOLF run.
+  # LARGE mode intentionally rejects unsafe full sparse regress_out operations.
+  regress_out: []
+
+  scale_max_value: 10.0
+
+  # Guide assignments are already defined and there are no ambiguous calls
+  # in this dataset, so no second all-cell/singlet embedding is necessary.
+  assigned_only: false
 
 
 # -------------------------------------------------------------------------
-# Direct perturbation efficacy
+# DIRECT PERTURBATION EFFICACY
 #
-# This asks:
+# Question:
 # Did perturbing gene X reduce expression of gene X?
 #
-# Keep NTC as the primary biological reference while also calculating the
-# larger "other-target" reference arm.
+# NTC is the biologically preferred primary reference.
+# "other" is retained as an independent secondary control.
 # -------------------------------------------------------------------------
 perturbation:
   controls:
@@ -110,27 +171,35 @@ perturbation:
 
   min_cells_per_target: 10
   min_control_cells: 10
+
+  # Targets essentially absent from controls cannot yield meaningful
+  # knockdown estimates.
   min_pct_expressing_control: 1.0
 
   fdr_alpha: 0.05
+
+  # Effective perturbation requires negative target-expression log2FC.
   max_log2fc_for_hit: 0.0
 
   top_n_report: 12
+
+  # Only affects visualization background sampling, not statistics.
   umap_background_fraction: 0.01
 
 
 # -------------------------------------------------------------------------
-# Perturbation enrichment across cell states
+# PERTURBATION ENRICHMENT ACROSS CELL STATES
 #
-# This asks:
-# Does perturbing a gene move cells into or out of particular transcriptional
+# Question:
+# Does perturbing a gene move cells into / out of particular transcriptional
 # states?
 #
-# batch-stratified CMH controls for differences in cluster composition between
-# batches.
+# CMH stratification by batch protects against batch-dependent cluster
+# composition.
 # -------------------------------------------------------------------------
 enrichment:
   enabled: true
+
   cluster_key: leiden
 
   controls:
@@ -140,33 +209,33 @@ enrichment:
   primary_control: ntc
 
   fdr_alpha: 0.05
+
   min_cells_per_target: 10
   min_cells_per_cluster: 20
   min_reference_cells: 10
 
-  # Individual guide identities exist in obs["gRNA"], but the current pipeline
-  # configuration does not explicitly map that source into OBS_GUIDE.
-  # Leave guide-level concordance off until that adapter is added.
-  guide_concordance: false
+  odds_pseudocount: 0.5
 
   stratify_by: batch
 
-  # 1000 is statistically useful but expensive at this scale.
-  # Keep it for the full biological run; use 0-100 during debugging if needed.
+  # KOLF has individual guide information in obs["gRNA"], but the current
+  # adapter does not map that field to the pipeline's guide-ID column.
+  # Leave concordance off until that adapter is explicitly implemented.
+  guide_concordance: false
+
+  min_cells_per_guide: 5
+
+  # Keep the production biological setting.
   permutations: 1000
 
   top_n_report: 12
 
 
 # -------------------------------------------------------------------------
-# Co-functional perturbation modules / gene programs
+# CO-FUNCTIONAL MODULES / GENE PROGRAMS
 #
-# Enable this for the biological run.
-#
-# LARGE mode should:
-# - use bounded marker discovery,
-# - chunk effect-matrix construction,
-# - avoid holding redundant giant matrices in memory.
+# Keep enabled — this is biologically valuable and the LARGE implementation
+# now builds the perturbation x gene effect matrix in bounded chunks.
 # -------------------------------------------------------------------------
 modules:
   enabled: true
@@ -177,7 +246,6 @@ modules:
   n_marker_genes_per_cluster: 100
   marker_method: wilcoxon
 
-  # KOLF has many targets; 20 cells is a reasonable minimum starting point.
   min_cells_per_perturbation: 20
 
   control: ntc
@@ -186,20 +254,20 @@ modules:
   module_correlation: spearman
   linkage_method: average
 
-  # Exploratory cuts, not biological ground truth.
+  # Exploratory clustering resolution, not biological ground truth.
   n_programs: 4
   n_modules: 9
+
   cluster_distance_threshold: 0.7
 
-  # This adds per-cell program-score columns.
-  # It may be expensive on 2.66M cells, but is biologically useful.
+  # Biologically useful program scores across cells.
   score_programs: true
 
   hub_lfc_threshold: 0.5
   de_fdr_alpha: 0.05
 
-  # Network layouts are secondary to the module/program matrices.
-  # Keep false for the first KOLF run to avoid wasting time on layouts.
+  # Skip optional NetworkX layouts during the first production KOLF run.
+  # Heatmaps/module tables are still produced.
   draw_networks: false
 
   min_perturbations: 5
@@ -209,13 +277,12 @@ modules:
 
 
 # -------------------------------------------------------------------------
-# Per-cell perturbation score
+# PER-CELL PERTURBATION SCORE
 #
-# Keep PS itself enabled.
+# Keep PS statistics enabled.
 #
-# IMPORTANT:
-# Do NOT run full supervised LDA/UMAP on 2.66 million cells.
-# That visualization is not required for the PS statistics.
+# The supervised LDA-UMAP is an optional visualization and is deliberately
+# disabled for the full 2.66M-cell run.
 # -------------------------------------------------------------------------
 ps_score:
   enabled: true
@@ -225,6 +292,7 @@ ps_score:
   scale_factor: 3.0
 
   ps_threshold: 0.5
+
   expression_cut: mean
   expression_cut_quantile: 0.75
 
@@ -233,10 +301,14 @@ ps_score:
 
   top_n_report: 12
 
-  # Strong recommendation for KOLF.
+  # IMPORTANT for KOLF.
   compute_lda_umap: false
 
-  # If you later enable LDA, LARGE mode should cap it here.
+  # Retained for future bounded-LDA experiments.
+  lda_n_pcs: 40
+  lda_max_genes: 5000
+  lda_highlight_threshold: 0.8
+
   lda_large_max_cells: 150000
   lda_large_stratified: true
 
@@ -244,12 +316,13 @@ ps_score:
 # -------------------------------------------------------------------------
 # lochNESS
 #
-# Full cell x target materialization is impossible here:
+# KOLF:
+#   ~2.66M cells x ~11.7k targets
 #
-# 2.66M cells x ~11.7k targets = tens of billions of values.
+# Never materialize the complete cell x target score matrix.
 #
-# LARGE mode should therefore compute sparse/chunked summaries and retain
-# lochness_self rather than thousands of per-target obs columns.
+# LARGE mode computes sparse/chunked summaries plus each cell's own
+# perturbation enrichment.
 # -------------------------------------------------------------------------
 lochness:
   enabled: true
@@ -259,49 +332,77 @@ lochness:
   n_neighbors: 300
   n_pcs: 20
 
-  # Prefer X_pca_harmony automatically when present.
+  # Prefer X_pca_harmony automatically when available.
   use_rep: null
 
   recompute_neighbors: true
 
   min_cells_per_target: 10
+
   enrichment_cut: 0.5
   noise_delta: 0.0
 
+  # Number of perturbations processed per bounded operation.
   target_chunk_size: 256
 
-  # Current config summary indicates this is the maximum number of individual
-  # target score columns retained in obs.
-  max_targets_in_obs: 50
+  # IMPORTANT:
+  # Do not retain complete n_cells vectors for individual targets in KOLF.
+  # Keep lochness_self + target/cluster summaries instead.
+  max_targets_in_obs: 1
 
   top_n_report: 12
 
 
 # -------------------------------------------------------------------------
-# Report
+# REPORT
 #
-# Full result tables are still written to disk; the large-mode report path
-# should use bounded previews.
+# Complete numerical tables remain on disk.
+# HTML rendering uses bounded previews for large datasets.
 # -------------------------------------------------------------------------
 report:
   title: "Perturb-seq report — KOLF Pan Genome"
+
   embed_figures: true
+
   figure_format: png
   figure_dpi: 150
+
   max_table_rows: 100
 
 
 # -------------------------------------------------------------------------
-# Outputs
+# OUTPUT
 # -------------------------------------------------------------------------
 output:
   h5ad_name: KOLF_Pan_Genome_processed.h5ad
   report_name: report.html
 
+  # cluster.assigned_only is false, so a second all-cell H5AD is unnecessary.
   write_unfiltered_h5ad: false
+  unfiltered_h5ad_name: null
 
+  # KOLF uses precomputed labels rather than a separate guide-count matrix,
+  # so there should be nothing large to merge here; leaving this true remains
+  # compatible with normal pipeline behavior.
   merge_guides_into_h5ad: true
+  guide_obsm_key: guide_counts
+
   write_guide_h5ad: false
 
-  # Avoid spending additional time compressing a giant debug/full run.
+  save_figures_pdf: false
+
+  # Avoid creating/compressing another massive bundle on the first
+  # production-scale run.
   archive: false
+  archive_name: null
+
+  # No separate guide-count matrix exists for this input.
+  write_guide_table: false
+
+  guide_table_name: null
+  guide_table_min_umi: 3
+
+  # Do not relocate the output automatically.
+  large_file_dir: null
+
+  large_file_threshold_mb: 50.0

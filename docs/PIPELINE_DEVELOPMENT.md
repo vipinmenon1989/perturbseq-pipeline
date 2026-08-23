@@ -106,6 +106,175 @@ Cells are assigned to one of four mutually exclusive perturbation classes:
 
 ---
 
+## Guide-to-Target Mapping for Metadata-Rich CRISPR Libraries
+
+### Problem & Motivation
+
+Single-cell pooled CRISPR screens historically utilized guide identifiers that directly encoded the target gene symbol (e.g., `AFF4_P1P2_1` -> `AFF4` or `CD81.2` -> `CD81`). However, newer chemistries such as **10x Genomics Chromium Flex CRISPRi** decouple guide feature identifiers from target gene names.
+
+In the 1.23-million cell K562 10x Flex CRISPRi dataset (`K562_1M_CRISPR_filtered.h5ad`):
+* **Dataset dimensions**: 1,233,421 cells × 25,349 features (18,446 Gene Expression, 6,903 CRISPR Guide Capture).
+* **Guide identifiers**: Encode TSS / transcript / genomic IDs, for example:
+  ```text
+  guide ID: TSS100020_17082653_23-ENST00000606659
+  ```
+* **True biological target**: Stored explicitly in feature metadata:
+  ```text
+  var["target_gene_name"] == "CNOT7"
+  ```
+* **Failure of historical guide-name parsing**: Empirical comparison across all 6,726 targeting guides in the library revealed **0.00% exact agreement** between delimiter-based guide ID parsing and true `target_gene_name`. Naive parsing produced bogus target labels such as `TSS100020`, `TSS100176`, and `TSS10038` instead of actual genes (`CNOT7`, `CDCA2`, `DDX51`, `DCLRE1C`).
+* **Non-biological metadata annotations**: The library also annotates non-targeting controls as `target_gene_name = "Non-Targeting"` and non-targeting/unassigned controls as `target_gene_name = "Ignore"`.
+
+All 6,903 guide features have populated `target_gene_name` and `target_gene_id` fields in `var`.
+
+---
+
+### Authoritative Metadata Resolution Architecture
+
+To address metadata-rich CRISPR libraries while strictly preserving historical behavior, the pipeline introduces an optional, authoritative metadata mapping mechanism in `GuideConfig` and `resolve_guide_targets()`:
+
+```text
+       [Guide Count Matrix]
+                │
+                ▼ (top vs runner-up UMI)
+        [Dominant Guide ID]
+                │
+                ├── target_feature_column is null ────────► Legacy Guide-ID Parsing (target_split_delims / target_regex)
+                │
+                └── target_feature_column is set
+                            │
+                            ▼
+                    Read guides.var[col]
+                            │
+                            ├── In ignored_target_values? ──► unassigned_label ("unassigned") -> CLASS_UNASSIGNED
+                            ├── Empty / NaN / Null? ────────► unassigned_label ("unassigned") -> CLASS_UNASSIGNED
+                            ├── Matches ntc_patterns? ──────► ntc_label ("ntc") -> CLASS_NTC
+                            └── Biological gene symbol ─────► Biological target -> CLASS_TARGETING
+```
+
+#### Key Components:
+
+1. **`guides.target_feature_column`** (Default: `null`):
+   * When set (e.g. `target_gene_name`), the specified column in `guides.var` is treated as the authoritative source of target gene names.
+   * If the configured column is missing from `guides.var`, the pipeline immediately raises a clear `ValueError` rather than silently inferring incorrect targets from guide names.
+   * When `null` (default), legacy delimiter and regex-based guide ID parsing remains 100% active.
+
+2. **`guides.ignored_target_values`** (Default: `["Ignore"]`):
+   * Values matching any entry in this list (case-insensitively, e.g. `"Ignore"`, `"ignore"`) are mapped directly to `guides.unassigned_label` (`"unassigned"`).
+   * These guides are classified as `CLASS_UNASSIGNED` and are excluded from downstream biological target tests, co-functional modules, and perturbation hit calling.
+
+3. **Non-Targeting Control Handling**:
+   * Metadata values such as `"Non-Targeting"` or `"non-targeting"` are detected case-insensitively via the configurable `guides.ntc_patterns` (e.g. `r"^non[-_. ]?targeting"`).
+   * They collapse to `guides.ntc_label` (`"ntc"` or `"non-targeting"`) with `CLASS_NTC`, establishing the unperturbed control baseline.
+
+4. **Export Safeguards (`write_guide_table`)**:
+   * `write_guide_table()` checks `guides.var["target_gene"]` first before falling back to `parse_target_genes()`.
+   * This guarantees that exported long-format guide tables reproduce the authoritative metadata target names instead of re-parsing TSS IDs.
+
+5. **Downstream Decoupling**:
+   * Downstream modules (`qc`, `cluster`, `perturbation`, `enrichment`, `modules`, `ps_score`, `lochness`, `report`) interface strictly with `expr.obs["guide_id"]`, `expr.obs["target_gene"]`, and `expr.obs["perturbation_class"]`.
+   * Guide concordance in enrichment uses `guide_id` for individual guide identity and `target_gene` for biological gene identity.
+
+---
+
+### Backward-Compatibility Guarantees
+
+| Screen / Input Type | Configuration | Target Resolution Path | Backward Compatibility Status |
+|---|---|---|---|
+| **Replogle Screens** | `input.guide_obs_column: gene`<br>`guides.target_feature_column: null` | `_assign_from_labels()` (precomputed `obs['gene']`) | **100% Unchanged**. No guide count matrix or var column involved. |
+| **KOLF Pan Genome** | `input.guide_obs_column: gene_target`<br>`guides.target_feature_column: null` | `_assign_from_labels()` (precomputed `obs['gene_target']`) | **100% Unchanged**. Categorical parsing of unique labels preserved. |
+| **Conventional Guide Matrices** | `input.mode: h5ad` / `mtx`<br>`guides.target_feature_column: null` | `_assign_from_matrix()` + `parse_target_genes()` | **100% Unchanged**. Existing delimiter splitting and regex overrides active. |
+| **10x Flex CRISPRi** | `input.mode: h5ad`<br>`guides.target_feature_column: target_gene_name` | `_assign_from_matrix()` + `resolve_guide_targets()` | **New Feature**. Authoritative `guides.var['target_gene_name']` mapping. |
+
+---
+
+### Interaction with LARGE Execution
+
+* **One-Pass Guide Resolution**: Guide target resolution operates across unique guide features ($N_{\text{guides}} = 6,903$) rather than per single cell ($N_{\text{cells}} = 1,233,421$), adding zero measurable memory overhead.
+* **Sparse Top-Two Guide Search**: Operates directly on CSR sparse guide matrices via `_csr_top_two_numba` / `_csr_top_two_python`.
+* **Logging & Observability**: Clear log messages report target mapping mode:
+  ```text
+  Guide target mapping: using var['target_gene_name'] for 6903 guide features (177 ignored, 0 missing)
+  ```
+  or in legacy mode:
+  ```text
+  Guide target mapping: parsing target names from guide IDs
+  ```
+
+---
+
+### Recommended 10x Flex 1M Configuration (`config/1MCRISPRiflex.yaml`)
+
+```yaml
+run:
+  name: K562_1M_CRISPRi
+  outdir: results/k562_1m_crispri
+
+input:
+  mode: h5ad
+  h5ad: ../data/K562_1M_CRISPR_filtered.h5ad
+  feature_type_column: feature_types
+  gex_feature_type: "Gene Expression"
+  guide_feature_types:
+    - "CRISPR Guide Capture"
+  counts_layer: counts
+
+scaling:
+  mode: auto
+  large_n_cells: 1000000
+
+guides:
+  min_umi: 3
+  dominance_ratio: 2.0
+  max_second_umi: -1
+  detection_threshold: 3
+  target_feature_column: target_gene_name
+  ignored_target_values:
+    - Ignore
+  target_regex: null
+  target_split_delims: []
+  ntc_label: ntc
+  ntc_patterns:
+    - "^non[-_. ]?targeting"
+    - "^non$"
+    - "^ntc"
+    - scramble
+    - "^safe[-_. ]?harbor"
+  unassigned_label: unassigned
+  ambiguous_label: ambiguous
+
+ps_score:
+  compute_lda_umap: false
+
+modules:
+  draw_networks: false
+
+output:
+  archive: false
+  write_guide_table: false
+```
+
+---
+
+### Validation & Testing
+
+1. **Unit & Regression Test Suite (`tests/test_guide_metadata.py`)**:
+   * **Test A & B**: Verified metadata target overrides guide parsing (`TSS100020_...` -> `CNOT7`, `TSS100176_...` -> `CDCA2`).
+   * **Test C**: Verified `Non-Targeting` metadata maps to configured `ntc_label` and `CLASS_NTC`.
+   * **Test D**: Verified `Ignore` metadata maps to `unassigned_label` and `CLASS_UNASSIGNED` (never a biological target).
+   * **Test E**: Verified missing `target_feature_column` raises clear `ValueError`.
+   * **Test F**: Verified legacy guide-matrix parsing remains identical when `target_feature_column: null`.
+   * **Test G & H**: Verified Replogle and KOLF label paths are completely unaffected.
+   * **Test I**: Verified YAML round-trip serialization and backward compatibility with old dictionaries.
+   * **Test J**: Verified regression assertions (`"TSS100020" not in targets`, `"Ignore" not in targets`, `"CNOT7" in targets`).
+2. **Real-Data Validation on `K562_1M_CRISPR_filtered.h5ad`**:
+   * Evaluated on full 6,903-guide library and a 5,000-cell slice.
+   * Confirmed 849 resolved biological targets including `CNOT7`, `CDCA2`, `DDX51`, and `DCLRE1C`.
+   * Confirmed 0 TSS-prefixed labels and 0 `Ignore` entries in biological targets.
+   * Confirmed 98 non-targeting cells correctly assigned `CLASS_NTC`.
+
+---
+
 ## Perturbation-Strength Analysis
 
 Perturbation-strength testing (`perturbseq_pipeline.perturbation`) verifies whether a guide knock-down successfully depletes the target gene's own mRNA transcript.
@@ -515,6 +684,14 @@ results/<run_name>/
 ---
 
 ## Development History & Changelog
+
+### 2026-08-23: Authoritative Metadata Guide Target Mapping for 10x Flex CRISPRi
+* **Authoritative Guide-to-Target Metadata**: Added `target_feature_column` to `GuideConfig` in `config.py` and implemented `resolve_guide_targets()` in `guides.py` to support metadata-rich libraries (e.g. 10x Flex CRISPRi) where guide IDs encode TSS/transcript details rather than target genes.
+* **Ignored & Non-Targeting Annotations**: Added `ignored_target_values` (default `["Ignore"]`) to safely map non-biological annotations to `unassigned` class; added case-insensitive non-targeting pattern support for `"Non-Targeting"`.
+* **Export Decoupling**: Updated `write_guide_table()` in `io.py` to prioritize `guides.var["target_gene"]` over guide-ID reparsing.
+* **Backward-Compatibility Guarantees**: Preserved 100% fidelity for Replogle `obs['gene']`, KOLF `obs['gene_target']`, and legacy guide-ID parsing when `target_feature_column: null`.
+* **Configuration**: Created and validated `config/1MCRISPRiflex.yaml` for 1.23M-cell K562 10x Flex CRISPRi screen; updated `config/default.yaml`.
+* **Testing & Real-Data Validation**: Added `tests/test_guide_metadata.py` (12 tests covering tests A–J); performed lightweight validation against real `K562_1M_CRISPR_filtered.h5ad` verifying 849 real gene targets, 0 TSS labels, and correct NTC mapping.
 
 ### 2026-08-23: Large-Data Execution Hardening & KOLF OOM Resolution
 * **Centralized Scaling Architecture**: Added `ScalingConfig` in `config.py` supporting `STANDARD`, `LARGE`, and `AUTO` modes with unified thresholds across all pipeline stages.

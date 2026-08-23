@@ -89,8 +89,75 @@ CLASS_UNASSIGNED = "unassigned"
 
 
 # ---------------------------------------------------------------------------
-# Target-gene parsing
+# Target-gene parsing & resolution
 # ---------------------------------------------------------------------------
+
+
+def resolve_guide_targets(
+    guides: ad.AnnData,
+    gcfg: GuideConfig,
+) -> np.ndarray:
+    """Resolve guide features to biological target names.
+
+    When ``gcfg.target_feature_column`` is configured, that column of
+    ``guides.var`` is treated as the authoritative source of target gene names.
+    Values matching ``gcfg.ignored_target_values`` (case-insensitively) or
+    empty/missing entries are mapped to ``gcfg.unassigned_label``.
+
+    When ``gcfg.target_feature_column`` is None, falls back to legacy
+    guide-ID parsing via :func:`parse_target_genes`.
+    """
+    guide_ids = guides.var_names.to_numpy().astype(str)
+
+    if gcfg.target_feature_column is None:
+        logger.info("Guide target mapping: parsing target names from guide IDs")
+        return parse_target_genes(guide_ids, gcfg)
+
+    col = gcfg.target_feature_column
+    if col not in guides.var.columns:
+        raise ValueError(
+            f"Configured guide target column {col!r} not found in guides.var. "
+            f"Available var columns: {list(guides.var.columns)}"
+        )
+
+    raw_series = guides.var[col]
+    n_features = guides.n_vars
+    out = np.empty(n_features, dtype=object)
+
+    ignored_set = {
+        str(v).strip().lower()
+        for v in (gcfg.ignored_target_values or [])
+        if str(v).strip()
+    }
+
+    n_ignored = 0
+    n_missing = 0
+
+    for idx, val in enumerate(raw_series):
+        if pd.isna(val) or val is None:
+            out[idx] = gcfg.unassigned_label
+            n_missing += 1
+            continue
+
+        s = str(val).strip()
+        if not s or s.lower() in ("nan", "none", "null"):
+            out[idx] = gcfg.unassigned_label
+            n_missing += 1
+        elif s.lower() in ignored_set:
+            out[idx] = gcfg.unassigned_label
+            n_ignored += 1
+        else:
+            out[idx] = s
+
+    logger.info(
+        "Guide target mapping: using var[%r] for %d guide features (%d ignored, %d missing)",
+        col,
+        n_features,
+        n_ignored,
+        n_missing,
+    )
+
+    return out
 
 
 def parse_target_genes(
@@ -1218,8 +1285,8 @@ def _assign_from_matrix(
     )
 
     guide_targets = (
-        parse_target_genes(
-            guide_ids,
+        resolve_guide_targets(
+            aligned_guides,
             gcfg,
         )
     )
