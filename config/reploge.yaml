@@ -8,11 +8,43 @@ input:
   h5ad: ../data/ReplogleWeissman2022_K562_essential.h5ad
   guide_obs_column: gene
 
+# -------------------------------------------------------------------------
+# Scaling
+# Replogle (~300k cells, ~1,800 perturbations) should remain in standard
+# mode under the centralized auto-scaling rules. Do not force large mode.
+# -------------------------------------------------------------------------
+scaling:
+  mode: auto
+  large_n_cells: 1000000
+  large_n_perturbations: 5000
+
+  marker_max_cells: 200000
+  effect_gene_chunk: 256
+
+  guide_chunk_size: 20000
+  guide_max_dense_elements: 20000000
+
+  collect_between_stages: true
+  log_memory: true
+
+  report_preview_rows: 500
+
+# -------------------------------------------------------------------------
+# Guide labels
+# Replogle already supplies target labels in obs["gene"], so do not parse
+# gene names using delimiters.
+# -------------------------------------------------------------------------
 guides:
   target_split_delims: []
   ntc_label: ntc
-  ntc_patterns: ["non-targeting"]
+  ntc_patterns:
+    - "non-targeting"
 
+# -------------------------------------------------------------------------
+# QC
+# Preserve the already-preprocessed Replogle object rather than imposing
+# arbitrary new cell/gene filters.
+# -------------------------------------------------------------------------
 qc:
   min_genes_per_cell: null
   min_cells_per_gene: null
@@ -21,6 +53,9 @@ qc:
   max_pct_hb: null
   min_counts_per_cell: null
 
+# -------------------------------------------------------------------------
+# Clustering
+# -------------------------------------------------------------------------
 cluster:
   n_top_genes: 3000
   n_pcs: 50
@@ -28,48 +63,161 @@ cluster:
   leiden_resolution: 1.0
   batch_key: batch
 
+# -------------------------------------------------------------------------
+# Direct perturbation efficacy
+# -------------------------------------------------------------------------
 perturbation:
-  controls: ["ntc", "other"]
-  primary_control: ntc
-  min_cells_per_target: 10
-  fdr_alpha: 0.05
-  top_n_report: 12
+  controls:
+    - ntc
+    - other
 
+  primary_control: ntc
+
+  min_cells_per_target: 10
+  min_control_cells: 10
+  min_pct_expressing_control: 1.0
+
+  fdr_alpha: 0.05
+  max_log2fc_for_hit: 0.0
+
+  top_n_report: 12
+  umap_background_fraction: 0.1
+
+# -------------------------------------------------------------------------
+# Perturbation enrichment across transcriptional states
+# -------------------------------------------------------------------------
 enrichment:
   enabled: true
   cluster_key: leiden
-  controls: ["ntc", "other"]
+
+  controls:
+    - ntc
+    - other
+
   primary_control: ntc
+
   fdr_alpha: 0.05
   min_cells_per_target: 10
   min_cells_per_cluster: 20
+  min_reference_cells: 10
 
-  # Keep false because the pipeline cannot currently be told
-  # that obs["guide_id"] contains the individual guide IDs.
+  # The current Replogle input contains target labels rather than reliable
+  # individual-guide identities for guide-level concordance.
   guide_concordance: false
 
   stratify_by: batch
   permutations: 1000
+
   top_n_report: 12
 
+# -------------------------------------------------------------------------
+# Co-functional perturbation modules / co-regulated gene programs
+# -------------------------------------------------------------------------
+modules:
+  enabled: true
+
+  cluster_key: leiden
+
+  gene_selection: cluster_markers
+  n_marker_genes_per_cluster: 100
+  marker_method: wilcoxon
+
+  # Require enough cells for reasonably stable perturbation profiles.
+  min_cells_per_perturbation: 20
+
+  # Replogle contains NTCs; use them as the primary biological reference.
+  control: ntc
+
+  # Chen-style correlation choices.
+  program_correlation: pearson
+  module_correlation: spearman
+  linkage_method: average
+
+  # Exploratory hierarchical cuts.
+  # These should NOT be interpreted as biologically established numbers
+  # of programs/modules.
+  n_programs: 4
+  n_modules: 9
+  cluster_distance_threshold: 0.7
+
+  score_programs: true
+
+  # Network/hub calls require both effect size and statistical significance.
+  hub_lfc_threshold: 0.5
+  de_fdr_alpha: 0.05
+
+  draw_networks: true
+
+  min_perturbations: 5
+  min_genes: 10
+
+  top_n_report: 12
+
+# -------------------------------------------------------------------------
+# Perturbation Score
+#
+# Keep the actual PS analysis.
+# Disable only the supervised LDA visualization because it is extremely
+# expensive for ~1,800 targets and does not change the PS statistics.
+# -------------------------------------------------------------------------
 ps_score:
   enabled: true
+
+  top_n_biomarkers: 100
+  scale_factor: 3.0
+
   ps_threshold: 0.5
+
   expression_cut: mean
+  expression_cut_quantile: 0.75
+
+  min_cells_per_target: 10
+  min_control_cells: 10
+
   top_n_report: 12
 
+  compute_lda_umap: false
+
+# -------------------------------------------------------------------------
+# lochNESS
+# -------------------------------------------------------------------------
 lochness:
   enabled: true
 
-modules:
-  enabled: false
+  genotype_key: target_gene
 
+  n_neighbors: 300
+  n_pcs: 20
+
+  recompute_neighbors: true
+
+  min_cells_per_target: 10
+  enrichment_cut: 0.5
+
+  noise_delta: 0.0
+
+  top_n_report: 12
+
+# -------------------------------------------------------------------------
+# Report
+# -------------------------------------------------------------------------
 report:
   title: "Perturb-seq report — Replogle K562 Essential"
   embed_figures: true
+  figure_format: png
+  figure_dpi: 150
+  max_table_rows: 100
 
+# -------------------------------------------------------------------------
+# Outputs
+# -------------------------------------------------------------------------
 output:
   h5ad_name: ReplogleWeissman2022_K562_essential_processed.h5ad
   report_name: report.html
+
   write_unfiltered_h5ad: false
-  archive: false
+
+  merge_guides_into_h5ad: true
+  write_guide_h5ad: false
+
+  archive: true

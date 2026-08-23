@@ -2,21 +2,44 @@
 
 After :func:`normalize`, the downstream contract is:
 
-* ``layers['counts']``  — raw integer counts
-* ``layers['lognorm']`` — log1p library-size-normalized counts
-* ``adata.X``           — log-normalized values
+* ``layers['counts']``  — raw integer counts.
+* ``layers['lognorm']`` — log1p library-size-normalized counts.
+* ``adata.X``           — log-normalized values.
 
-For large datasets, this module uses a memory-aware path:
+Large-data execution
+--------------------
+For multi-million-cell datasets, the standard Scanpy workflow can fail even
+when the expression matrix is sparse. In particular,::
 
-* Avoid unnecessary full-matrix copies.
-* Estimate highly variable genes (HVGs) on a representative subset of cells.
-* Perform scaling/PCA only on HVGs.
-* Never regress covariates across the full gene matrix for multi-million-cell
-  datasets.
-* Avoid copying the full log-normalized matrix merely to restore ``adata.X``.
+    sc.pp.scale(..., zero_center=True)
 
-This is particularly important for datasets such as KOLF with millions of
-cells and tens of thousands of genes.
+explicitly subtracts each gene mean. A sparse matrix then becomes dense.
+For a dataset such as KOLF::
+
+    2.66 million cells x 3,000 HVGs
+
+one dense float64 matrix is already roughly 60 GiB, and scaling/PCA may require
+multiple temporary matrices. This can exhaust hundreds of GiB of RAM.
+
+The LARGE execution path therefore deliberately changes *how* standardized PCA
+is computed without changing which cells enter the biological analysis:
+
+1. HVGs are estimated from a reproducible bounded cell sample.
+2. All cells are retained for PCA / neighbors / UMAP / Leiden.
+3. The PCA working matrix contains HVGs only.
+4. Sparse HVGs are variance-scaled with ``zero_center=False``.
+5. PCA performs mean-centering internally/implicitly on the sparse matrix.
+6. Explicit clipping is omitted in this sparse LARGE path because clipping
+   uncentered values before PCA centering is not equivalent to clipping centered
+   z-scores.
+7. Full-expression covariate regression is never performed implicitly; when
+   requested it is restricted to the HVG working object.
+
+For STANDARD datasets the historical pipeline behaviour is preserved:
+``sc.pp.scale`` performs its normal zero-centering and ``max_value`` clipping.
+
+This module also avoids unnecessary full-matrix copies where possible and
+stores Harmony output as float32 after correction.
 """
 
 from __future__ import annotations
@@ -29,6 +52,7 @@ import anndata as ad
 import numpy as np
 import pandas as pd
 import scanpy as sc
+from scipy import sparse
 
 from .config import Config
 from .io import LANE_KEY
@@ -40,20 +64,47 @@ LOGNORM_LAYER = "lognorm"
 CLUSTER_KEY = "leiden"
 
 
+# ---------------------------------------------------------------------------
+# Small helpers
+# ---------------------------------------------------------------------------
+
+
+def _collect() -> None:
+    """Request Python garbage collection after memory-heavy stages."""
+    gc.collect()
+
+
+def _matrix_gib(n_rows: int, n_cols: int, dtype=np.float64) -> float:
+    """Dense memory footprint in GiB, used only for informative logging."""
+    return (
+        int(n_rows)
+        * int(n_cols)
+        * np.dtype(dtype).itemsize
+        / (1024.0 ** 3)
+    )
+
+
+# ---------------------------------------------------------------------------
+# Normalization
+# ---------------------------------------------------------------------------
+
+
 def normalize(expr: ad.AnnData, cfg: Config) -> ad.AnnData:
     """Library-size normalize and log1p-transform while preserving raw counts.
 
-    Small datasets retain the previous behaviour.
+    STANDARD datasets retain the historical copy-safe behaviour.
 
-    Large datasets avoid unnecessary copies of the complete expression matrix.
-    This is critical for matrices containing millions of cells.
+    LARGE datasets avoid creating another complete copy merely to keep
+    ``X`` and ``layers['lognorm']`` synchronized. Downstream large-data
+    clustering never scales ``expr.X`` in place; scaling occurs only on the
+    temporary HVG working object.
     """
 
     is_large = cfg.use_large_mode(expr.n_obs)
 
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Already normalized
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------------
     if LOGNORM_LAYER in expr.layers:
         logger.info(
             "Using pre-computed '%s' layer; skipping normalization",
@@ -61,7 +112,6 @@ def normalize(expr: ad.AnnData, cfg: Config) -> ad.AnnData:
         )
 
         if is_large:
-            # Do NOT duplicate a potentially enormous sparse matrix.
             expr.X = expr.layers[LOGNORM_LAYER]
             logger.info(
                 "Large-dataset memory mode: using '%s' directly as X "
@@ -73,31 +123,26 @@ def normalize(expr: ad.AnnData, cfg: Config) -> ad.AnnData:
 
         return expr
 
-    # --------------------------------------------------------------
-    # Preserve counts
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Preserve raw counts
+    # ------------------------------------------------------------------
     if "counts" not in expr.layers:
         logger.info(
             "No 'counts' layer found; preserving current X as raw counts"
         )
         expr.layers["counts"] = expr.X.copy()
-        gc.collect()
-
+        _collect()
     else:
         logger.info("Using existing 'counts' layer as raw expression")
 
-    # --------------------------------------------------------------
-    # Create writable normalized expression
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Construct writable normalized expression
+    # ------------------------------------------------------------------
     #
-    # counts must remain unchanged, so normalization requires a writable
-    # matrix distinct from layers['counts'].
-    #
-    # Assignment replaces the previous X reference. Explicit collection is
-    # useful for huge AnnData objects where the previous matrix may itself be
-    # many GB.
+    # Raw counts must remain unchanged, so normalization requires a matrix
+    # distinct from layers['counts'].
     expr.X = expr.layers["counts"].copy()
-    gc.collect()
+    _collect()
 
     sc.pp.normalize_total(
         expr,
@@ -106,15 +151,13 @@ def normalize(expr: ad.AnnData, cfg: Config) -> ad.AnnData:
 
     sc.pp.log1p(expr)
 
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Preserve normalized expression
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------------
     if is_large:
-        # Important:
-        # Do not immediately make yet another full copy.
+        # Intentionally avoid a second full expression-matrix copy.
         #
-        # Downstream large-dataset operations in this module do not modify
-        # expr.X in place. Scaling occurs only on a temporary HVG subset.
+        # The downstream LARGE path never modifies expr.X in place.
         expr.layers[LOGNORM_LAYER] = expr.X
 
         logger.info(
@@ -130,42 +173,64 @@ def normalize(expr: ad.AnnData, cfg: Config) -> ad.AnnData:
             cfg.cluster.target_sum or "median library size",
         )
 
-    gc.collect()
-
+    _collect()
     return expr
+
+
+# ---------------------------------------------------------------------------
+# Highly variable genes
+# ---------------------------------------------------------------------------
 
 
 def _select_hvgs(expr: ad.AnnData, cfg: Config) -> None:
     """Select highly variable genes.
 
-    For large datasets, HVGs are estimated from a reproducible random subset
-    rather than all cells. The resulting HVG mask is then copied back to the
-    complete AnnData object.
+    STANDARD
+        HVGs are estimated using the complete dataset, preserving the original
+        pipeline behaviour.
 
-    This preserves all cells for downstream PCA/neighbors/Leiden while avoiding
-    a very expensive full-dataset HVG calculation.
+    LARGE
+        HVGs are estimated from a reproducible random sample of at most
+        ``scaling.marker_max_cells`` cells. The resulting gene mask is then
+        applied to the complete dataset.
+
+    Importantly, the cell sample affects only feature selection. All cells are
+    subsequently retained for PCA, neighbors, UMAP and Leiden.
     """
 
     c = cfg.cluster
     n_top = min(c.n_top_genes, expr.n_vars)
+    is_large = cfg.use_large_mode(expr.n_obs)
 
-    if not cfg.use_large_mode(expr.n_obs):
+    # ------------------------------------------------------------------
+    # Standard mode
+    # ------------------------------------------------------------------
+    if not is_large:
         sc.pp.highly_variable_genes(
             expr,
             n_top_genes=n_top,
         )
 
+        n_selected = int(expr.var["highly_variable"].sum())
+
+        if n_selected == 0:
+            raise RuntimeError(
+                "HVG selection returned zero highly variable genes."
+            )
+
         logger.info(
             "Selected %d highly variable genes",
-            int(expr.var["highly_variable"].sum()),
+            n_selected,
         )
-
         return
 
-    # --------------------------------------------------------------
-    # Large dataset HVG estimation
-    # --------------------------------------------------------------
-    n_sample = min(cfg.scaling.marker_max_cells, expr.n_obs)
+    # ------------------------------------------------------------------
+    # Large mode
+    # ------------------------------------------------------------------
+    n_sample = min(
+        int(cfg.scaling.marker_max_cells),
+        expr.n_obs,
+    )
 
     logger.info(
         "Large dataset detected: %d cells x %d genes",
@@ -187,11 +252,9 @@ def _select_hvgs(expr: ad.AnnData, cfg: Config) -> None:
         replace=False,
     )
 
-    # Sorting makes sparse row slicing somewhat friendlier and deterministic.
+    # Sorted sparse row slicing is generally cheaper and deterministic.
     sampled_idx.sort()
 
-    # Only a cell subset is copied. We deliberately do not copy the entire
-    # multi-million-cell object.
     hvg_expr = expr[sampled_idx, :].copy()
 
     sc.pp.highly_variable_genes(
@@ -205,7 +268,9 @@ def _select_hvgs(expr: ad.AnnData, cfg: Config) -> None:
         .astype(bool)
     )
 
-    if hvg_mask.sum() == 0:
+    n_selected = int(hvg_mask.sum())
+
+    if n_selected == 0:
         raise RuntimeError(
             "Large-dataset HVG selection returned zero highly variable genes."
         )
@@ -214,7 +279,7 @@ def _select_hvgs(expr: ad.AnnData, cfg: Config) -> None:
 
     logger.info(
         "Selected %d highly variable genes from %d-cell reference subset",
-        int(hvg_mask.sum()),
+        n_selected,
         n_sample,
     )
 
@@ -222,17 +287,53 @@ def _select_hvgs(expr: ad.AnnData, cfg: Config) -> None:
     del sampled_idx
     del hvg_mask
 
-    gc.collect()
+    _collect()
+
+
+# ---------------------------------------------------------------------------
+# PCA
+# ---------------------------------------------------------------------------
 
 
 def _run_pca_on_hvgs(expr: ad.AnnData, cfg: Config) -> None:
     """Run PCA using only highly variable genes.
 
-    A temporary HVG AnnData object is created so that operations such as
-    scaling never densify or modify all genes in the parent dataset.
+    STANDARD path
+    -------------
+    Preserves the previous implementation:
+
+        HVG copy
+          -> zero-centered scaling
+          -> optional max-value clipping
+          -> PCA
+
+    LARGE sparse path
+    -----------------
+    Explicit zero-centering is forbidden because it densifies the matrix.
+
+    Instead:
+
+        sparse HVG copy
+          -> divide each gene by its SD (zero_center=False)
+          -> sparse-compatible PCA with implicit centering
+
+    Algebraically, scaling by SD first and subtracting the scaled gene mean
+    during PCA gives the same standardized coordinates as::
+
+        (x - mean(x)) / sd(x)
+
+    before PCA.
+
+    ``scale_max_value`` clipping is deliberately NOT applied in this sparse
+    path. Clipping ``x / sd`` before the mean is subtracted is not equivalent
+    to clipping centered z-scores and would introduce a dataset-size-dependent
+    statistical change.
+
+    The full parent AnnData is never scaled.
     """
 
     c = cfg.cluster
+    is_large = cfg.use_large_mode(expr.n_obs)
 
     if "highly_variable" not in expr.var.columns:
         raise RuntimeError(
@@ -244,7 +345,8 @@ def _run_pca_on_hvgs(expr: ad.AnnData, cfg: Config) -> None:
 
     if n_hvg < 2:
         raise RuntimeError(
-            f"Only {n_hvg} highly variable genes available; PCA requires at least 2."
+            f"Only {n_hvg} highly variable genes available; "
+            "PCA requires at least 2."
         )
 
     n_pcs = int(
@@ -255,18 +357,43 @@ def _run_pca_on_hvgs(expr: ad.AnnData, cfg: Config) -> None:
         )
     )
 
-    logger.info(
-        "Creating PCA working matrix: %d cells x %d HVGs",
+    if n_pcs < 1:
+        raise RuntimeError(
+            f"PCA resolved to n_pcs={n_pcs}; "
+            "at least one component is required."
+        )
+
+    dense_gib32 = _matrix_gib(
         expr.n_obs,
         n_hvg,
+        np.float32,
+    )
+    dense_gib64 = _matrix_gib(
+        expr.n_obs,
+        n_hvg,
+        np.float64,
     )
 
-    # This copy contains only ~3000 genes rather than all ~37k genes.
+    logger.info(
+        "Creating PCA working matrix: %d cells x %d HVGs "
+        "(dense equivalent %.1f GiB float32 / %.1f GiB float64)",
+        expr.n_obs,
+        n_hvg,
+        dense_gib32,
+        dense_gib64,
+    )
+
+    # This copy contains only the selected HVGs rather than all genes.
     pca_expr = expr[:, hvg_mask].copy()
 
-    # --------------------------------------------------------------
+    logger.info(
+        "PCA working matrix storage: %s",
+        "sparse" if sparse.issparse(pca_expr.X) else "dense",
+    )
+
+    # ------------------------------------------------------------------
     # Optional covariate regression
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------------
     if c.regress_out:
         missing = [
             key
@@ -280,43 +407,99 @@ def _run_pca_on_hvgs(expr: ad.AnnData, cfg: Config) -> None:
                 f"{missing}"
             )
 
+        if is_large:
+            # sc.pp.regress_out commonly creates dense intermediates.
+            #
+            # Even though we already restricted to HVGs, 2.6M x 3k can still
+            # be tens of GiB when dense. Fail explicitly rather than allowing
+            # a surprise OOM.
+            raise ValueError(
+                "cluster.regress_out is not supported in LARGE execution mode "
+                "because Scanpy regression can densify the multi-million-cell "
+                "HVG matrix. Remove cluster.regress_out for this run or perform "
+                "the desired correction upstream. Batch correction through "
+                "cluster.batch_key / Harmony remains supported."
+            )
+
         logger.info(
             "Regressing out %s on HVG working matrix",
             c.regress_out,
         )
 
-        # Regression is now restricted to HVGs rather than every gene.
         sc.pp.regress_out(
             pca_expr,
             c.regress_out,
         )
 
-    # --------------------------------------------------------------
-    # Optional scaling
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------------
+    # Scaling
+    # ------------------------------------------------------------------
     if c.scale_max_value is not None:
+        if is_large and sparse.issparse(pca_expr.X):
+            logger.info(
+                "LARGE sparse scaling: zero_center=False to preserve sparsity; "
+                "gene means will be centered by PCA. "
+                "cluster.scale_max_value=%s is intentionally not applied in "
+                "this path because clipping before centering is not equivalent "
+                "to clipping centered z-scores.",
+                c.scale_max_value,
+            )
+
+            # Critical KOLF fix:
+            #
+            # NEVER use zero_center=True here. It would turn the sparse
+            # 2.66M x 3000 matrix into a dense matrix.
+            #
+            # We variance-scale while leaving zero entries sparse.
+            sc.pp.scale(
+                pca_expr,
+                zero_center=False,
+                max_value=None,
+            )
+
+        else:
+            logger.info(
+                "Scaling HVG working matrix with max_value=%s",
+                c.scale_max_value,
+            )
+
+            # Historical STANDARD behaviour.
+            sc.pp.scale(
+                pca_expr,
+                zero_center=True,
+                max_value=c.scale_max_value,
+            )
+
+    elif is_large and sparse.issparse(pca_expr.X):
         logger.info(
-            "Scaling HVG working matrix with max_value=%s",
-            c.scale_max_value,
+            "LARGE PCA: cluster.scale_max_value is null; "
+            "running sparse PCA without prior variance scaling."
         )
 
-        sc.pp.scale(
-            pca_expr,
-            max_value=c.scale_max_value,
-        )
-
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------------
     # PCA
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------------
+    logger.info(
+        "Running PCA: n_comps=%d, solver=arpack, zero_center=True",
+        n_pcs,
+    )
+
+    # Scanpy supports mean-centered PCA for sparse matrices without requiring
+    # callers to explicitly materialize a centered dense matrix. This is the
+    # crucial difference from sc.pp.scale(zero_center=True).
     sc.tl.pca(
         pca_expr,
         n_comps=n_pcs,
+        zero_center=True,
         svd_solver="arpack",
         random_state=cfg.run.seed,
     )
 
-    # Preserve only PCA results in the original object.
-    expr.obsm["X_pca"] = pca_expr.obsm["X_pca"]
+    # Keep the cell embedding compact.
+    expr.obsm["X_pca"] = np.asarray(
+        pca_expr.obsm["X_pca"],
+        dtype=np.float32,
+    )
 
     if "pca" in pca_expr.uns:
         expr.uns["pca"] = pca_expr.uns["pca"]
@@ -330,45 +513,72 @@ def _run_pca_on_hvgs(expr: ad.AnnData, cfg: Config) -> None:
     del pca_expr
     del hvg_mask
 
-    gc.collect()
+    _collect()
 
 
-def embed_and_cluster(expr: ad.AnnData, cfg: Config) -> ad.AnnData:
+# ---------------------------------------------------------------------------
+# Embedding and clustering
+# ---------------------------------------------------------------------------
+
+
+def embed_and_cluster(
+    expr: ad.AnnData,
+    cfg: Config,
+) -> ad.AnnData:
     """HVG selection, PCA, optional Harmony, neighbors, UMAP and Leiden."""
 
     c = cfg.cluster
+    is_large = cfg.use_large_mode(expr.n_obs)
+
     sc.settings.seed = cfg.run.seed
 
-    # --------------------------------------------------------------
+    logger.info(
+        "Clustering execution mode: %s",
+        "LARGE" if is_large else "STANDARD",
+    )
+
+    # ------------------------------------------------------------------
     # 1. Highly variable genes
-    # --------------------------------------------------------------
-    _select_hvgs(expr, cfg)
+    # ------------------------------------------------------------------
+    _select_hvgs(
+        expr,
+        cfg,
+    )
 
-    # --------------------------------------------------------------
-    # 2. PCA on HVGs only
-    # --------------------------------------------------------------
-    _run_pca_on_hvgs(expr, cfg)
+    # ------------------------------------------------------------------
+    # 2. PCA
+    # ------------------------------------------------------------------
+    _run_pca_on_hvgs(
+        expr,
+        cfg,
+    )
 
-    n_pcs = int(expr.obsm["X_pca"].shape[1])
+    n_pcs = int(
+        expr.obsm["X_pca"].shape[1]
+    )
 
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------------
     # 3. Optional Harmony
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------------
     use_rep = "X_pca"
 
     if c.batch_key:
-        harmony_rep = _run_harmony(expr, cfg)
+        harmony_rep = _run_harmony(
+            expr,
+            cfg,
+        )
 
         if harmony_rep is not None:
             use_rep = harmony_rep
 
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------------
     # 4. Neighbor graph
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------------
     logger.info(
-        "Computing %d-nearest-neighbor graph using %s",
+        "Computing %d-nearest-neighbor graph using %s over %d cells",
         c.n_neighbors,
         use_rep,
+        expr.n_obs,
     )
 
     sc.pp.neighbors(
@@ -379,16 +589,18 @@ def embed_and_cluster(expr: ad.AnnData, cfg: Config) -> ad.AnnData:
         random_state=cfg.run.seed,
     )
 
-    gc.collect()
+    _collect()
 
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------------
     # 5. UMAP
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------------
     #
-    # UMAP on several million cells may still be expensive. We keep the
-    # existing behaviour for now so pipeline semantics do not change.
-    # If KOLF later stalls here, this should become the next large-dataset
-    # optimisation target.
+    # This intentionally preserves full-data UMAP semantics.
+    #
+    # On multi-million-cell datasets this may itself become the next major
+    # computational bottleneck. If that occurs, optimize it independently;
+    # do not silently subsample here because downstream plots currently assume
+    # one coordinate per analysed cell.
     logger.info(
         "Computing UMAP for %d cells",
         expr.n_obs,
@@ -400,11 +612,16 @@ def embed_and_cluster(expr: ad.AnnData, cfg: Config) -> ad.AnnData:
         random_state=cfg.run.seed,
     )
 
-    gc.collect()
+    _collect()
 
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------------
     # 6. Leiden
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------------
+    logger.info(
+        "Running Leiden clustering at resolution %.2f",
+        c.leiden_resolution,
+    )
+
     sc.tl.leiden(
         expr,
         key_added=CLUSTER_KEY,
@@ -415,7 +632,9 @@ def embed_and_cluster(expr: ad.AnnData, cfg: Config) -> ad.AnnData:
         random_state=cfg.run.seed,
     )
 
-    n_clusters = expr.obs[CLUSTER_KEY].nunique()
+    n_clusters = int(
+        expr.obs[CLUSTER_KEY].nunique()
+    )
 
     logger.info(
         "Leiden clustering at resolution %.2f: %d clusters",
@@ -423,16 +642,13 @@ def embed_and_cluster(expr: ad.AnnData, cfg: Config) -> ad.AnnData:
         n_clusters,
     )
 
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------------
     # Restore X
-    # --------------------------------------------------------------
+    # ------------------------------------------------------------------
     #
-    # Scaling/regression happened only on the temporary HVG object, so the
-    # parent's X was never changed.
-    #
-    # For a large dataset, avoid another enormous copy.
+    # Parent X was never scaled. The temporary PCA object absorbed all scaling.
     if LOGNORM_LAYER in expr.layers:
-        if cfg.use_large_mode(expr.n_obs):
+        if is_large:
             expr.X = expr.layers[LOGNORM_LAYER]
 
             logger.info(
@@ -443,18 +659,24 @@ def embed_and_cluster(expr: ad.AnnData, cfg: Config) -> ad.AnnData:
         else:
             expr.X = expr.layers[LOGNORM_LAYER].copy()
 
-    gc.collect()
-
+    _collect()
     return expr
 
 
-def reset_embedding(expr: ad.AnnData) -> ad.AnnData:
+# ---------------------------------------------------------------------------
+# Reset embedding
+# ---------------------------------------------------------------------------
+
+
+def reset_embedding(
+    expr: ad.AnnData,
+) -> ad.AnnData:
     """Drop everything :func:`embed_and_cluster` produced, in place.
 
-    Used when a subset of an already-embedded object is re-embedded on its own
-    (``cluster.assigned_only``).
+    Used when a subset of an already embedded object is re-embedded on its own
+    under ``cluster.assigned_only``.
 
-    The ``counts`` and ``lognorm`` layers are preserved.
+    ``counts`` and ``lognorm`` layers remain untouched.
     """
 
     for key in (
@@ -475,7 +697,10 @@ def reset_embedding(expr: ad.AnnData) -> ad.AnnData:
         CLUSTER_KEY,
         f"{CLUSTER_KEY}_colors",
     ):
-        expr.uns.pop(key, None)
+        expr.uns.pop(
+            key,
+            None,
+        )
 
     if "highly_variable" in expr.var.columns:
         del expr.var["highly_variable"]
@@ -483,18 +708,24 @@ def reset_embedding(expr: ad.AnnData) -> ad.AnnData:
     if CLUSTER_KEY in expr.obs.columns:
         del expr.obs[CLUSTER_KEY]
 
-    gc.collect()
-
+    _collect()
     return expr
+
+
+# ---------------------------------------------------------------------------
+# Harmony
+# ---------------------------------------------------------------------------
 
 
 def _run_harmony(
     expr: ad.AnnData,
     cfg: Config,
 ) -> Optional[str]:
-    """Batch-correct PCA embedding with Harmony.
+    """Batch-correct the PCA embedding with Harmony.
 
-    Returns the corrected representation key.
+    Harmony operates only on the cells x PCs matrix, not on cells x genes.
+    Its corrected result is stored as float32 after the algorithm completes to
+    halve persistent embedding memory.
     """
 
     key = cfg.cluster.batch_key
@@ -505,7 +736,9 @@ def _run_harmony(
             f"Available: {sorted(expr.obs.columns)[:30]}"
         )
 
-    n_batches = expr.obs[key].nunique()
+    n_batches = int(
+        expr.obs[key].nunique()
+    )
 
     if n_batches < 2:
         logger.warning(
@@ -523,19 +756,21 @@ def _run_harmony(
             "Install it with: pip install 'perturbseq-pipeline[harmony]'"
         ) from exc
 
-    # --------------------------------------------------------------
-    # Harmony requires dense PCA embeddings, but this is only
-    # cells x PCs rather than cells x genes.
-    # --------------------------------------------------------------
+    # Harmony currently operates on a dense cells x PCs representation.
+    #
+    # This is acceptable relative to cells x genes:
+    # 2.66M x 50 float64 is ~1 GiB rather than tens/hundreds of GiB.
     embedding = np.asarray(
         expr.obsm["X_pca"],
         dtype=np.float64,
     )
 
     logger.info(
-        "Running Harmony on embedding of shape %s across %d batches",
+        "Running Harmony on embedding of shape %s across %d batches "
+        "(dense float64 input approximately %.2f GiB)",
         embedding.shape,
         n_batches,
+        embedding.nbytes / (1024.0 ** 3),
     )
 
     out = harmonypy.run_harmony(
@@ -550,7 +785,8 @@ def _run_harmony(
         else out.Z_corr
     )
 
-    # Orient defensively.
+    # Orient defensively because harmonypy versions have historically differed
+    # in whether corrected coordinates are cells x PCs or PCs x cells.
     if corrected.shape != embedding.shape:
         if corrected.T.shape == embedding.shape:
             corrected = corrected.T
@@ -561,8 +797,6 @@ def _run_harmony(
                 f"{embedding.shape} nor its transpose."
             )
 
-    # float32 is sufficient for neighbor search and halves the memory
-    # requirement compared with Harmony's float64 output.
     expr.obsm["X_pca_harmony"] = corrected.astype(
         np.float32,
         copy=False,
@@ -572,7 +806,7 @@ def _run_harmony(
     del embedding
     del out
 
-    gc.collect()
+    _collect()
 
     logger.info(
         "Harmony batch correction on %r across %d batches",
@@ -583,14 +817,19 @@ def _run_harmony(
     return "X_pca_harmony"
 
 
+# ---------------------------------------------------------------------------
+# Summaries
+# ---------------------------------------------------------------------------
+
+
 def cluster_summary(
     expr: ad.AnnData,
     lane_key: str = LANE_KEY,
 ) -> pd.DataFrame:
     """Cluster sizes and lane composition.
 
-    A cluster dominated by one lane is a classic indication of batch effects,
-    so the per-lane share is reported in addition to cluster size.
+    A cluster dominated by one lane can indicate residual batch structure, so
+    per-lane composition is included whenever multiple lanes are available.
     """
 
     if CLUSTER_KEY not in expr.obs.columns:
@@ -607,19 +846,27 @@ def cluster_summary(
             "cluster": cl,
             "n_cells": len(sub),
             "pct_of_total": round(
-                100 * len(sub) / expr.n_obs,
+                100.0
+                * len(sub)
+                / max(expr.n_obs, 1),
                 2,
             ),
         }
 
         if "n_genes_by_counts" in sub.columns:
             row["median_genes"] = float(
-                np.median(sub["n_genes_by_counts"])
+                np.median(
+                    sub["n_genes_by_counts"]
+                )
             )
 
         if "pct_counts_mt" in sub.columns:
             row["median_pct_mt"] = round(
-                float(np.median(sub["pct_counts_mt"])),
+                float(
+                    np.median(
+                        sub["pct_counts_mt"]
+                    )
+                ),
                 2,
             )
 
@@ -630,25 +877,39 @@ def cluster_summary(
             share = (
                 sub[lane_key]
                 .astype(str)
-                .value_counts(normalize=True)
+                .value_counts(
+                    normalize=True
+                )
             )
 
-            row["top_lane"] = share.index[0]
-            row["top_lane_pct"] = round(
-                100 * float(share.iloc[0]),
-                1,
-            )
+            if not share.empty:
+                row["top_lane"] = str(
+                    share.index[0]
+                )
+
+                row["top_lane_pct"] = round(
+                    100.0
+                    * float(
+                        share.iloc[0]
+                    ),
+                    1,
+                )
 
         rows.append(row)
 
     out = pd.DataFrame(rows)
+
+    if out.empty:
+        return out
 
     return (
         out.sort_values(
             "n_cells",
             ascending=False,
         )
-        .reset_index(drop=True)
+        .reset_index(
+            drop=True
+        )
     )
 
 
@@ -656,7 +917,7 @@ def cluster_composition(
     expr: ad.AnnData,
     group_key: str,
 ) -> pd.DataFrame:
-    """Contingency table of Leiden cluster against another obs column."""
+    """Contingency table of Leiden cluster against another ``obs`` column."""
 
     if (
         CLUSTER_KEY not in expr.obs.columns
@@ -667,9 +928,14 @@ def cluster_composition(
     return (
         expr.obs
         .groupby(
-            [CLUSTER_KEY, group_key],
+            [
+                CLUSTER_KEY,
+                group_key,
+            ],
             observed=True,
         )
         .size()
-        .unstack(fill_value=0)
+        .unstack(
+            fill_value=0
+        )
     )

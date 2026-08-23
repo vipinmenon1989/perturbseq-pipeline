@@ -10,22 +10,66 @@ input:
   # Existing perturbation assignment in the AnnData.
   guide_obs_column: gene_target
 
+  # Raw counts are stored here in this object.
+  counts_layer: counts
 
+
+# -------------------------------------------------------------------------
+# Scaling
+#
+# KOLF is a genuine large-data run:
+# ~2.66 million cells
+# ~37k genes
+# ~11.7k perturbation targets
+#
+# AUTO should already classify this as LARGE. Keeping AUTO rather than
+# forcing LARGE lets the centralized scaling logic remain the source of truth.
+# -------------------------------------------------------------------------
+scaling:
+  mode: auto
+
+  large_n_cells: 1000000
+  large_n_perturbations: 5000
+
+  marker_max_cells: 200000
+  effect_gene_chunk: 256
+
+  guide_chunk_size: 20000
+  guide_max_dense_elements: 20000000
+
+  collect_between_stages: true
+  log_memory: true
+
+  report_preview_rows: 500
+
+
+# -------------------------------------------------------------------------
+# Guide labels
+#
+# gene_target already contains clean target labels such as:
+# DUX4, BBC3, ZFP3, ..., NTC
+#
+# Therefore no target-name parsing is needed.
+# -------------------------------------------------------------------------
 guides:
-  # gene_target already contains clean target names such as:
-  # DUX4, BBC3, ZFP3, ..., NTC
-  # Therefore do not split target names further.
   target_split_delims: []
 
-  # Convert the dataset-specific "NTC" assignment into the
-  # pipeline's internal non-targeting category "ntc".
+  # Collapse dataset-specific NTC into the pipeline's internal control label.
   ntc_label: ntc
-  ntc_patterns: ["NTC"]
+
+  # Exact-ish NTC pattern.
+  ntc_patterns:
+    - "^NTC$"
 
 
+# -------------------------------------------------------------------------
+# QC
+#
+# KOLF_Pan_Genome_QC_Filtered.h5ad is already QC filtered.
+# We therefore preserve the published/processed cell population rather than
+# imposing another arbitrary QC pass.
+# -------------------------------------------------------------------------
 qc:
-  # This dataset is already QC-filtered.
-  # Do not apply a second arbitrary filtering pass.
   min_genes_per_cell: null
   min_cells_per_gene: null
   min_genes_final: null
@@ -34,83 +78,230 @@ qc:
   min_counts_per_cell: null
 
 
+# -------------------------------------------------------------------------
+# Clustering
+#
+# The large-mode implementation should avoid scaling/densifying the full
+# 2.66M x 37k matrix. HVG/PCA operations should use the bounded scalable path.
+# -------------------------------------------------------------------------
 cluster:
   n_top_genes: 3000
   n_pcs: 50
   n_neighbors: 15
   leiden_resolution: 1.0
-
-  # Present in adata.obs.
   batch_key: batch
 
 
+# -------------------------------------------------------------------------
+# Direct perturbation efficacy
+#
+# This asks:
+# Did perturbing gene X reduce expression of gene X?
+#
+# Keep NTC as the primary biological reference while also calculating the
+# larger "other-target" reference arm.
+# -------------------------------------------------------------------------
 perturbation:
-  # These are INTERNAL pipeline control classes.
-  # Do NOT put the dataset label "NTC" here.
-  controls: ["ntc", "other"]
+  controls:
+    - ntc
+    - other
+
   primary_control: ntc
 
   min_cells_per_target: 10
+  min_control_cells: 10
+  min_pct_expressing_control: 1.0
+
   fdr_alpha: 0.05
+  max_log2fc_for_hit: 0.0
+
   top_n_report: 12
+  umap_background_fraction: 0.01
 
 
+# -------------------------------------------------------------------------
+# Perturbation enrichment across cell states
+#
+# This asks:
+# Does perturbing a gene move cells into or out of particular transcriptional
+# states?
+#
+# batch-stratified CMH controls for differences in cluster composition between
+# batches.
+# -------------------------------------------------------------------------
 enrichment:
   enabled: true
   cluster_key: leiden
 
-  controls: ["ntc", "other"]
+  controls:
+    - ntc
+    - other
+
   primary_control: ntc
 
   fdr_alpha: 0.05
   min_cells_per_target: 10
   min_cells_per_cluster: 20
+  min_reference_cells: 10
 
-  # KOLF has obs["gRNA"], but the current config schema does not
-  # allow us to explicitly specify a guide-ID column.
-  # Therefore leave this off for now.
+  # Individual guide identities exist in obs["gRNA"], but the current pipeline
+  # configuration does not explicitly map that source into OBS_GUIDE.
+  # Leave guide-level concordance off until that adapter is added.
   guide_concordance: false
 
-  # batch exists in adata.obs.
   stratify_by: batch
 
+  # 1000 is statistically useful but expensive at this scale.
+  # Keep it for the full biological run; use 0-100 during debugging if needed.
   permutations: 1000
+
   top_n_report: 12
 
 
-ps_score:
+# -------------------------------------------------------------------------
+# Co-functional perturbation modules / gene programs
+#
+# Enable this for the biological run.
+#
+# LARGE mode should:
+# - use bounded marker discovery,
+# - chunk effect-matrix construction,
+# - avoid holding redundant giant matrices in memory.
+# -------------------------------------------------------------------------
+modules:
   enabled: true
 
-  # Analysis threshold for now — don't treat <0.5 as junk.
-  ps_threshold: 0.5
+  cluster_key: leiden
 
-  # Same setting as the demo.
-  expression_cut: mean
+  gene_selection: cluster_markers
+  n_marker_genes_per_cluster: 100
+  marker_method: wilcoxon
+
+  # KOLF has many targets; 20 cells is a reasonable minimum starting point.
+  min_cells_per_perturbation: 20
+
+  control: ntc
+
+  program_correlation: pearson
+  module_correlation: spearman
+  linkage_method: average
+
+  # Exploratory cuts, not biological ground truth.
+  n_programs: 4
+  n_modules: 9
+  cluster_distance_threshold: 0.7
+
+  # This adds per-cell program-score columns.
+  # It may be expensive on 2.66M cells, but is biologically useful.
+  score_programs: true
+
+  hub_lfc_threshold: 0.5
+  de_fdr_alpha: 0.05
+
+  # Network layouts are secondary to the module/program matrices.
+  # Keep false for the first KOLF run to avoid wasting time on layouts.
+  draw_networks: false
+
+  min_perturbations: 5
+  min_genes: 10
 
   top_n_report: 12
 
 
+# -------------------------------------------------------------------------
+# Per-cell perturbation score
+#
+# Keep PS itself enabled.
+#
+# IMPORTANT:
+# Do NOT run full supervised LDA/UMAP on 2.66 million cells.
+# That visualization is not required for the PS statistics.
+# -------------------------------------------------------------------------
+ps_score:
+  enabled: true
+  require: false
+
+  top_n_biomarkers: 100
+  scale_factor: 3.0
+
+  ps_threshold: 0.5
+  expression_cut: mean
+  expression_cut_quantile: 0.75
+
+  min_cells_per_target: 10
+  min_control_cells: 10
+
+  top_n_report: 12
+
+  # Strong recommendation for KOLF.
+  compute_lda_umap: false
+
+  # If you later enable LDA, LARGE mode should cap it here.
+  lda_large_max_cells: 150000
+  lda_large_stratified: true
+
+
+# -------------------------------------------------------------------------
+# lochNESS
+#
+# Full cell x target materialization is impossible here:
+#
+# 2.66M cells x ~11.7k targets = tens of billions of values.
+#
+# LARGE mode should therefore compute sparse/chunked summaries and retain
+# lochness_self rather than thousands of per-target obs columns.
+# -------------------------------------------------------------------------
 lochness:
   enabled: true
 
+  genotype_key: target_gene
 
-modules:
-  enabled: false
+  n_neighbors: 300
+  n_pcs: 20
+
+  # Prefer X_pca_harmony automatically when present.
+  use_rep: null
+
+  recompute_neighbors: true
+
+  min_cells_per_target: 10
+  enrichment_cut: 0.5
+  noise_delta: 0.0
+
+  target_chunk_size: 256
+
+  # Current config summary indicates this is the maximum number of individual
+  # target score columns retained in obs.
+  max_targets_in_obs: 50
+
+  top_n_report: 12
 
 
+# -------------------------------------------------------------------------
+# Report
+#
+# Full result tables are still written to disk; the large-mode report path
+# should use bounded previews.
+# -------------------------------------------------------------------------
 report:
   title: "Perturb-seq report — KOLF Pan Genome"
   embed_figures: true
+  figure_format: png
+  figure_dpi: 150
+  max_table_rows: 100
 
 
+# -------------------------------------------------------------------------
+# Outputs
+# -------------------------------------------------------------------------
 output:
   h5ad_name: KOLF_Pan_Genome_processed.h5ad
   report_name: report.html
 
   write_unfiltered_h5ad: false
 
-  # Don't archive a multi-million-cell run while debugging.
-  archive: false
+  merge_guides_into_h5ad: true
+  write_guide_h5ad: false
 
-  # Guide assignments already exist in the h5ad.
-  write_guide_table: false
+  # Avoid spending additional time compressing a giant debug/full run.
+  archive: false
