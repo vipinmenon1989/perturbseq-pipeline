@@ -685,6 +685,22 @@ results/<run_name>/
 
 ## Development History & Changelog
 
+### 2026-08-23: 320K 10x Flex CRISPRi configuration
+* **320K Flex Configuration (`config/320CRISPRiflex.yaml`)**: Configured the 312,195-cell K562 10x Flex CRISPRi dataset (`../data/K562_320K_CRISPR_filtered.h5ad`), following the exact biological and input logic of the 1M Flex dataset rather than KOLF.
+* **Metadata-Aware Guide Resolution**: Uses authoritative `guides.var["target_gene_name"]` (`target_feature_column: target_gene_name`) with non-targeting pattern matching (`"Non-Targeting"` -> `ntc`), `ignored_target_values: ["Ignore"]` (`"Ignore"` -> `unassigned`), and missing values -> `unassigned`. TSS transcript identifiers (e.g. `TSS100020_...`) are never treated as biological gene targets.
+* **Automatic Scaling Behavior**: Retains `scaling.mode: auto` with thresholds `large_n_cells: 1000000` and `large_n_perturbations: 5000`. Because 320K Flex contains 312,195 cells and 849 candidate perturbations, AUTO scaling resolves to `STANDARD` execution mode (compared to 1M Flex with 1.23M cells resolving automatically to `LARGE` mode).
+* **Dataset Independence & Compatibility**:
+  - **320K Flex & 1M Flex**: Combined Gene Expression + CRISPR Guide Capture matrices split via `var["feature_types"]`, guide targets resolved via guide metadata `target_gene_name`.
+  - **Replogle**: Legacy guide-ID parsing or `obs['gene']` remains unaffected.
+  - **KOLF**: Independent precomputed-label path (`obs["gene_target"]`) and batch-stratified CMH analysis remain unaffected.
+  - No existing dataset architecture was changed.
+* **Real-Data Validation Results**:
+  - Validated via `Config.from_yaml("config/320CRISPRiflex.yaml")` -> `CONFIG VALID`.
+  - Verified 312,195 cells, 18,446 GEX features, 6,903 CRISPR Guide Capture features.
+  - Resolved execution mode: `STANDARD`.
+  - Tested on a real 5,000-cell subset: successfully separated GEX and guide matrices, correctly mapped 629 biological targets (including CNOT7), mapped 97 NTC cells to `ntc`, mapped 1,493 Ignore-dominant cells to `unassigned`, and confirmed 0 TSS identifiers in `target_gene`.
+  - Passed full test suite (132/132 tests passing).
+
 ### 2026-08-23: Authoritative Metadata Guide Target Mapping for 10x Flex CRISPRi
 * **Authoritative Guide-to-Target Metadata**: Added `target_feature_column` to `GuideConfig` in `config.py` and implemented `resolve_guide_targets()` in `guides.py` to support metadata-rich libraries (e.g. 10x Flex CRISPRi) where guide IDs encode TSS/transcript details rather than target genes.
 * **Ignored & Non-Targeting Annotations**: Added `ignored_target_values` (default `["Ignore"]`) to safely map non-biological annotations to `unassigned` class; added case-insensitive non-targeting pattern support for `"Non-Targeting"`.

@@ -1,0 +1,401 @@
+run:
+  name: K562_320K_CRISPRi
+  outdir: results/k562_320k_crispri
+  seed: 0
+
+
+# -------------------------------------------------------------------------
+# INPUT
+#
+# Converted from 10x Flex HDF5 / filtered feature matrix:
+#
+#   312,195 cells
+#   25,349 total features
+#     - 18,446 Gene Expression
+#     - 6,903 CRISPR Guide Capture
+#
+# Guide information is NOT precomputed in obs.
+# The pipeline splits the combined feature matrix using var["feature_types"].
+# -------------------------------------------------------------------------
+input:
+  mode: h5ad
+
+  h5ad: ../data/K562_320K_CRISPR_filtered.h5ad
+
+  feature_type_column: feature_types
+  gex_feature_type: "Gene Expression"
+
+  guide_feature_types:
+    - "CRISPR Guide Capture"
+
+  counts_layer: counts
+  normalized_layer: null
+
+  # No pre-computed guide label exists in obs.
+  guide_obs_column: null
+
+  guide_h5ad: null
+  guide_table: null
+
+
+# -------------------------------------------------------------------------
+# SCALING
+#
+# 312,195 cells is below the default 1M-cell threshold and contains ~850
+# perturbations (below the 5,000 threshold), so AUTO resolves to STANDARD
+# execution automatically.
+# -------------------------------------------------------------------------
+scaling:
+  mode: auto
+
+  large_n_cells: 1000000
+  large_n_perturbations: 5000
+
+  marker_max_cells: 200000
+
+  effect_gene_chunk: 256
+
+  guide_chunk_size: 20000
+  guide_max_dense_elements: 20000000
+
+  collect_between_stages: true
+  log_memory: true
+
+  report_preview_rows: 500
+
+
+# -------------------------------------------------------------------------
+# GUIDE CALLING & TARGET RESOLUTION
+#
+# Guide IDs encode transcript/TSS identifiers, e.g.:
+#   TSS100020_17082653_23-ENST00000606659
+#
+# The true biological target is stored in guide feature metadata:
+#   var["target_gene_name"]
+#
+# Use authoritative metadata mode to map dominant guides to biological targets.
+# -------------------------------------------------------------------------
+guides:
+  min_umi: 3
+
+  dominance_ratio: 2.0
+
+  # Keep disabled initially so behavior matches the historical pipeline.
+  # Can be tightened later after inspecting top-vs-second guide distributions.
+  max_second_umi: -1
+
+  detection_threshold: 3
+
+  # Authoritative metadata column in guides.var
+  target_feature_column: target_gene_name
+
+  ignored_target_values:
+    - Ignore
+
+  target_regex: null
+  target_split_delims: []
+
+  ntc_label: ntc
+
+  ntc_patterns:
+    - "^non[-_. ]?targeting"
+    - "^non$"
+    - "^ntc"
+    - scramble
+    - "^safe[-_. ]?harbor"
+
+  unassigned_label: unassigned
+  ambiguous_label: ambiguous
+
+
+# -------------------------------------------------------------------------
+# QC
+#
+# Standard Perturb-seq QC pass matching 1M Flex analysis.
+# -------------------------------------------------------------------------
+qc:
+  min_genes_per_cell: 200
+
+  min_cells_per_gene: 3
+
+  min_genes_final: 1000
+
+  max_pct_mt: 20.0
+
+  max_pct_hb: null
+
+  min_counts_per_cell: null
+
+  mito_prefix: "MT-"
+
+  ribo_prefix:
+    - "RPS"
+    - "RPL"
+
+  hb_pattern: "^HB[^(P)]"
+
+
+# -------------------------------------------------------------------------
+# CLUSTERING
+#
+# No batch/sample information exists in obs, so Harmony must NOT be requested.
+# -------------------------------------------------------------------------
+cluster:
+  target_sum: null
+
+  n_top_genes: 3000
+
+  n_pcs: 50
+
+  n_neighbors: 15
+
+  leiden_resolution: 1.0
+
+  umap_min_dist: 0.5
+
+  batch_key: null
+
+  regress_out: []
+
+  scale_max_value: 10.0
+
+  assigned_only: false
+
+
+# -------------------------------------------------------------------------
+# DIRECT PERTURBATION STRENGTH
+#
+# Did guides against gene X reduce expression of gene X?
+# -------------------------------------------------------------------------
+perturbation:
+  controls:
+    - ntc
+    - other
+
+  primary_control: ntc
+
+  min_cells_per_target: 10
+
+  min_control_cells: 10
+
+  min_pct_expressing_control: 1.0
+
+  fdr_alpha: 0.05
+
+  max_log2fc_for_hit: 0.0
+
+  top_n_report: 12
+
+  # Plotting only, not statistical sampling.
+  umap_background_fraction: 0.01
+
+
+# -------------------------------------------------------------------------
+# CLUSTER ENRICHMENT
+#
+# Does perturbing a gene shift cells into/out of particular cell states?
+#
+# There is no batch column, so use pooled Fisher testing rather than CMH.
+# -------------------------------------------------------------------------
+enrichment:
+  enabled: true
+
+  cluster_key: leiden
+
+  controls:
+    - ntc
+    - other
+
+  # The dataset contains non-targeting controls.
+  primary_control: ntc
+
+  fdr_alpha: 0.05
+
+  min_cells_per_target: 10
+
+  min_cells_per_cluster: 20
+
+  min_reference_cells: 10
+
+  odds_pseudocount: 0.5
+
+  stratify_by: null
+
+  # Guide identities are known from the guide-count matrix, so guide-level
+  # concordance can be evaluated.
+  guide_concordance: true
+
+  min_cells_per_guide: 5
+
+  permutations: 1000
+
+  top_n_report: 12
+
+
+# -------------------------------------------------------------------------
+# CO-FUNCTIONAL MODULES / GENE PROGRAMS
+#
+# Keep enabled for the full biological analysis.
+# -------------------------------------------------------------------------
+modules:
+  enabled: true
+
+  cluster_key: leiden
+
+  gene_selection: cluster_markers
+
+  n_marker_genes_per_cluster: 100
+
+  marker_method: wilcoxon
+
+  min_cells_per_perturbation: 20
+
+  control: ntc
+
+  program_correlation: pearson
+
+  module_correlation: spearman
+
+  linkage_method: average
+
+  # Exploratory cuts matching 1M Flex.
+  n_programs: 4
+  n_modules: 9
+
+  cluster_distance_threshold: 0.7
+
+  score_programs: true
+
+  hub_lfc_threshold: 0.5
+
+  de_fdr_alpha: 0.05
+
+  # Skip optional NetworkX layouts for initial run.
+  draw_networks: false
+
+  min_perturbations: 5
+
+  min_genes: 10
+
+  top_n_report: 12
+
+
+# -------------------------------------------------------------------------
+# PER-CELL PERTURBATION SCORE
+#
+# Keep PS statistics enabled.
+# Skip supervised LDA/UMAP visualization for initial run.
+# -------------------------------------------------------------------------
+ps_score:
+  enabled: true
+
+  require: false
+
+  top_n_biomarkers: 100
+
+  scale_factor: 3.0
+
+  ps_threshold: 0.5
+
+  expression_cut: mean
+
+  expression_cut_quantile: 0.75
+
+  min_cells_per_target: 10
+
+  min_control_cells: 10
+
+  top_n_report: 12
+
+  compute_lda_umap: false
+
+  lda_n_pcs: 40
+
+  lda_max_genes: 5000
+
+  lda_highlight_threshold: 0.8
+
+  lda_large_max_cells: 150000
+
+  lda_large_stratified: true
+
+
+# -------------------------------------------------------------------------
+# lochNESS
+# -------------------------------------------------------------------------
+lochness:
+  enabled: true
+
+  genotype_key: target_gene
+
+  n_neighbors: 300
+
+  n_pcs: 20
+
+  use_rep: null
+
+  recompute_neighbors: true
+
+  min_cells_per_target: 10
+
+  enrichment_cut: 0.5
+
+  noise_delta: 0.0
+
+  target_chunk_size: 256
+
+  store_all_target_scores: false
+  # Current schema requires >= 1.
+  max_targets_in_obs: 1
+
+  top_n_report: 12
+
+
+# -------------------------------------------------------------------------
+# REPORT
+# -------------------------------------------------------------------------
+report:
+  title: "Perturb-seq report — 10x Flex K562 320K CRISPRi"
+
+  embed_figures: true
+
+  figure_format: png
+
+  figure_dpi: 150
+
+  max_table_rows: 100
+
+
+# -------------------------------------------------------------------------
+# OUTPUT
+# -------------------------------------------------------------------------
+output:
+  h5ad_name: K562_320K_CRISPRi_processed.h5ad
+
+  report_name: report.html
+
+  write_unfiltered_h5ad: false
+
+  unfiltered_h5ad_name: null
+
+  merge_guides_into_h5ad: true
+
+  guide_obsm_key: guide_counts
+
+  write_guide_h5ad: false
+
+  save_figures_pdf: false
+
+  archive: false
+
+  archive_name: null
+
+  write_guide_table: false
+
+  guide_table_name: null
+
+  guide_table_min_umi: 3
+
+  large_file_dir: null
+
+  large_file_threshold_mb: 50.0
