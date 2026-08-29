@@ -523,6 +523,37 @@ class EnrichmentConfig:
 
 
 @dataclass
+class ProgramEnrichmentConfig:
+    """Biological pathway enrichment and functional annotation for gene programs."""
+
+    enabled: bool = True
+
+    method: str = "ora"
+
+    species: str = "human"
+
+    sources: List[str] = field(
+        default_factory=lambda: [
+            "hallmark",
+            "reactome",
+            "go_bp",
+        ]
+    )
+
+    custom_gmt_files: Dict[str, str] = field(default_factory=dict)
+
+    fdr_alpha: float = 0.05
+
+    min_overlap: int = 2
+
+    min_genes: int = 5
+
+    max_genes: int = 1500
+
+    top_terms_per_program: int = 5
+
+
+@dataclass
 class ModulesConfig:
     """Co-functional modules and co-regulated gene programs."""
 
@@ -572,6 +603,11 @@ class ModulesConfig:
     min_genes: int = 10
 
     top_n_report: int = 12
+
+    #: Biological pathway enrichment and functional annotation for gene programs.
+    program_enrichment: ProgramEnrichmentConfig = field(
+        default_factory=ProgramEnrichmentConfig
+    )
 
 
 # ===========================================================================
@@ -888,6 +924,44 @@ class ComputeConfig:
 
 
 # ===========================================================================
+# Storage / data access policy
+# ===========================================================================
+
+
+@dataclass
+class StorageConfig:
+    """Storage, dataset backing, and worker data-sharing policy.
+
+    Controls whether large AnnData datasets are loaded in-memory or accessed
+    via disk backing, and whether representations are shared across workers.
+
+    Modes
+    -----
+    ``auto``
+        Automatically uses backed H5AD for datasets with cell count >=
+        ``backed_threshold_cells`` if ``prefer_backed_h5ad`` is True.
+        STANDARD datasets remain in-memory.
+
+    ``in_memory``
+        Forces all datasets to be fully loaded into memory.
+
+    ``backed``
+        Requests backed H5AD (read-only) for large expression matrices.
+        Embeddings and metadata are retained in memory.
+    """
+
+    mode: str = "auto"
+
+    backed_threshold_cells: int = 1_000_000
+
+    prefer_backed_h5ad: bool = True
+
+    keep_embeddings_in_memory: bool = True
+
+    shared_worker_arrays: bool = True
+
+
+# ===========================================================================
 # Report
 # ===========================================================================
 
@@ -1041,6 +1115,11 @@ class Config:
     # Hardware compute backend policy.
     compute: ComputeConfig = field(
         default_factory=ComputeConfig
+    )
+
+    # Storage and data access policy.
+    storage: StorageConfig = field(
+        default_factory=StorageConfig
     )
 
     report: ReportConfig = field(
@@ -1594,6 +1673,40 @@ class Config:
                     "modules.cluster_distance_threshold is null"
                 )
 
+        pe_cfg = modules.program_enrichment
+        if pe_cfg.enabled:
+            if pe_cfg.method not in ("ora", "hypergeometric", "fisher"):
+                raise ValueError(
+                    "modules.program_enrichment.method must be 'ora' or 'hypergeometric' "
+                    f"(got {pe_cfg.method!r})"
+                )
+            if not (0 < pe_cfg.fdr_alpha < 1):
+                raise ValueError(
+                    "modules.program_enrichment.fdr_alpha must be in (0, 1)"
+                )
+            if pe_cfg.min_overlap < 1:
+                raise ValueError(
+                    "modules.program_enrichment.min_overlap must be >= 1"
+                )
+            if pe_cfg.min_genes < 1:
+                raise ValueError(
+                    "modules.program_enrichment.min_genes must be >= 1"
+                )
+            if pe_cfg.max_genes < pe_cfg.min_genes:
+                raise ValueError(
+                    "modules.program_enrichment.max_genes must be >= min_genes"
+                )
+            if pe_cfg.top_terms_per_program < 1:
+                raise ValueError(
+                    "modules.program_enrichment.top_terms_per_program must be >= 1"
+                )
+            if pe_cfg.custom_gmt_files:
+                for src_name, path in pe_cfg.custom_gmt_files.items():
+                    if not Path(path).is_file():
+                        raise FileNotFoundError(
+                            f"Custom GMT file for source {src_name!r} not found: {path}"
+                        )
+
         # ==============================================================
         # PS
         # ==============================================================
@@ -2007,6 +2120,27 @@ class Config:
                 raise ValueError(
                     f"compute.{name} must be >= 1, -1, or null (got {val})"
                 )
+
+        # ==============================================================
+        # Storage
+        # ==============================================================
+
+        storage_cfg = self.storage
+
+        if storage_cfg.mode not in (
+            "auto",
+            "in_memory",
+            "backed",
+        ):
+            raise ValueError(
+                "storage.mode must be one of 'auto', 'in_memory', 'backed' "
+                f"(got {storage_cfg.mode!r})"
+            )
+
+        if storage_cfg.backed_threshold_cells < 1:
+            raise ValueError(
+                "storage.backed_threshold_cells must be >= 1"
+            )
 
         # ==============================================================
         # Report / output

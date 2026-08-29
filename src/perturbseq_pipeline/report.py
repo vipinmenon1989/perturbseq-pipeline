@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import numpy as np
 import pandas as pd
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from markupsafe import Markup
@@ -156,6 +157,8 @@ def build_report(inputs: ReportInputs, path: Path) -> Path:
             "lochness",
             "cofunctional_modules",
             "gene_programs",
+            "program_summary",
+            "program_enrichment",
             "module_program_strength",
             "tf_hubs",
             "perturbation_distance",
@@ -207,6 +210,82 @@ def build_report(inputs: ReportInputs, path: Path) -> Path:
     modules_ctx = None
     if mods is not None and not mods.effect_matrix.empty:
         top_hub = mods.hubs.iloc[0].to_dict() if not mods.hubs.empty else {}
+
+        # Program biological annotations & pathways
+        prog_annotations = getattr(mods, "program_annotations", {})
+        display_labels = getattr(mods, "program_display_labels", {})
+        enr_df = getattr(mods, "program_enrichment", None)
+
+        program_details = []
+        for p in mods.program_labels:
+            p_genes = mods.program_genes.get(p, [])
+            ann = prog_annotations.get(p, "unannotated")
+            disp = display_labels.get(p, p)
+
+            top_pathways = []
+            if enr_df is not None and not enr_df.empty and "program_id" in enr_df.columns:
+                p_enr = enr_df[enr_df["program_id"] == p].sort_values(["fdr", "p_value"]).head(5)
+                for _, r in p_enr.iterrows():
+                    fdr_val = r.get("fdr", float("nan"))
+                    fdr_str = (
+                        f"{fdr_val:.2e}"
+                        if pd.notna(fdr_val) and fdr_val < 0.001
+                        else (f"{fdr_val:.3f}" if pd.notna(fdr_val) else "N/A")
+                    )
+                    top_pathways.append(
+                        {
+                            "term": r.get("term", ""),
+                            "clean_term": r.get("clean_term", r.get("term", "")),
+                            "source": r.get("gene_set_source", ""),
+                            "fdr": fdr_str,
+                            "fdr_num": fdr_val,
+                            "overlap_count": int(r.get("overlap_count", 0)),
+                            "overlap_genes": r.get("overlap_genes", ""),
+                        }
+                    )
+
+            program_details.append(
+                {
+                    "program_id": p,
+                    "annotation": ann,
+                    "display_label": disp,
+                    "top_genes": p_genes[:10],
+                    "all_genes_count": len(p_genes),
+                    "top_pathways": top_pathways,
+                }
+            )
+
+        # Module-program biological interpretations
+        mp_mat = getattr(mods, "module_program", None)
+        module_details = []
+        for m in mods.module_labels:
+            m_members = mods.module_members.get(m, [])
+            pos_progs = []
+            neg_progs = []
+            if mp_mat is not None and not mp_mat.empty and m in mp_mat.index:
+                row = mp_mat.loc[m]
+                for p_col, val in row.items():
+                    if np.isfinite(val):
+                        disp = display_labels.get(p_col, p_col)
+                        if val > 0.05:
+                            pos_progs.append((disp, float(val)))
+                        elif val < -0.05:
+                            neg_progs.append((disp, float(val)))
+                pos_progs.sort(key=lambda x: -x[1])
+                neg_progs.sort(key=lambda x: x[1])
+
+            module_details.append(
+                {
+                    "module_id": m,
+                    "members": m_members,
+                    "n_targets": len(m_members),
+                    "positive_programs": pos_progs[:3],
+                    "negative_programs": neg_progs[:3],
+                }
+            )
+
+        has_enrichment = bool(enr_df is not None and not enr_df.empty)
+
         modules_ctx = {
             "n_modules": mods.n_modules,
             "n_programs": mods.n_programs,
@@ -223,6 +302,11 @@ def build_report(inputs: ReportInputs, path: Path) -> Path:
             "program_genes": {
                 p: mods.program_genes.get(p, [])[:10] for p in mods.program_labels
             },
+            "program_annotations": prog_annotations,
+            "program_display_labels": display_labels,
+            "programs": program_details,
+            "modules_list": module_details,
+            "has_enrichment": has_enrichment,
         }
     modules_extras = reg.extras(SECTION_MODULES)
 

@@ -53,6 +53,11 @@ from .compute import (
     run_parallel,
 )
 from .config import Config
+from .data_access import (
+    SharedArrayBuffer,
+    get_embedding,
+    get_target_indices_map,
+)
 from .guides import (
     CLASS_NTC,
     CLASS_TARGETING,
@@ -270,30 +275,8 @@ def compute_mmd(
 
 
 def _resolve_representation(expr: ad.AnnData, requested_rep: str) -> np.ndarray:
-    """Extract the high-dimensional cell embedding matrix (e.g. X_pca)."""
-    if requested_rep in expr.obsm:
-        rep = expr.obsm[requested_rep]
-        if sparse.issparse(rep):
-            rep = rep.toarray()
-        return np.asarray(rep, dtype=np.float64)
-
-    # Fallback to PCA or Harmony if available
-    for fallback in ("X_pca_harmony", "X_pca"):
-        if fallback in expr.obsm:
-            logger.warning(
-                "Representation %r not found in obsm; using %r",
-                requested_rep,
-                fallback,
-            )
-            rep = expr.obsm[fallback]
-            if sparse.issparse(rep):
-                rep = rep.toarray()
-            return np.asarray(rep, dtype=np.float64)
-
-    raise ValueError(
-        f"Requested distance representation {requested_rep!r} not found in obsm "
-        f"(available: {sorted(expr.obsm.keys())}). Clustering must run first."
-    )
+    """Extract the cell embedding matrix (e.g. X_pca)."""
+    return get_embedding(expr, rep_name=requested_rep, dtype=np.float32)
 
 
 def _sample_cell_indices(
@@ -347,7 +330,7 @@ def _sample_cell_indices(
 
 
 # ---------------------------------------------------------------------------
-# Permutation DistanceTest
+# Permutation DistanceTest (Optimized Exact O(n^2) Null Sampling)
 # ---------------------------------------------------------------------------
 
 
@@ -357,7 +340,16 @@ def distance_test_permutation(
     n_permutations: int = 1000,
     seed: int = 123,
 ) -> Tuple[float, float]:
-    """Perform a permutation test for Energy Distance between X and Y.
+    """Perform an exact, fast permutation test for Energy Distance between X and Y.
+
+    Uses the algebraic identity:
+        S_Y = S_total + S_X - 2 * R_X
+    where R_X = sum_{i in X} row_sums[i] and S_total = sum(D).
+
+    This computes exact Energy Distance across permutations without allocating
+    or summing large O((n+m)^2) intermediate matrices repeatedly. Preserves
+    identical statistical meaning and finite-permutation empirical p-values:
+        p = (1 + sum(perm_stat >= obs_stat)) / (1 + n_permutations)
 
     Parameters
     ----------
@@ -386,25 +378,51 @@ def distance_test_permutation(
     Z = np.vstack([X, Y])
     N = n + m
     D = cdist(Z, Z, metric="euclidean")
+    row_sums = np.sum(D, axis=1)
+    s_total = float(np.sum(row_sums))
 
     # Observed distance
     idx_x_obs = np.arange(n, dtype=np.int64)
-    idx_y_obs = np.arange(n, N, dtype=np.int64)
-    obs_stat = energy_distance_from_cdist(D, idx_x_obs, idx_y_obs)
+    r_x_obs = float(np.sum(row_sums[idx_x_obs]))
+    s_x_obs = float(np.sum(D[np.ix_(idx_x_obs, idx_x_obs)]))
+    s_y_obs = s_total + s_x_obs - 2.0 * r_x_obs
+    between_obs = 2.0 * (r_x_obs - s_x_obs) / (n * m)
+    within_x_obs = s_x_obs / (n * n)
+    within_y_obs = s_y_obs / (m * m)
+    obs_stat = float(max(between_obs - within_x_obs - within_y_obs, 0.0))
 
     if n_permutations <= 0:
         return obs_stat, float("nan")
 
     rng = np.random.default_rng(seed)
-    count_greater_or_equal = 0
-
     all_indices = np.arange(N, dtype=np.int64)
+    count_greater_or_equal = 0
+    tol = obs_stat - 1e-12
+
+    inv_nm = 2.0 / (n * m)
+    inv_nn = 1.0 / (n * n)
+    inv_mm = 1.0 / (m * m)
+
+    use_x = (n <= m)
+
     for _ in range(n_permutations):
         perm = rng.permutation(all_indices)
-        perm_x = perm[:n]
-        perm_y = perm[n:]
-        perm_stat = energy_distance_from_cdist(D, perm_x, perm_y)
-        if perm_stat >= obs_stat - 1e-12:
+        if use_x:
+            px = perm[:n]
+            r_k = float(np.sum(row_sums[px]))
+            s_k = float(np.sum(D[np.ix_(px, px)]))
+            s_x = s_k
+            s_y = s_total + s_x - 2.0 * r_k
+            stat = (r_k - s_x) * inv_nm - s_x * inv_nn - s_y * inv_mm
+        else:
+            py = perm[n:]
+            r_k = float(np.sum(row_sums[py]))
+            s_k = float(np.sum(D[np.ix_(py, py)]))
+            s_y = s_k
+            s_x = s_total + s_y - 2.0 * r_k
+            stat = (r_k - s_y) * inv_nm - s_x * inv_nn - s_y * inv_mm
+
+        if stat >= tol:
             count_greater_or_equal += 1
 
     # Exact finite-permutation empirical p-value
@@ -415,6 +433,85 @@ def distance_test_permutation(
 # ---------------------------------------------------------------------------
 # Perturbation Distance vs Control API
 # ---------------------------------------------------------------------------
+
+
+def _eval_target_dist_worker(
+    task_payload: Tuple[
+        int,
+        str,
+        np.ndarray,
+        np.ndarray,
+        np.ndarray,
+        Optional[np.ndarray],
+        int,
+        int,
+        int,
+        int,
+        str,
+        Optional[str],
+    ],
+) -> Tuple[Optional[dict], Optional[dict]]:
+    """Worker function executing DistanceTest for one perturbation target.
+
+    Receives cleanly unpacked numeric arrays and scalar parameters without
+    referencing or deserializing full AnnData objects.
+    """
+    (
+        i,
+        target,
+        pert_indices,
+        embedding_arr,
+        Y_ctrl,
+        strata,
+        min_cells,
+        max_cells_per_target,
+        n_permutations,
+        random_seed,
+        primary_metric,
+        secondary_metric,
+    ) = task_payload
+
+    n_pert = int(pert_indices.size)
+    if n_pert < min_cells:
+        return None, {
+            "target_gene": target,
+            "n_cells": n_pert,
+            "reason": f"fewer than {min_cells} cells ({n_pert})",
+        }
+
+    target_seed = derive_seed(random_seed, f"{i}_{target}")
+    rng_target = np.random.default_rng(target_seed)
+
+    pert_indices_sampled = _sample_cell_indices(
+        pert_indices,
+        max_cells_per_target,
+        rng_target,
+        strata=strata,
+    )
+    X_target = embedding_arr[pert_indices_sampled]
+
+    # Compute primary metric and permutation DistanceTest
+    edist, pval = distance_test_permutation(
+        X_target,
+        Y_ctrl,
+        n_permutations=n_permutations,
+        seed=target_seed,
+    )
+
+    row = {
+        "target_gene": target,
+        "n_cells": n_pert,
+        "n_control": len(Y_ctrl),
+        "energy_distance": edist,
+        "pvalue": pval,
+    }
+
+    # Optional secondary metric: MMD
+    if secondary_metric == "mmd":
+        mmd_val = compute_mmd(X_target, Y_ctrl)
+        row["mmd_distance"] = mmd_val
+
+    return row, None
 
 
 def compute_perturbation_distance(
@@ -515,65 +612,60 @@ def compute_perturbation_distance(
     if cfg.compute.log_backend_decisions:
         log_compute_decision(decision)
 
+    logger.info(
+        "[distance] representation=%s representation_shape=%dx%d worker_data=shared anndata_passed_to_workers=false n_jobs=%d n_permutations=%d",
+        rep_name,
+        embedding.shape[0],
+        embedding.shape[1],
+        decision.n_jobs,
+        dcfg.n_permutations,
+    )
+
     targeting_indices_dict: Dict[str, np.ndarray] = {
         target: np.flatnonzero((targets_col == target) & targeting_mask)
         for target in all_targets
     }
 
-    def _eval_target_dist(target_item: Tuple[int, str]) -> Tuple[Optional[dict], Optional[dict]]:
-        i, target = target_item
-        pert_indices = targeting_indices_dict.get(target, np.empty(0, dtype=np.int64))
-        n_pert = int(pert_indices.size)
+    # Setup shared array buffer for worker processes
+    shm_buffer: Optional[SharedArrayBuffer] = None
+    worker_embedding: np.ndarray = embedding
+    if getattr(cfg, "storage", None) and cfg.storage.shared_worker_arrays and decision.n_jobs > 1:
+        try:
+            shm_buffer = SharedArrayBuffer(embedding, create_memmap=True)
+            worker_embedding = shm_buffer.array
+        except Exception as exc:
+            logger.debug("SharedArrayBuffer creation skipped: %s", exc)
+            worker_embedding = embedding
 
-        if n_pert < dcfg.min_cells:
-            return None, {
-                "target_gene": target,
-                "n_cells": n_pert,
-                "reason": f"fewer than {dcfg.min_cells} cells ({n_pert})",
-            }
-
-        target_seed = derive_seed(dcfg.random_seed, f"{i}_{target}")
-        rng_target = np.random.default_rng(target_seed)
-
-        pert_indices_sampled = _sample_cell_indices(
-            pert_indices,
-            dcfg.max_cells_per_target,
-            rng_target,
-            strata=strata,
-        )
-        X_target = embedding[pert_indices_sampled]
-
-        # Compute primary metric and DistanceTest
-        edist, pval = distance_test_permutation(
-            X_target,
+    tasks = [
+        (
+            i,
+            target,
+            targeting_indices_dict.get(target, np.empty(0, dtype=np.int64)),
+            worker_embedding,
             Y_ctrl,
-            n_permutations=dcfg.n_permutations,
-            seed=target_seed,
+            strata,
+            dcfg.min_cells,
+            dcfg.max_cells_per_target,
+            dcfg.n_permutations,
+            dcfg.random_seed,
+            dcfg.primary_metric,
+            dcfg.secondary_metric,
         )
+        for i, target in enumerate(all_targets)
+    ]
 
-        row = {
-            "target_gene": target,
-            "n_cells": n_pert,
-            "n_control": len(ctrl_indices_sampled),
-            "energy_distance": edist,
-            "pvalue": pval,
-        }
-
-        # Optional secondary metric: MMD
-        if dcfg.secondary_metric == "mmd":
-            mmd_val = compute_mmd(X_target, Y_ctrl)
-            row["mmd_distance"] = mmd_val
-
-        return row, None
-
-    indexed_targets = list(enumerate(all_targets))
-    results = run_parallel(
-        _eval_target_dist,
-        indexed_targets,
-        n_jobs=decision.n_jobs,
-        blas_threads=cfg.compute.blas_threads_per_worker,
-        backend=cfg.compute.cpu_parallel_backend,
-    )
+    try:
+        results = run_parallel(
+            _eval_target_dist_worker,
+            tasks,
+            n_jobs=decision.n_jobs,
+            blas_threads=cfg.compute.blas_threads_per_worker,
+            backend=cfg.compute.cpu_parallel_backend,
+        )
+    finally:
+        if shm_buffer is not None:
+            shm_buffer.close()
 
     rows = [r for r, s in results if r is not None]
     skipped = [s for r, s in results if s is not None]
@@ -694,6 +786,18 @@ def compute_pcoa_coordinates(
     return coords, pos_evals
 
 
+def _eval_pair_dist_worker(
+    task: Tuple[int, int, np.ndarray, np.ndarray, str],
+) -> Tuple[int, int, float]:
+    """Evaluate pairwise distance between two perturbation samples."""
+    i, j, X_i, X_j, metric = task
+    if metric == "mmd":
+        d_val = compute_mmd(X_i, X_j)
+    else:
+        d_val = compute_energy_distance(X_i, X_j)
+    return i, j, d_val
+
+
 def compute_distance_space(
     expr: ad.AnnData,
     cfg: Config,
@@ -797,25 +901,22 @@ def compute_distance_space(
         K,
     )
 
-    # Build K x K pairwise distance matrix
     dist_mat = np.zeros((K, K), dtype=np.float64)
-    pairs = [(i, j) for i in range(K) for j in range(i + 1, K)]
-
-    def _eval_pair_dist(pair: Tuple[int, int]) -> Tuple[int, int, float]:
-        i, j = pair
-        t_i = eligible_targets[i]
-        t_j = eligible_targets[j]
-        X_i = target_samples[t_i]
-        X_j = target_samples[t_j]
-        if dscfg.metric == "mmd":
-            d_val = compute_mmd(X_i, X_j)
-        else:
-            d_val = compute_energy_distance(X_i, X_j)
-        return i, j, d_val
+    pair_tasks = [
+        (
+            i,
+            j,
+            target_samples[eligible_targets[i]],
+            target_samples[eligible_targets[j]],
+            dscfg.metric,
+        )
+        for i in range(K)
+        for j in range(i + 1, K)
+    ]
 
     pair_results = run_parallel(
-        _eval_pair_dist,
-        pairs,
+        _eval_pair_dist_worker,
+        pair_tasks,
         n_jobs=decision.n_jobs,
         blas_threads=cfg.compute.blas_threads_per_worker,
         backend=cfg.compute.cpu_parallel_backend,

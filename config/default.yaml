@@ -123,6 +123,17 @@ modules:
   min_perturbations: 5
   min_genes: 10
   top_n_report: 12
+  program_enrichment:
+    enabled: true
+    method: ora
+    species: human
+    sources:
+      - hallmark
+      - reactome
+      - go_bp
+    fdr_alpha: 0.05
+    min_overlap: 2
+    top_terms_per_program: 5
 ps_score:
   enabled: true
   require: false
@@ -209,6 +220,12 @@ output:
   write_guide_table: true
   guide_table_name: null
   guide_table_min_umi: 3
+storage:
+  mode: auto
+  backed_threshold_cells: 1000000
+  prefer_backed_h5ad: true
+  keep_embeddings_in_memory: true
+  shared_worker_arrays: true
 scaling:
   mode: auto
   large_n_cells: 1000000

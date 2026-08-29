@@ -78,6 +78,7 @@ from .compute import (
     resolve_stage_backend,
     run_parallel,
 )
+from .gene_sets import run_program_enrichment
 from .guides import CLASS_TARGETING, OBS_CLASS, OBS_TARGET
 from .perturbation import (
     CONTROL_NTC,
@@ -156,6 +157,18 @@ class ModulesResults:
     module_members: Dict[str, List[str]] = field(default_factory=dict)
 
     score_columns: List[str] = field(default_factory=list)
+
+    #: Full biological pathway enrichment results for gene programs.
+    program_enrichment: pd.DataFrame = field(default_factory=pd.DataFrame)
+
+    #: Compact biological annotations per program (e.g. {'P1': 'Interferon response'}).
+    program_annotations: Dict[str, str] = field(default_factory=dict)
+
+    #: Display labels with biological annotations (e.g. {'P1': 'P1 — Interferon response'}).
+    program_display_labels: Dict[str, str] = field(default_factory=dict)
+
+    #: Compact summary table combining program sizes, top genes, and top enriched pathways.
+    program_summary: pd.DataFrame = field(default_factory=pd.DataFrame)
 
     #: Execution mode, useful in reports/debugging.
     execution_mode: str = "standard"
@@ -3218,6 +3231,47 @@ def compute_modules(
     )
 
     # ------------------------------------------------------------------
+    # Program pathway enrichment & biological annotation
+    # ------------------------------------------------------------------
+
+    enrichment_df = pd.DataFrame()
+    prog_annotations: Dict[str, str] = {p: "unannotated" for p in program_labels}
+    display_labels: Dict[str, str] = {p: p for p in program_labels}
+    prog_summary = pd.DataFrame(
+        [
+            {
+                "program_id": p,
+                "annotation": "unannotated",
+                "display_label": p,
+                "top_term": "None",
+                "gene_set_source": "None",
+                "fdr": np.nan,
+                "program_size": len(program_genes.get(p, [])),
+                "top_genes": ", ".join(program_genes.get(p, [])[:8]),
+                "member_genes": ", ".join(program_genes.get(p, [])),
+            }
+            for p in program_labels
+        ]
+    )
+
+    pe_cfg = getattr(mcfg, "program_enrichment", None)
+    if pe_cfg is not None and getattr(pe_cfg, "enabled", True):
+        try:
+            enrichment_df, prog_annotations, prog_summary, display_labels = run_program_enrichment(
+                program_genes=program_genes,
+                universe=genes,
+                cfg=pe_cfg,
+            )
+            n_annotated = sum(1 for a in prog_annotations.values() if a != "unannotated")
+            logger.info(
+                "modules: program enrichment complete (%d/%d programs annotated)",
+                n_annotated,
+                len(program_labels),
+            )
+        except Exception as exc:
+            logger.warning("modules: program enrichment failed: %s", exc)
+
+    # ------------------------------------------------------------------
     # Result
     # ------------------------------------------------------------------
 
@@ -3257,6 +3311,10 @@ def compute_modules(
         program_genes=program_genes,
         module_members=module_members,
         score_columns=score_columns,
+        program_enrichment=enrichment_df,
+        program_annotations=prog_annotations,
+        program_display_labels=display_labels,
+        program_summary=prog_summary,
         execution_mode=execution_mode,
         note=note,
     )

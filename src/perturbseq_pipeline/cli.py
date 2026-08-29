@@ -1513,6 +1513,32 @@ def run_pipeline(
                     table_paths,
                 )
 
+            if (
+                not modules_result
+                .program_enrichment
+                .empty
+            ):
+
+                _write_table(
+                    "program_enrichment",
+                    modules_result.program_enrichment,
+                    tabledir,
+                    table_paths,
+                )
+
+            if (
+                not modules_result
+                .program_summary
+                .empty
+            ):
+
+                _write_table(
+                    "program_summary",
+                    modules_result.program_summary,
+                    tabledir,
+                    table_paths,
+                )
+
             # Keep only report-friendly summaries in RAM.
             tables[
                 "gene_programs"
@@ -1525,6 +1551,32 @@ def run_pipeline(
             ] = (
                 modules_result.modules
             )
+
+            if (
+                not modules_result
+                .program_summary
+                .empty
+            ):
+
+                tables[
+                    "program_summary"
+                ] = (
+                    modules_result.program_summary
+                )
+
+            if (
+                not modules_result
+                .program_enrichment
+                .empty
+            ):
+
+                _table_for_report(
+                    tables,
+                    "program_enrichment",
+                    modules_result.program_enrichment,
+                    large_mode=large_mode,
+                    max_rows_large=cfg.scaling.report_preview_rows,
+                )
 
             _table_for_report(
                 tables,
@@ -2370,7 +2422,14 @@ def run_pipeline(
         )
     )
 
-    # Archive only after report generation.
+    # Save compute performance profile table before archiving
+    profile_df = profiler.to_dataframe()
+    profile_path = tabledir / "compute_profile.csv"
+    profiler.save_csv(profile_path)
+    table_paths["compute_profile"] = profile_path
+    tables["compute_profile"] = profile_df
+
+    # Archive only after report generation and all tables are written.
     archive_path = (
         io_mod.archive_results(
             outdir,
@@ -2389,13 +2448,6 @@ def run_pipeline(
         expr.n_obs,
         n_cells_input,
     )
-
-    # Save compute performance profile table
-    profile_df = profiler.to_dataframe()
-    profile_path = tabledir / "compute_profile.csv"
-    profiler.save_csv(profile_path)
-    table_paths["compute_profile"] = profile_path
-    tables["compute_profile"] = profile_df
 
     result = PipelineResult(
         outdir=outdir,

@@ -10,8 +10,11 @@ input:
 
 # -------------------------------------------------------------------------
 # Scaling
-# Replogle (~300k cells, ~1,800 perturbations) should remain in standard
-# mode under the centralized auto-scaling rules. Do not force large mode.
+# Replogle (~300k cells, ~1,800 perturbations) remains STANDARD under the
+# centralized auto-scaling rules.
+#
+# STANDARD/LARGE controls biological/data scaling behavior and is independent
+# of CPU/GPU execution.
 # -------------------------------------------------------------------------
 scaling:
   mode: auto
@@ -55,6 +58,8 @@ qc:
 
 # -------------------------------------------------------------------------
 # Clustering
+# PCA / neighbors / UMAP may use GPU automatically when the backend decides
+# the operation is sufficiently large and compatible.
 # -------------------------------------------------------------------------
 cluster:
   n_top_genes: 3000
@@ -112,6 +117,10 @@ enrichment:
 
 # -------------------------------------------------------------------------
 # Co-functional perturbation modules / co-regulated gene programs
+#
+# Keep fewer workers here than Distance because effect-matrix construction,
+# correlations, linkage and program scoring can have substantially larger
+# per-worker memory requirements.
 # -------------------------------------------------------------------------
 modules:
   enabled: true
@@ -122,27 +131,21 @@ modules:
   n_marker_genes_per_cluster: 100
   marker_method: wilcoxon
 
-  # Require enough cells for reasonably stable perturbation profiles.
   min_cells_per_perturbation: 20
 
-  # Replogle contains NTCs; use them as the primary biological reference.
   control: ntc
 
-  # Chen-style correlation choices.
   program_correlation: pearson
   module_correlation: spearman
   linkage_method: average
 
-  # Exploratory hierarchical cuts.
-  # These should NOT be interpreted as biologically established numbers
-  # of programs/modules.
+  # Exploratory hierarchical cuts; not fixed biological truths.
   n_programs: 4
   n_modules: 9
   cluster_distance_threshold: 0.7
 
   score_programs: true
 
-  # Network/hub calls require both effect size and statistical significance.
   hub_lfc_threshold: 0.5
   de_fdr_alpha: 0.05
 
@@ -153,12 +156,24 @@ modules:
 
   top_n_report: 12
 
+  program_enrichment:
+    enabled: true
+    method: ora
+    species: human
+    sources:
+      - hallmark
+      - reactome
+      - go_bp
+    fdr_alpha: 0.05
+    min_overlap: 2
+    top_terms_per_program: 5
+
 # -------------------------------------------------------------------------
 # Perturbation Score
 #
-# Keep the actual PS analysis.
-# Disable only the supervised LDA visualization because it is extremely
-# expensive for ~1,800 targets and does not change the PS statistics.
+# Keep PS itself enabled.
+# Supervised LDA/UMAP remains disabled because it is very expensive across
+# ~1,800 perturbations and is not required for PS statistics.
 # -------------------------------------------------------------------------
 ps_score:
   enabled: true
@@ -180,6 +195,10 @@ ps_score:
 
 # -------------------------------------------------------------------------
 # lochNESS
+#
+# lochNESS is primarily vectorized / Numba-oriented. Avoid a large external
+# process pool here because nested process/thread parallelism can increase
+# memory pressure without useful scaling.
 # -------------------------------------------------------------------------
 lochness:
   enabled: true
@@ -199,36 +218,55 @@ lochness:
   top_n_report: 12
 
 # -------------------------------------------------------------------------
-# Perturbation Distance & Permutation DistanceTest (Stage 10)
+# Perturbation Distance & Permutation DistanceTest — Stage 10
+#
+# The optimized implementation shares X_pca via file-backed np.memmap and
+# passes indices rather than AnnData objects to workers.
 # -------------------------------------------------------------------------
 distance:
   enabled: true
+
   representation: X_pca
   primary_metric: edistance
   secondary_metric: null
+
   min_cells: 10
+
   max_cells_per_target: 2000
   max_control_cells: 5000
+
   n_permutations: 1000
+
   random_seed: 123
   fdr_threshold: 0.05
 
 # -------------------------------------------------------------------------
-# Perturbation DistanceSpace (Stage 11)
-# Note: For ~1,800 Replogle targets, all-vs-all pairwise distance is ~1.62M pairs.
-# Disabled by default for initial routine exploration; enable when pairwise
-# phenotype manifolds and modules are specifically required.
+# Perturbation DistanceSpace — Stage 11
+#
+# ENABLED FOR THIS RUN.
+#
+# ~1,800 perturbations correspond to ~1.62 million unique perturbation pairs.
+# This will probably be the largest new computational workload in this run.
+#
+# Pairwise Energy Distance remains exact and uses bounded target-cell
+# sampling. DistanceSpace mathematics was verified unchanged by the
+# optimization.
 # -------------------------------------------------------------------------
 distance_space:
-  enabled: false
+  enabled: true
+
   metric: edistance
   representation: X_pca
+
   n_components: 10
   nearest_neighbors: 10
+
   clustering: true
   linkage_method: average
+
   min_cells: 10
   max_cells_per_target: 2000
+
   random_seed: 123
 
 # -------------------------------------------------------------------------
@@ -257,15 +295,73 @@ output:
 
 # -------------------------------------------------------------------------
 # Compute Execution Layer
+#
+# SLURM allocation for this run:
+#
+#   CPUs allocated : 128
+#   RAM allocated  : 600 GB
+#   GPU            : 1 × H200
+#
+# Do NOT use all 128 CPUs as workers.
+#
+# 96 general workers leaves ~32 CPUs of headroom for:
+#   - parent/orchestrator process
+#   - I/O
+#   - HDF5 / memmap operations
+#   - GPU feeder work
+#   - OS/runtime activity
+#
+# Different biological modules intentionally receive different worker caps.
 # -------------------------------------------------------------------------
 compute:
   backend: auto
-  n_jobs: 16
-  gpu_device: 0
-  gpu_min_cells: 200000
-  gpu_min_dense_elements: 50000000
-  gpu_memory_fraction: 0.80
-  cpu_parallel_backend: loky
-  blas_threads_per_worker: 1
-  log_backend_decisions: true
 
+  # General upper bound for CPU-parallel stages.
+  n_jobs: 96
+
+  gpu_device: 0
+
+  # Replogle exceeds this cell threshold, allowing compatible operations
+  # such as large PCA/neighbors calculations to consider GPU execution.
+  gpu_min_cells: 200000
+
+  # Avoid moving small dense operations to GPU where transfer overhead
+  # dominates.
+  gpu_min_dense_elements: 50000000
+
+  # Leave ~20% H200 memory as safety margin.
+  gpu_memory_fraction: 0.80
+
+  cpu_parallel_backend: loky
+
+  # Critical with large process pools:
+  # 96 workers × 1 BLAS thread, not 96 workers × multithreaded BLAS.
+  blas_threads_per_worker: 1
+
+  # -----------------------------------------------------------------------
+  # Stage-specific CPU worker allocation
+  # -----------------------------------------------------------------------
+
+  # Perturbation-level efficacy calculations are highly independent across
+  # targets and comparatively lightweight per worker.
+  perturbation_n_jobs: 96
+
+  # Cluster-enrichment calculations are also largely target-wise independent.
+  enrichment_n_jobs: 96
+
+  # DistanceTest and DistanceSpace have the largest amount of embarrassingly
+  # parallel work. Replogle DistanceSpace has ~1.62M perturbation pairs.
+  #
+  # Use the full 96-worker process pool here.
+  distance_n_jobs: 96
+
+  # Module construction includes effect matrices, correlations and clustering.
+  # Reduce process count to limit simultaneous matrix copies/intermediates and
+  # therefore memory-bandwidth/RAM pressure.
+  modules_n_jobs: 48
+
+  # lochNESS already relies on efficient vectorized / compiled operations.
+  # Avoid nested multiprocessing.
+  lochness_n_jobs: 1
+
+  log_backend_decisions: true

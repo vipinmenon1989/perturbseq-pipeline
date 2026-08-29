@@ -7189,8 +7189,13 @@ def _plot_module_program(
         )
     )
 
+    display_labels = getattr(results, "program_display_labels", {})
+    xticklabels = [display_labels.get(col, col) for col in matrix.columns]
     ax.set_xticklabels(
-        matrix.columns
+        xticklabels,
+        rotation=30,
+        ha="right",
+        rotation_mode="anchor",
     )
 
     ax.set_yticks(
@@ -7564,13 +7569,16 @@ def _plot_alluvial(
             )
         )
 
+        display_labels = getattr(results, "program_display_labels", {})
+        label_text = display_labels.get(program, program)
+
         ax.text(
             0.98,
             (
                 low + high
             )
             / 2,
-            program,
+            label_text,
             ha="left",
             va="center",
             fontsize=8,
@@ -8192,6 +8200,101 @@ def _plot_networks(
         )
 
 
+def _plot_program_enrichment(
+    results,
+    reg: FigureRegistry,
+    cfg: Config,
+) -> None:
+    """Compact program x pathway enrichment dot plot."""
+    enr = getattr(results, "program_enrichment", None)
+    if enr is None or enr.empty:
+        return
+
+    pe_cfg = getattr(cfg.modules, "program_enrichment", None)
+    fdr_alpha = float(getattr(pe_cfg, "fdr_alpha", 0.05)) if pe_cfg else 0.05
+    top_n = int(getattr(pe_cfg, "top_terms_per_program", 5)) if pe_cfg else 5
+
+    # Filter to significant hits or fallback to top terms
+    sig = enr[enr["fdr"] <= fdr_alpha]
+    if sig.empty:
+        sig = enr.groupby("program_id", group_keys=False).head(2)
+
+    if sig.empty:
+        return
+
+    # Select top terms per program
+    selected = (
+        sig.sort_values(["program_id", "fdr", "p_value"])
+        .groupby("program_id", as_index=False)
+        .head(top_n)
+    )
+
+    terms = selected["clean_term"].unique().tolist()
+    if not terms:
+        return
+
+    # Limit total terms so figure is readable and compact
+    if len(terms) > 30:
+        terms = terms[:30]
+        selected = selected[selected["clean_term"].isin(terms)]
+
+    progs = list(results.program_labels) if getattr(results, "program_labels", None) else sorted(selected["program_id"].unique())
+    display_labels = getattr(results, "program_display_labels", {})
+    prog_labels = [display_labels.get(p, p) for p in progs]
+
+    term_to_y = {t: i for i, t in enumerate(terms)}
+    prog_to_x = {p: i for i, p in enumerate(progs)}
+
+    valid_mask = selected["program_id"].isin(prog_to_x) & selected["clean_term"].isin(term_to_y)
+    sel_valid = selected[valid_mask]
+    if sel_valid.empty:
+        return
+
+    xs = [prog_to_x[p] for p in sel_valid["program_id"]]
+    ys = [term_to_y[t] for t in sel_valid["clean_term"]]
+    fdrs = np.clip(sel_valid["fdr"].to_numpy(dtype=float), 1e-30, 1.0)
+    neg_log_fdr = -np.log10(fdrs)
+    overlaps = sel_valid["overlap_count"].to_numpy(dtype=float)
+
+    sizes = np.clip(overlaps * 18 + 25, 25, 350)
+
+    fig, ax = plt.subplots(
+        figsize=(
+            max(5, 0.9 * len(progs) + 2.5),
+            max(3.5, 0.35 * len(terms) + 1.8),
+        )
+    )
+
+    scatter = ax.scatter(
+        xs,
+        ys,
+        s=sizes,
+        c=neg_log_fdr,
+        cmap="YlOrRd",
+        edgecolors="black",
+        linewidths=0.5,
+        alpha=0.9,
+    )
+
+    ax.set_xticks(range(len(progs)))
+    ax.set_xticklabels(prog_labels, rotation=35, ha="right", rotation_mode="anchor", fontsize=8)
+    ax.set_yticks(range(len(terms)))
+    ax.set_yticklabels(terms, fontsize=8)
+    ax.set_title("Gene Program Pathway Enrichment", fontsize=11)
+    ax.grid(True, linestyle="--", alpha=0.3)
+
+    plt.colorbar(scatter, ax=ax, shrink=0.7, label="-log10(FDR)")
+    fig.tight_layout()
+
+    reg.save(
+        fig,
+        "program_enrichment",
+        SECTION_MODULES,
+        "Program pathway enrichment",
+        "Over-representation analysis of Stage 7 gene programs across biological pathway databases.",
+    )
+
+
 def plot_modules(
     expr,
     results,
@@ -8220,6 +8323,12 @@ def plot_modules(
     )
 
     _plot_alluvial(
+        results,
+        reg,
+        cfg,
+    )
+
+    _plot_program_enrichment(
         results,
         reg,
         cfg,

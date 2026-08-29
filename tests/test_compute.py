@@ -49,19 +49,19 @@ def test_detect_slurm_cpus_parsing():
     with mock.patch.dict(os.environ, {}, clear=True):
         assert detect_slurm_cpus() is None
 
-    with mock.patch.dict(os.environ, {"SLURM_CPUS_PER_TASK": "8"}):
+    with mock.patch.dict(os.environ, {"SLURM_CPUS_PER_TASK": "8"}, clear=True):
         assert detect_slurm_cpus() == 8
 
-    with mock.patch.dict(os.environ, {"SLURM_CPUS_ON_NODE": "16"}):
+    with mock.patch.dict(os.environ, {"SLURM_CPUS_ON_NODE": "16"}, clear=True):
         assert detect_slurm_cpus() == 16
 
-    with mock.patch.dict(os.environ, {"SLURM_JOB_CPUS_PER_NODE": "4(x2),8"}):
+    with mock.patch.dict(os.environ, {"SLURM_JOB_CPUS_PER_NODE": "4(x2),8"}, clear=True):
         assert detect_slurm_cpus() == 4
 
 
 def test_detect_available_cpus_respects_slurm():
     """detect_available_cpus should prefer SLURM allocation over physical count."""
-    with mock.patch.dict(os.environ, {"SLURM_CPUS_PER_TASK": "6"}):
+    with mock.patch.dict(os.environ, {"SLURM_CPUS_PER_TASK": "6"}, clear=True):
         assert detect_available_cpus() == 6
 
 
@@ -97,7 +97,8 @@ def test_is_gpu_available_mock():
         with mock.patch.dict("sys.modules", {"torch": mock_torch}):
             assert is_gpu_available() is True
 
-    with mock.patch("perturbseq_pipeline.compute.is_package_available", return_value=False):
+    with mock.patch("perturbseq_pipeline.compute.is_package_available", return_value=False), \
+         mock.patch.dict("sys.modules", {"torch": None, "cupy": None, "pynvml": None}):
         assert is_gpu_available() is False
 
 
