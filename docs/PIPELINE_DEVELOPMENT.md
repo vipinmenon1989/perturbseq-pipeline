@@ -20,7 +20,7 @@ The pipeline provides an end-to-end workflow for CRISPR pooled single-cell scree
 
 ## Pipeline Workflow
 
-The complete analysis pipeline executes 11 sequential stages managed centrally by `perturbseq_pipeline.cli.run_pipeline`:
+The complete analysis pipeline executes 14 sequential stages managed centrally by `perturbseq_pipeline.cli.run_pipeline`:
 
 ```text
  [1. Input Loading]
@@ -34,41 +34,54 @@ The complete analysis pipeline executes 11 sequential stages managed centrally b
          ▼
  [4. Normalization & Cluster] ──► [HVG -> PCA -> UMAP -> Leiden]
          │
-         ▼
+         ├──────────────────────────────────────────┐
+         │                                          │
+         ▼                                          ▼
  [5. Perturbation Strength] ────► [Directional Knockdown vs NTC/Other]
+         │                                          │
+         ├────────────────────┐                     ▼
+         │                    │              [6. Cluster Enrichment]
+         ▼                    ▼              [Fisher / CMH / Concordance]
+ [7. Modules & Programs]   [8. PS Scoring]
+ [Log2FC Matrix -> M/P]    [Cellular Penetrance]
+         │                    │
+         ├────────────────────┘
          │
          ▼
- [6. Cluster Enrichment] ───────► [Fisher / CMH / Guide Concordance]
+ [9. lochNESS] ─────────────────► [k-NN Neighbourhood Topology (k=300)]
          │
          ▼
- [7. Modules & Programs] ───────► [Log2FC Matrix -> Modules (Spearman) & Programs (Pearson)]
+ [10. Distance & DistanceTest] ─► [Energy Distance & Permutation FDR vs NTC]
          │
          ▼
- [8. PS Scoring] ───────────────► [Single-cell PS Scores & Optional Supervised LDA]
+ [11. DistanceSpace] ───────────► [Pairwise Distance Matrix, PCoA, Phenotype Modules]
          │
          ▼
- [9. lochNESS] ─────────────────► [k-NN Neighbourhood Enrichment (k=300)]
+ [12. Master Meta & Atlas] ─────► [tables/perturbation_meta.csv & Cross-Layer Plots]
          │
          ▼
- [10. Output Writing] ──────────► [Processed H5AD, Guide Table, CSVs, Figures, Tarball]
+ [13. Output Writing] ──────────► [Processed H5AD, Guide Table, CSVs, Figures, Tarball]
          │
          ▼
- [11. HTML Report] ─────────────► [Self-contained Interactive Report]
+ [14. HTML Report] ─────────────► [Self-contained Interactive Report & Manifest]
 ```
 
 ### Execution Stages in `cli.py`
 
-1. **Stage 1/11: Input Loading & Validation**: Resolves 10x MTX directories, companion guide matrices, or `.h5ad` inputs; merges sample metadata; applies `Config.validate()`; determines scaling execution mode (`standard` vs `large`).
-2. **Stage 2/11: Quality Control**: Annotates mitochondrial, ribosomal, and hemoglobin genes; filters low-quality cells and unexpressed genes; records step-by-step filtering tables.
-3. **Stage 3/11: Guide Assignment**: Determines dominant and runner-up guide counts per cell; applies dominance ratio and optional second-guide UMI gates; parses target gene identities.
-4. **Stage 4/11: Normalization, Embedding & Clustering**: Performs library-size normalization and log1p transformation; identifies HVGs; computes PCA, k-NN graph, UMAP projection, and Leiden clustering. If `cluster.assigned_only: true`, optionally re-embeds singlets while preserving the all-cell embedding.
-5. **Stage 5/11: Perturbation Strength**: Measures target gene knockdown in perturbed cells versus Non-Targeting Controls (`ntc`) and Other-Targeting Controls (`other`); calculates log2 fold changes and Benjamini–Hochberg FDR values.
-6. **Stage 6/11: Cluster Enrichment**: Evaluates whether perturbation targets alter cluster occupancy using Fisher's exact test, stratified CMH tests across lanes, guide concordance verification, and omnibus permutation testing.
-7. **Stage 7/11: Co-functional Modules & Gene Programs**: Constructs a perturbation × gene effect matrix; clusters genes into co-regulated programs (Pearson correlation) and perturbations into co-functional modules (Spearman correlation); identifies TF hubs and connectivity networks.
-8. **Stage 8/11: Per-cell Perturbation Scores (PS Score)**: Executes per-cell signature scoring via `pertps`; stratifies cells into responders and non-responders/escapers; optionally constructs supervised LDA projections.
-9. **Stage 9/11: lochNESS Neighbourhood Enrichment**: Quantifies continuous manifold over-representation across $k=300$ nearest neighbours without relying on discrete cluster boundaries.
-10. **Stage 10/11: Output Writing**: Saves the integrated `.h5ad` containing expression counts, layers, and embedded guide matrices (`obsm['guide_counts']`); writes structured tables (`tables/`), diagnostic figures (`figures/`), figure manifest, and optional results archive (`.tar.gz`).
-11. **Stage 11/11: HTML Report Generation**: Renders a standalone, self-contained HTML report with interactive data tables and embedded figures.
+1. **Stage 1/14: Input Loading & Validation**: Resolves 10x MTX directories, companion guide matrices, or `.h5ad` inputs; merges sample metadata; applies `Config.validate()`; determines scaling execution mode (`standard` vs `large`).
+2. **Stage 2/14: Quality Control**: Annotates mitochondrial, ribosomal, and hemoglobin genes; filters low-quality cells and unexpressed genes; records step-by-step filtering tables.
+3. **Stage 3/14: Guide Assignment**: Determines dominant and runner-up guide counts per cell; applies dominance ratio and optional second-guide UMI gates; parses target gene identities.
+4. **Stage 4/14: Normalization, Embedding & Clustering**: Performs library-size normalization and log1p transformation; identifies HVGs; computes PCA, k-NN graph, UMAP projection, and Leiden clustering. If `cluster.assigned_only: true`, optionally re-embeds singlets while preserving the all-cell embedding.
+5. **Stage 5/14: Perturbation Strength (Efficacy)**: Measures target gene knockdown in perturbed cells versus Non-Targeting Controls (`ntc`) and Other-Targeting Controls (`other`); calculates log2 fold changes and Benjamini–Hochberg FDR values.
+6. **Stage 6/14: Cluster Enrichment**: Evaluates whether perturbation targets alter cluster occupancy using Fisher's exact test, stratified CMH tests across lanes, guide concordance verification, and omnibus permutation testing.
+7. **Stage 7/14: Co-functional Modules & Gene Programs (Regulome)**: Constructs a perturbation × gene effect matrix; clusters genes into co-regulated programs (Pearson correlation) and perturbations into co-functional modules (Spearman correlation); identifies TF hubs and connectivity networks.
+8. **Stage 8/14: Per-cell Perturbation Scores (PS Penetrance)**: Executes per-cell signature scoring via `pertps`; stratifies cells into responders and non-responders/escapers; optionally constructs supervised LDA projections.
+9. **Stage 9/14: lochNESS Neighbourhood Topology**: Quantifies continuous manifold over-representation across $k=300$ nearest neighbours without relying on discrete cluster boundaries.
+10. **Stage 10/14: Perturbation Distance & Permutation DistanceTest**: Computes multivariate distribution distances (Energy Distance / MMD) against unperturbed control with finite-permutation empirical p-values and BH-FDR.
+11. **Stage 11/14: Perturbation Distance Space & Phenotype Modules**: Evaluates all-vs-all pairwise Energy Distance matrix, classical MDS / PCoA coordinates, nearest phenotypic neighbors, and Phenotype Modules.
+12. **Stage 12/14: Master Perturbation Metadata & Integrated Visualizations**: Merges all target-level metrics into `tables/perturbation_meta.csv` and renders the Perturbation Atlas, PS $\times$ Distance map, and Module concordance figures.
+13. **Stage 13/14: Output Writing & Lean H5AD**: Saves the integrated `.h5ad` containing cell-level observations and latent embeddings; writes structured tables (`tables/`), diagnostic figures (`figures/`), compute profile (`tables/compute_profile.csv`), and optional results archive (`.tar.gz`).
+14. **Stage 14/14: HTML Report Generation & Manifest**: Renders a standalone, self-contained HTML report with interactive data tables, figure previews, and deliverables manifest.
 
 ---
 

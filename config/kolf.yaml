@@ -354,6 +354,36 @@ lochness:
 
 
 # -------------------------------------------------------------------------
+# PERTURBATION DISTANCE & PERMUTATION DISTANCETEST (Stage 10)
+# -------------------------------------------------------------------------
+distance:
+  enabled: true
+  representation: X_pca
+  primary_metric: edistance
+  secondary_metric: null
+  min_cells: 10
+  max_cells_per_target: 2000
+  max_control_cells: 5000
+  n_permutations: 1000
+  random_seed: 123
+  fdr_threshold: 0.05
+
+# -------------------------------------------------------------------------
+# PERTURBATION DISTANCE SPACE (Stage 11)
+# Disabled for KOLF due to high target count and combinatorial pair costs.
+# -------------------------------------------------------------------------
+distance_space:
+  enabled: false
+  metric: edistance
+  representation: X_pca
+  n_components: 10
+  nearest_neighbors: 10
+  clustering: true
+  min_cells: 10
+  max_cells_per_target: 2000
+  random_seed: 123
+
+# -------------------------------------------------------------------------
 # REPORT
 #
 # Complete numerical tables remain on disk.
@@ -406,3 +436,18 @@ output:
   large_file_dir: null
 
   large_file_threshold_mb: 50.0
+
+# -------------------------------------------------------------------------
+# COMPUTE EXECUTION LAYER
+# -------------------------------------------------------------------------
+compute:
+  backend: auto
+  n_jobs: 16
+  gpu_device: 0
+  gpu_min_cells: 200000
+  gpu_min_dense_elements: 50000000
+  gpu_memory_fraction: 0.80
+  cpu_parallel_backend: loky
+  blas_threads_per_worker: 1
+  log_backend_decisions: true
+

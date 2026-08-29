@@ -60,6 +60,10 @@ import pandas as pd
 from scipy import sparse
 
 from .cluster import CLUSTER_KEY
+from .compute import (
+    log_compute_decision,
+    resolve_stage_backend,
+)
 from .config import Config
 from .guides import CLASS_NTC, CLASS_TARGETING, OBS_CLASS
 
@@ -784,6 +788,16 @@ def compute_lochness(
         )
 
         return None
+
+    decision = resolve_stage_backend("lochness", cfg, n_cells=expr.n_obs)
+    if cfg.compute.log_backend_decisions:
+        log_compute_decision(decision)
+
+    if NUMBA_AVAILABLE and numba is not None:
+        try:
+            numba.set_num_threads(decision.n_jobs)
+        except Exception:
+            pass
 
     key = lcfg.genotype_key
 

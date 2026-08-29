@@ -72,6 +72,12 @@ from scipy import sparse
 
 from .cluster import CLUSTER_KEY, LOGNORM_LAYER
 from .config import Config
+from .compute import (
+    is_package_available,
+    log_compute_decision,
+    resolve_stage_backend,
+    run_parallel,
+)
 from .guides import CLASS_TARGETING, OBS_CLASS, OBS_TARGET
 from .perturbation import (
     CONTROL_NTC,
@@ -2233,6 +2239,53 @@ def build_effect_matrix(
 # ---------------------------------------------------------------------------
 
 
+def compute_correlation_matrix(
+    df: pd.DataFrame,
+    method: str = "pearson",
+    cfg: Optional[Config] = None,
+) -> np.ndarray:
+    """Compute pairwise row correlation matrix using CPU or GPU (CuPy)."""
+    if cfg is not None:
+        decision = resolve_stage_backend(
+            "modules_correlation",
+            cfg,
+            extra_info={"n_dense_elements": df.shape[0] * df.shape[1]},
+        )
+        if cfg.compute.log_backend_decisions:
+            log_compute_decision(decision)
+
+        if decision.is_gpu and is_package_available("cupy"):
+            try:
+                import cupy as cp
+
+                # Data is shape (n_items, n_features)
+                X = cp.asarray(df.to_numpy(dtype=np.float64))
+                if method.lower() == "spearman":
+                    order = cp.argsort(X, axis=1)
+                    ranks = cp.empty_like(order, dtype=cp.float64)
+                    cp.put_along_axis(
+                        ranks,
+                        order,
+                        cp.arange(X.shape[1], dtype=cp.float64)[None, :],
+                        axis=1,
+                    )
+                    X = ranks
+
+                corr_gpu = cp.corrcoef(X)
+                return cp.asnumpy(corr_gpu)
+            except Exception as exc:
+                logger.warning(
+                    "GPU correlation computation failed (%s); falling back to CPU",
+                    exc,
+                )
+
+    return (
+        df.T
+        .corr(method=method)
+        .to_numpy()
+    )
+
+
 def cluster_axis(
     items: pd.DataFrame,
     correlation: str,
@@ -2240,6 +2293,7 @@ def cluster_axis(
     k: Optional[int],
     threshold: Optional[float],
     prefix: str,
+    cfg: Optional[Config] = None,
 ) -> Tuple[
     pd.Series,
     List[str],
@@ -2285,12 +2339,10 @@ def cluster_axis(
             else [],
         )
 
-    corr = (
-        items.T
-        .corr(
-            method=correlation
-        )
-        .to_numpy()
+    corr = compute_correlation_matrix(
+        items,
+        method=correlation,
+        cfg=cfg,
     )
 
     dist = (
@@ -2987,6 +3039,7 @@ def compute_modules(
         mcfg.n_programs,
         mcfg.cluster_distance_threshold,
         prefix="P",
+        cfg=cfg,
     )
 
     # ------------------------------------------------------------------
@@ -3004,6 +3057,7 @@ def compute_modules(
         mcfg.n_modules,
         mcfg.cluster_distance_threshold,
         prefix="M",
+        cfg=cfg,
     )
 
     logger.info(

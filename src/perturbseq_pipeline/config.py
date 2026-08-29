@@ -666,6 +666,104 @@ class LochnessConfig:
 
 
 # ===========================================================================
+# Perturbation distance vs control
+# ===========================================================================
+
+
+@dataclass
+class DistanceConfig:
+    """Perturbation distance vs control analysis."""
+
+    enabled: bool = True
+
+    representation: str = "X_pca"
+
+    primary_metric: str = "edistance"
+
+    secondary_metric: Optional[str] = "mmd"
+
+    min_cells: int = 30
+
+    max_cells_per_target: int = 2000
+
+    max_control_cells: int = 5000
+
+    n_permutations: int = 1000
+
+    random_seed: int = 123
+
+    fdr_threshold: float = 0.05
+
+    stratify_by: Optional[str] = None
+
+
+# ===========================================================================
+# Perturbation distance space
+# ===========================================================================
+
+
+@dataclass
+class DistanceSpaceConfig:
+    """Pairwise perturbation distance space analysis."""
+
+    enabled: bool = True
+
+    metric: str = "edistance"
+
+    representation: str = "X_pca"
+
+    n_components: int = 10
+
+    nearest_neighbors: int = 10
+
+    clustering: bool = True
+
+    n_modules: Optional[int] = None
+
+    cluster_distance_threshold: Optional[float] = None
+
+    linkage_method: str = "average"
+
+    min_cells: int = 30
+
+    max_cells_per_target: int = 2000
+
+    random_seed: int = 123
+
+
+# ===========================================================================
+# Master perturbation meta-analysis
+# ===========================================================================
+
+
+@dataclass
+class MetaAnalysisConfig:
+    """Master perturbation meta-analysis table."""
+
+    enabled: bool = True
+
+
+# ===========================================================================
+# Visualization options
+# ===========================================================================
+
+
+@dataclass
+class VisualizationConfig:
+    """Advanced overview and perturbation distance visualization."""
+
+    perturbation_atlas: bool = True
+
+    ps_distance_map: bool = True
+
+    perturbation_space: bool = True
+
+    module_concordance: bool = True
+
+    atlas_top_n: int = 50
+
+
+# ===========================================================================
 # Adaptive scaling
 # ===========================================================================
 
@@ -723,6 +821,70 @@ class ScalingConfig:
     #: Maximum rows of a huge table retained for HTML report assembly. The
     #: complete table remains written to disk.
     report_preview_rows: int = 500
+
+
+# ===========================================================================
+# Compute / hardware backend policy
+# ===========================================================================
+
+
+@dataclass
+class ComputeConfig:
+    """Hardware compute and backend execution policy.
+
+    Controls whether CPU multiprocessing, threading, or optional GPU acceleration
+    is selected across pipeline stages.
+
+    Backend options
+    ---------------
+    ``auto``
+        Selects CPU or GPU stage-by-stage based on dataset size, dense matrix
+        dimensions, available GPU hardware, and installed optional libraries.
+
+    ``cpu``
+        Forces all stages to use CPU implementations with deterministic
+        multiprocessing/multithreading. Never requires GPU packages.
+
+    ``gpu``
+        Requests GPU acceleration for supported stages (e.g. clustering, dense
+        correlations, distance space) when safe and available; unsupported
+        stages remain CPU.
+    """
+
+    backend: str = "auto"
+
+    #: Global default worker count for CPU multiprocessing.
+    n_jobs: int = 16
+
+    #: GPU device index (0-indexed).
+    gpu_device: int = 0
+
+    #: Minimum number of cells in the dataset before GPU acceleration
+    #: is considered for clustering/embedding stages in AUTO mode.
+    gpu_min_cells: int = 200_000
+
+    #: Minimum number of scalar elements in a dense matrix before GPU
+    #: acceleration is considered for correlation or matrix multiplication.
+    gpu_min_dense_elements: int = 50_000_000
+
+    #: Maximum fractional safe memory limit on GPU to prevent OOM.
+    gpu_memory_fraction: float = 0.80
+
+    #: CPU multiprocessing backend engine: 'loky', 'multiprocessing', or 'threading'.
+    cpu_parallel_backend: str = "loky"
+
+    #: BLAS / OpenMP thread limit per worker process to prevent oversubscription.
+    blas_threads_per_worker: int = 1
+
+    #: Per-stage multiprocessing overrides. If null, inherits compute.n_jobs.
+    distance_n_jobs: Optional[int] = None
+    perturbation_n_jobs: Optional[int] = None
+    enrichment_n_jobs: Optional[int] = None
+    modules_n_jobs: Optional[int] = None
+    lochness_n_jobs: Optional[int] = None
+
+    #: Whether to log compute backend placement decisions per stage.
+    log_backend_decisions: bool = True
 
 
 # ===========================================================================
@@ -855,9 +1017,30 @@ class Config:
         default_factory=LochnessConfig
     )
 
+    distance: DistanceConfig = field(
+        default_factory=DistanceConfig
+    )
+
+    distance_space: DistanceSpaceConfig = field(
+        default_factory=DistanceSpaceConfig
+    )
+
+    meta_analysis: MetaAnalysisConfig = field(
+        default_factory=MetaAnalysisConfig
+    )
+
+    visualization: VisualizationConfig = field(
+        default_factory=VisualizationConfig
+    )
+
     # Central scaling policy.
     scaling: ScalingConfig = field(
         default_factory=ScalingConfig
+    )
+
+    # Hardware compute backend policy.
+    compute: ComputeConfig = field(
+        default_factory=ComputeConfig
     )
 
     report: ReportConfig = field(
@@ -1506,6 +1689,170 @@ class Config:
             )
 
         # ==============================================================
+        # Distance
+        # ==============================================================
+
+        dist = (
+            self.distance
+        )
+
+        if (
+            dist.primary_metric
+            not in (
+                "edistance",
+                "mmd",
+            )
+        ):
+
+            raise ValueError(
+                "distance.primary_metric must be 'edistance' or 'mmd' "
+                f"(got {dist.primary_metric!r})"
+            )
+
+        if (
+            dist.secondary_metric
+            is not None
+            and dist.secondary_metric
+            not in (
+                "edistance",
+                "mmd",
+            )
+        ):
+
+            raise ValueError(
+                "distance.secondary_metric must be 'edistance', 'mmd', or null "
+                f"(got {dist.secondary_metric!r})"
+            )
+
+        if (
+            dist.min_cells
+            < 1
+        ):
+
+            raise ValueError(
+                "distance.min_cells must be >= 1"
+            )
+
+        if (
+            dist.max_cells_per_target
+            < 1
+        ):
+
+            raise ValueError(
+                "distance.max_cells_per_target must be >= 1"
+            )
+
+        if (
+            dist.max_control_cells
+            < 1
+        ):
+
+            raise ValueError(
+                "distance.max_control_cells must be >= 1"
+            )
+
+        if (
+            dist.n_permutations
+            < 0
+        ):
+
+            raise ValueError(
+                "distance.n_permutations must be >= 0"
+            )
+
+        if not (
+            0
+            < dist.fdr_threshold
+            < 1
+        ):
+
+            raise ValueError(
+                "distance.fdr_threshold must be in (0, 1)"
+            )
+
+        # ==============================================================
+        # Distance Space
+        # ==============================================================
+
+        dist_space = (
+            self.distance_space
+        )
+
+        if (
+            dist_space.metric
+            not in (
+                "edistance",
+                "mmd",
+            )
+        ):
+
+            raise ValueError(
+                "distance_space.metric must be 'edistance' or 'mmd' "
+                f"(got {dist_space.metric!r})"
+            )
+
+        if (
+            dist_space.n_components
+            < 1
+        ):
+
+            raise ValueError(
+                "distance_space.n_components must be >= 1"
+            )
+
+        if (
+            dist_space.nearest_neighbors
+            < 1
+        ):
+
+            raise ValueError(
+                "distance_space.nearest_neighbors must be >= 1"
+            )
+
+        if (
+            dist_space.linkage_method
+            not in (
+                "average",
+                "complete",
+                "single",
+                "ward",
+                "weighted",
+            )
+        ):
+
+            raise ValueError(
+                "distance_space.linkage_method must be a supported scipy linkage method"
+            )
+
+        if (
+            dist_space.min_cells
+            < 1
+        ):
+
+            raise ValueError(
+                "distance_space.min_cells must be >= 1"
+            )
+
+        if (
+            dist_space.max_cells_per_target
+            < 1
+        ):
+
+            raise ValueError(
+                "distance_space.max_cells_per_target must be >= 1"
+            )
+
+        if (
+            dist_space.n_modules
+            is not None
+            and dist_space.n_modules < 2
+        ):
+
+            raise ValueError(
+                "distance_space.n_modules must be >= 2 or null"
+            )
+
+        # ==============================================================
         # Scaling
         # ==============================================================
 
@@ -1590,6 +1937,76 @@ class Config:
             raise ValueError(
                 "scaling.report_preview_rows must be >= 1"
             )
+
+        # ==============================================================
+        # Compute
+        # ==============================================================
+
+        comp = self.compute
+
+        if comp.backend not in (
+            "auto",
+            "cpu",
+            "gpu",
+        ):
+            raise ValueError(
+                "compute.backend must be 'auto', 'cpu', or 'gpu' "
+                f"(got {comp.backend!r})"
+            )
+
+        if comp.n_jobs < -1 or comp.n_jobs == 0:
+            raise ValueError(
+                f"compute.n_jobs must be >= 1 or -1 (got {comp.n_jobs})"
+            )
+
+        if comp.gpu_device < 0:
+            raise ValueError(
+                "compute.gpu_device must be >= 0"
+            )
+
+        if comp.gpu_min_cells < 1:
+            raise ValueError(
+                "compute.gpu_min_cells must be >= 1"
+            )
+
+        if comp.gpu_min_dense_elements < 1:
+            raise ValueError(
+                "compute.gpu_min_dense_elements must be >= 1"
+            )
+
+        if not (0.0 < comp.gpu_memory_fraction <= 1.0):
+            raise ValueError(
+                "compute.gpu_memory_fraction must be in (0, 1]"
+            )
+
+        if comp.blas_threads_per_worker < 1:
+            raise ValueError(
+                "compute.blas_threads_per_worker must be >= 1"
+            )
+
+        if comp.cpu_parallel_backend not in (
+            "loky",
+            "multiprocessing",
+            "threading",
+            "process",
+        ):
+            raise ValueError(
+                "compute.cpu_parallel_backend must be 'loky', 'multiprocessing', 'threading', or 'process' "
+                f"(got {comp.cpu_parallel_backend!r})"
+            )
+
+        for name in (
+            "distance_n_jobs",
+            "perturbation_n_jobs",
+            "enrichment_n_jobs",
+            "modules_n_jobs",
+            "lochness_n_jobs",
+        ):
+            val = getattr(comp, name)
+            if val is not None and (val < -1 or val == 0):
+                raise ValueError(
+                    f"compute.{name} must be >= 1, -1, or null (got {val})"
+                )
 
         # ==============================================================
         # Report / output

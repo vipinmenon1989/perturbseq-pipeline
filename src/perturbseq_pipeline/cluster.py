@@ -54,6 +54,11 @@ import pandas as pd
 import scanpy as sc
 from scipy import sparse
 
+from .compute import (
+    is_package_available,
+    log_compute_decision,
+    resolve_stage_backend,
+)
 from .config import Config
 from .io import LANE_KEY
 
@@ -531,6 +536,10 @@ def embed_and_cluster(
     is_large = cfg.use_large_mode(expr.n_obs)
 
     sc.settings.seed = cfg.run.seed
+
+    decision = resolve_stage_backend("clustering", cfg, n_cells=expr.n_obs)
+    if cfg.compute.log_backend_decisions:
+        log_compute_decision(decision)
 
     logger.info(
         "Clustering execution mode: %s",

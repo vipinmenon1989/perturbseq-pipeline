@@ -16,99 +16,41 @@ Every run produces three deliverables:
 
 ---
 
-## What it does
+## Biological Framework & What It Does
 
-**1 · Quality control**
-Standard single-cell QC (genes/UMIs per cell, mitochondrial, ribosomal and
-hemoglobin fractions, per-lane breakdowns) *plus* Perturb-seq-specific guide QC:
-guide UMI depth, guides detected per cell (MOI), top-vs-second guide dominance,
-assignment outcome per lane, and guide/target library representation.
+Perturb-seq screens measure complex cellular consequences across multiple complementary dimensions. Rather than collapsing these distinct biological phenomena into an arbitrary composite score, the pipeline evaluates each orthogonal layer along the perturbation cascade:
 
-**2 · Clustering**
-Library-size normalization, log1p, HVG selection, PCA, optional Harmony batch
-correction, UMAP and Leiden clustering — with the embedding coloured by cluster,
-lane, QC metrics, assignment class and target gene, so technical artefacts are
-visible rather than implicit.
+$$\text{Perturbation} \longrightarrow \text{Efficacy} \longrightarrow \text{Penetrance} \longrightarrow \text{Phenotype Magnitude} \longrightarrow \text{Topology} \longrightarrow \text{Phenotype Similarity} \longrightarrow \text{Mechanistic Organization}$$
 
-**3 · Perturbation strength**
-For every target gene also measured in the expression matrix, the gene's *own*
-expression is compared between perturbed and control cells. Effective CRISPR
-perturbation lowers it, so the call is directional: a target is **effective**
-only at BH-FDR < 0.05 **and** log2FC < 0.
+| Biological Dimension | Pipeline Stage | Primary Question | Key Metrics / Methods |
+|---|---|---|---|
+| **Efficacy** (Target Knockdown) | Stage 5 | Did the perturbation deplete the targeted transcript? | $\log_2\text{FC}$, KS/Wilcoxon FDR, `% knockdown` |
+| **Penetrance** (Per-Cell Response) | Stage 8 | What fraction of perturbed cells shifted into a distinct state? | Perturbation Score (PS), responder vs escaper fraction |
+| **Phenotype Magnitude** (Global Displacement) | Stage 10 | How far is the high-dimensional cell distribution displaced from control? | **Energy Distance** ($E$-distance), MMD |
+| **Statistical Evidence** (Significance) | Stage 10 | Is the global phenotype shift statistically significant? | Permutation **DistanceTest** empirical p-value & BH-FDR |
+| **Manifold Topology** (State Localization) | Stage 9 | Where does the perturbation concentrate in continuous cell-state space? | **lochNESS** neighborhood density enrichment ($k=300$) |
+| **Discrete State Enrichment** | Stage 6 | Does the perturbation over-represent specific discrete clusters? | Fisher's exact test / stratified CMH test, guide concordance |
+| **Phenotype Similarity** (Distance Space) | Stage 11 | Which perturbations produce similar whole-cell phenotype distributions? | Pairwise Energy Distance matrix, PCoA coordinates, **Phenotype Modules** |
+| **Mechanistic Organization** (Regulome) | Stage 7 | Which perturbations regulate similar downstream genes and programs? | **Co-functional Modules** (shared DE targets) & **Gene Programs** |
 
-Results are reported against **two control definitions** side by side:
+---
 
-| Control | Definition | Note |
-|---|---|---|
-| `ntc` | cells carrying non-targeting guides | preferred; same handling, no on-target effect |
-| `other` | cells assigned to a *different* target gene | larger n, but controls are themselves perturbed |
+### The 14 Pipeline Stages
 
-**4 · Cluster enrichment**
-The follow-on question: did losing the gene push cells into a particular
-transcriptional state? Every target is tested against every cluster with
-Fisher's exact test (BH-FDR across all pairs), reporting odds ratio, direction,
-and **how many of the target's guides independently agree** — a real phenotype
-appears across several guides, a single-guide artefact does not. Set
-`enrichment.stratify_by: lane_id` on a multi-lane run for a Cochran–Mantel–
-Haenszel test that controls for lane differences in cluster composition.
-
-On the demo lane this recovers SMARCC1 (core SWI/SNF) taking over one cluster,
-and EZH2 with SUZ12 — both core PRC2 subunits — independently landing in the
-same one.
-
-**5 · Per-cell perturbation response** *(optional)*
-Sections 3 and 4 treat all cells carrying a guide as one group, but a perturbed
-population is rarely uniform. This stage scores **each cell** using
-[PS_python](https://github.com/weili-lab/PS_python), the lab's scMAGeCK-style
-perturbation score, and combines it with the target's own expression to separate
-**confirmed knockdowns** from **escapers** — cells that carry the guide and show
-the signature yet still express the gene.
-
-```bash
-pip install -e ".[ps]"    # brings in pertps from PS_python
-```
-
-It also builds PS_python's **supervised LDA embedding**: where the UMAP in
-section 2 is unsupervised and knows nothing about which guide a cell carries,
-this one is trained on the perturbation labels, so its axes are chosen to
-separate perturbations. Scores are shown in that space, one figure per target.
-Disable with `ps_score.compute_lda_umap: false` if the extra few minutes and few
-GB are not worth it.
-
-Without the extra the stage is skipped and the report says so; set
-`ps_score.require: true` to make it a hard failure.
-
-**6 · lochNESS neighbourhood enrichment**
-Ported from [pertTF](https://github.com/davidliwei/pertTF). For every cell and
-every perturbation, the share of that cell's 300 nearest neighbours carrying the
-perturbation, divided by its overall share, minus one — so 0 is background and
-positive means locally over-represented. Continuous and cluster-free, so unlike
-section 4 it also sees structure inside a cluster or across two, and it maps
-*where* a perturbation accumulates. One figure per perturbation.
-
-On the demo lane it independently reproduces the section-4 result (SALL4 and
-SMARCC1 strongest; EZH2, SUZ12, NANOG and CTNNB1 all peaking in the same
-cluster) without using clusters at all.
-
-**7 · Co-functional modules & gene programs**
-The "regulome" map, after
-[Chen et al. 2023](https://www.nature.com/articles/s41586-023-06733-x). A
-perturbation×gene matrix of log2FC-vs-control is clustered on both axes:
-perturbations into **co-functional modules** (Spearman-correlation clustering)
-and downstream genes into **co-regulated programs** (Pearson-correlation
-clustering). It then relates the two — a signed module×program strength matrix
-and alluvial — and draws the TF-hub and module–module networks. Every cell is
-also scored for each program. Modules (`M1..`) and programs (`P1..`) are numbered
-clusters, not biological labels; their member TFs and top genes are in the
-tables so you can annotate them. The number of modules/programs is configurable
-(`modules.n_modules` / `modules.n_programs`, or an automatic dendrogram cut).
-
-```bash
-pip install -e ".[networks]"   # optional: the network-graph layouts (networkx)
-```
-
-The stage skips itself when a run has too few perturbations to be meaningful (a
-single small lane), so it is most useful on a full multi-lane screen.
+1. **Input Loading & Validation**: Multi-lane 10x MTX directories or AnnData H5AD, with automatic lane concatenation, guide/feature splitting, and sample metadata merging.
+2. **Quality Control**: Standard single-cell QC (gene/UMI counts, mitochondrial, ribosomal, hemoglobin fractions) plus Perturb-seq guide QC (depth, MOI, dominance).
+3. **Guide Assignment**: Dominance-ratio based single-guide calling per cell (`targeting`, `non-targeting`, `ambiguous`, `unassigned`).
+4. **Clustering & Normalization**: Library-size normalization, log1p transformation, HVG selection, PCA, optional Harmony batch correction, UMAP embedding, and Leiden clustering.
+5. **Perturbation Strength (Efficacy)**: Direct target knockdown assessment comparing target gene expression in perturbed vs control cells (two-sided and directional tests, log2FC, `% knockdown`, BH-FDR).
+6. **Cluster Enrichment**: Tests whether perturbations favor discrete cell states via Fisher's exact test or stratified Cochran–Mantel–Haenszel (CMH) test controlling for batch.
+7. **Co-functional Modules & Gene Programs (Regulome)**: Biclusters perturbation effect matrix into co-functional modules (Spearman correlation) and co-regulated gene programs (Pearson correlation), computing signed module-program strength and TF-hub connectivity.
+8. **Per-cell Perturbation Response (PS Penetrance)**: Computes per-cell perturbation scores via [PS_python](https://github.com/weili-lab/PS_python) (`pertps`), separating confirmed responders from escapers.
+9. **lochNESS Neighborhood Topology**: Continuous, cluster-free manifold neighborhood density enrichment ($k=300$) mapping where perturbations localize on the single-cell manifold.
+10. **Perturbation Distance & Permutation DistanceTest**: High-dimensional multivariate distribution comparison against unperturbed control using Energy Distance (primary) and optional MMD (secondary), with finite-permutation `DistanceTest` empirical p-values and BH-FDR.
+11. **Perturbation Distance Space & Phenotype Modules**: All-vs-all pairwise perturbation distance matrix (`tables/perturbation_distance_matrix.tsv`), Principal Coordinate Analysis (PCoA / classical MDS embedding in `tables/perturbation_space_coordinates.csv`), nearest phenotypic neighbors (`tables/perturbation_neighbors.csv`), and hierarchical clustering into Phenotype Modules (`tables/phenotype_modules.csv`).
+12. **Master Perturbation Metadata & Integrated Visualizations**: Consolidates all target-level summaries into a unified reference table (`tables/perturbation_meta.csv`) and generates integrated cross-layer figures (Perturbation Atlas heatmap, PS $\times$ Distance map, Phenotype Space PCoA, Module concordance).
+13. **Output Delivery & Lean H5AD**: Exports lean processed `.h5ad` storing cell-level annotations in `obs`/`obsm` while keeping large target tables and pairwise matrices in `tables/`.
+14. **Interactive HTML Report & Manifest**: Compiles all diagnostic figures, summary cards, and table previews into a standalone shareable HTML report with figure manifest.
 
 ---
 
@@ -120,12 +62,15 @@ cd perturbseq-pipeline
 pip install -e .
 
 # optional extras
-pip install -e ".[harmony]"   # batch correction across lanes
-pip install -e ".[demo]"      # gdown, for fetching the demo data
+pip install -e ".[harmony]"   # Harmony batch correction across lanes
+pip install -e ".[ps]"        # PS_python perturbation penetrance scoring
+pip install -e ".[networks]"  # NetworkX layouts for TF hub graphs
+pip install -e ".[demo]"      # gdown, for fetching demo datasets
+pip install -e ".[gpu]"       # GPU acceleration extras (CuPy, cuML, rapids-singlecell)
+pip install -e ".[dev]"       # pytest and developer tools
 ```
 
-Requires Python >= 3.9. Runs on Colab (Drive mounted), a workstation, or an HPC
-login node. No GPU needed.
+Requires Python >= 3.9. Runs on Linux/macOS/Windows, Colab, workstations, or HPC clusters. CPU execution is fully supported out of the box with zero GPU requirements.
 
 ---
 
@@ -524,6 +469,147 @@ Non-targeting guides are detected by pattern (`non`, `non_targeting`, `NTC`,
 
 ---
 
+## Perturbation Distance & DistanceTest (Stage 10)
+
+### Biological Purpose & Concept
+While target log2FC measures **direct efficacy** (did the guide deplete its targeted transcript?), **Perturbation Distance** measures **global phenotypic magnitude**: how far did the perturbation displace the high-dimensional cell distribution away from the unperturbed control population?
+
+These two metrics answer distinct biological questions:
+* **Strong target knockdown + small Energy Distance**: Highly effective molecular targeting with relatively specialized or minimal global transcriptional consequence.
+* **Modest target knockdown + large Energy Distance**: Downstream signal amplification, transcription factor cascade activation, or broad cellular state transitions.
+
+### Primary Metric: Energy Distance
+Evaluated in latent embedding space (e.g. PCA space `adata.obsm['X_pca']`):
+$$D^2(P, Q) = 2\,\mathbb{E}_{X \sim P, Y \sim Q}[\|X - Y\|_2] - \mathbb{E}_{X, X' \sim P}[\|X - X'\|_2] - \mathbb{E}_{Y, Y' \sim Q}[\|Y - Y'\|_2]$$
+Energy distance is zero if and only if $P = Q$. Unlike mean centroid Euclidean distance, Energy Distance captures higher-order distribution moments including variance shifts, shape changes, and multimodality. An optional secondary metric is **Maximum Mean Discrepancy (MMD)** with a Gaussian RBF kernel.
+
+### Permutation DistanceTest
+Statistical significance is assessed via label permutation testing:
+$$p = \frac{1 + \sum_{b=1}^B \mathbf{1}(D_{\text{perm}, b} \ge D_{\text{observed}})}{1 + B}$$
+followed by Benjamini–Hochberg False Discovery Rate (BH-FDR) multiple testing correction across all tested perturbations.
+* **Energy Distance** = effect magnitude.
+* **Distance FDR** = statistical confidence.
+
+### Scalable Bounded Sampling
+To prevent intractable pairwise matrix allocations on large datasets (such as Replogle or KOLF), cells are sampled deterministically:
+```yaml
+distance:
+  enabled: true
+  representation: X_pca
+  primary_metric: edistance
+  max_cells_per_target: 2000
+  max_control_cells: 5000
+  n_permutations: 1000
+  random_seed: 123
+  fdr_threshold: 0.05
+```
+
+---
+
+## Perturbation Distance Space & Phenotype Modules (Stage 11)
+
+Where Stage 10 asks *"How far does each perturbation move from control?"*, **DistanceSpace** asks:
+> **Which perturbations generate similar whole-cell phenotypic states?**
+
+### Outputs & Deliverables
+* `tables/perturbation_distance_matrix.tsv`: All-vs-all symmetric target $\times$ target Energy Distance matrix (stored outside H5AD to prevent memory bloat).
+* `tables/perturbation_space_coordinates.csv`: Low-dimensional Principal Coordinate Analysis (PCoA / classical MDS) embedding coordinates.
+* `tables/perturbation_neighbors.csv`: Top-$k$ nearest phenotypic neighbors ranked for every perturbation.
+* `tables/phenotype_modules.csv`: Hierarchical clustering partition into discrete **Phenotype Modules**.
+
+### DistanceSpace Scaling: $O(P^2)$
+Pairwise perturbation analysis scales quadratically as $\frac{P(P - 1)}{2}$. For ~1,800 perturbations in the Replogle dataset, this represents ~1.62 million pairwise distance evaluations. DistanceSpace is therefore substantially more intensive than Distance-vs-control. We recommend:
+* Running Distance & DistanceTest for routine phenotype magnitude quantification.
+* Enabling DistanceSpace when all-vs-all perturbation phenotypic relationships and manifolds are scientifically required.
+
+### Phenotype Modules vs Co-functional Modules
+The pipeline explicitly discovers and distinguishes two complementary modular structures:
+* **Co-functional Modules** (Stage 7, `tables/cofunctional_modules.csv`): Discovered from shared downstream differential expression profiles ($\log_2\text{FC}$ vectors across genes). *Which perturbations regulate the same downstream genes?*
+* **Phenotype Modules** (Stage 11, `tables/phenotype_modules.csv`): Discovered from pairwise Energy Distances in single-cell latent space. *Which perturbations produce similar geometric distributions across cellular states?*
+
+---
+
+## Master Perturbation Metadata & Integrated Visualizations (Stage 12)
+
+The pipeline integrates all target-level statistics into a unified master reference table:
+`tables/perturbation_meta.csv`.
+
+| Column | Source Stage | Biological Concept |
+|---|---|---|
+| `target_gene` | Metadata | Target identifier |
+| `n_cells` | QC / Guide calling | QC-passing cell count |
+| `target_log2fc` | Stage 5 | Direct target transcript knockdown ($\log_2\text{FC}$) |
+| `target_pct_kd` | Stage 5 | Percentage depletion of target transcript |
+| `target_fdr` | Stage 5 | Statistical significance of target depletion |
+| `is_effective_hit` | Stage 5 | Binary flag: statistically verified knockdown |
+| `ps_mean`, `ps_median` | Stage 8 | Per-cell Perturbation Score (PS) central tendencies |
+| `ps_responder_fraction` | Stage 8 | Cellular penetrance: fraction of confirmed responders |
+| `ps_escaper_fraction` | Stage 8 | Fraction of cells escaping perturbation phenotype |
+| `lochness_mean`, `lochness_peak` | Stage 9 | Continuous manifold neighborhood density enrichment |
+| `energy_distance`, `mmd_distance` | Stage 10 | Global phenotype displacement magnitude vs control |
+| `distance_pvalue`, `distance_fdr` | Stage 10 | Permutation DistanceTest statistical confidence |
+| `distance_significant` | Stage 10 | Binary flag: statistically significant phenotype shift |
+| `cofunctional_module` | Stage 7 | Co-functional module (shared DE target regulation) |
+| `phenotype_module` | Stage 11 | Phenotype module (shared manifold state distribution) |
+
+> **Architectural Principle**: This table is an integrated reference matrix, **never** an arbitrary composite scalar score. Target efficacy, cellular penetrance, manifold topology, and phenotypic distance represent distinct, non-fungible biological questions.
+
+### Integrated Figures
+* `figures/perturbation_atlas.png`: Heatmap overview of Z-scored efficacy, PS penetrance, lochNESS topology, and Energy Distance across top perturbations.
+* `figures/ps_vs_distance_map.png`: Scatter plot mapping Cellular Penetrance (PS) on the Y-axis against Global Phenotypic Distance on the X-axis.
+* `figures/perturbation_phenotype_space.png`: PCoA projection of Perturbation Distance Space colored by Phenotype Modules.
+* `figures/module_concordance.png`: Cross-tabulation heatmap and mutual information metrics between Co-functional Modules and Phenotype Modules.
+
+---
+
+## Lean H5AD Storage Policy
+
+To prevent single-cell objects from exhausting host memory, the pipeline enforces a strict storage separation:
+
+| Granularity | Location | Deliverables |
+|---|---|---|
+| **Cell $\times$ 1 value** | `adata.obs` | `target_gene`, `leiden`, `ps_score`, `ps_quadrant`, `lochness_self` |
+| **Cell $\times$ Feature** | `adata.obsm` / `layers` | `counts`, `lognorm`, `X_pca`, `X_umap`, `X_lda_umap`, `guide_counts` |
+| **Target $\times$ 1 summary** | `tables/perturbation_meta.csv` | Target efficacy, PS penetrance, lochNESS, Energy Distance, module calls |
+| **Target $\times$ Target** | `tables/` (TSV/CSV) | `perturbation_distance_matrix.tsv`, `perturbation_space_coordinates.csv` |
+| **Target $\times$ Gene** | `tables/` (CSV) | `effect_matrix.csv`, `gene_programs.csv`, `module_program_strength.csv` |
+| **Networks & Profiles** | `tables/` (CSV) | `tf_edges.csv`, `tf_hubs.csv`, `compute_profile.csv` |
+
+Large matrices and target tables are never stuffed into `adata.uns`.
+
+---
+
+## Scaling and Compute Architecture
+
+The execution layer decouples **Dataset Scaling Mode** from **Compute Hardware Backend**:
+
+| Dataset Class | Approximate Scale | Scaling Mode (`scaling.mode`) | Default Backend (`compute.backend`) | Execution Strategy |
+|---|---|---|---|---|
+| **Small Screen** | $< 100\text{k}$ cells | `STANDARD` | `auto` (CPU) | In-memory processing, CPU multiprocessing |
+| **Standard Screen (Replogle)** | $\sim 300\text{k}$ cells | `STANDARD` | `auto` (CPU / selective GPU) | CPU multiprocessing + optional GPU dense linear algebra |
+| **Large Screen** | $\sim 1\text{M}$ cells | `LARGE` / `AUTO` | `auto` (CPU / selective GPU) | Streaming/chunked CPU statistics + optional GPU |
+| **Million-Cell (KOLF)** | $\sim 2.66\text{M}$ cells | `LARGE` | `auto` (CPU / selective GPU) | Memory-bounded sparse CPU + optional GPU acceleration |
+
+### CPU Multiprocessing vs Selective GPU Acceleration
+* **CPU Multiprocessing**: Embarrassingly parallel statistical routines (perturbation testing, cluster enrichment Fisher/CMH tests, DistanceTest permutations) execute across worker pools with `blas_threads_per_worker: 1` to prevent CPU oversubscription.
+* **Selective GPU Acceleration**: GPU acceleration is optional and applied only to dense linear algebra (correlation matrices, RAPIDS single-cell neighbors/UMAP), with automatic VRAM safety checks (`gpu_memory_fraction: 0.80`) and CPU fallback.
+* **SLURM Cluster Awareness**: Detects `SLURM_CPUS_PER_TASK` and CPU affinity automatically.
+
+#### SLURM HPC Job Script Example
+```bash
+#!/bin/bash
+#SBATCH --job-name=perturbseq_run
+#SBATCH --cpus-per-task=16
+#SBATCH --mem=128G
+#SBATCH --time=04:00:00
+
+# Run with CPU multiprocessing using all 16 allocated SLURM cores:
+perturbseq-pipeline run --config config/my_run.yaml
+```
+
+
+---
+
 ## Testing
 
 ```bash
@@ -531,21 +617,18 @@ pip install -e ".[dev]"
 pytest tests/ -v
 ```
 
-The suite generates a synthetic dataset with a **known ground truth** — some
-targets are genuinely knocked down, others are not — and asserts that the
-pipeline recovers exactly those, through both entry points and all three h5ad
-layouts.
+The suite includes comprehensive unit tests verifying hardware detection, SLURM parsing, deterministic backend resolution, seed reproducibility, and serial vs parallel execution equivalence.
 
 ---
 
 ## Repository layout
 
 ```
-src/perturbseq_pipeline/   io · qc · guides · cluster · perturbation · plots · report · cli
-config/                    default.yaml (all documented defaults) · demo.yaml
+src/perturbseq_pipeline/   io · qc · guides · cluster · perturbation · distance · modules · ps_score · lochness · meta · plots · report · compute · cli
+config/                    default.yaml · demo.yaml · reploge.yaml · kolf.yaml
 demo/                      fetch_demo_data.py · sample_metadata.csv
 notebooks/                 demo_run_pipeline.ipynb · prototype/ (original analyses)
-tests/                     synthetic data generator + end-to-end tests
+tests/                     synthetic data generator + end-to-end tests + compute unit tests
 ```
 
 `CLAUDE.md` records the project conventions, including where large files belong.
@@ -554,4 +637,5 @@ tests/                     synthetic data generator + end-to-end tests
 
 ## Development notes
 
-For implementation details, scaling behavior, and documentation of the extended Perturb-seq analyses, see [`docs/PIPELINE_DEVELOPMENT.md`](docs/PIPELINE_DEVELOPMENT.md).
+For implementation details, scaling behavior, and documentation of the extended Perturb-seq analyses, see [`docs/PIPELINE_DEVELOPMENT.md`](docs/PIPELINE_DEVELOPMENT.md) and [`docs/methods.md`](docs/methods.md).
+

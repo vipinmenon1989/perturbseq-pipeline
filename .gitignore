@@ -36,3 +36,7 @@ venv/
 .DS_Store
 .vscode/
 .idea/
+
+# Generated stress-test outputs
+scratch/stress_test/results_*/
+scratch/stress_test/**/*.tar.gz

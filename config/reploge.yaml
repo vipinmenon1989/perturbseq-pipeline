@@ -199,6 +199,39 @@ lochness:
   top_n_report: 12
 
 # -------------------------------------------------------------------------
+# Perturbation Distance & Permutation DistanceTest (Stage 10)
+# -------------------------------------------------------------------------
+distance:
+  enabled: true
+  representation: X_pca
+  primary_metric: edistance
+  secondary_metric: null
+  min_cells: 10
+  max_cells_per_target: 2000
+  max_control_cells: 5000
+  n_permutations: 1000
+  random_seed: 123
+  fdr_threshold: 0.05
+
+# -------------------------------------------------------------------------
+# Perturbation DistanceSpace (Stage 11)
+# Note: For ~1,800 Replogle targets, all-vs-all pairwise distance is ~1.62M pairs.
+# Disabled by default for initial routine exploration; enable when pairwise
+# phenotype manifolds and modules are specifically required.
+# -------------------------------------------------------------------------
+distance_space:
+  enabled: false
+  metric: edistance
+  representation: X_pca
+  n_components: 10
+  nearest_neighbors: 10
+  clustering: true
+  linkage_method: average
+  min_cells: 10
+  max_cells_per_target: 2000
+  random_seed: 123
+
+# -------------------------------------------------------------------------
 # Report
 # -------------------------------------------------------------------------
 report:
@@ -221,3 +254,18 @@ output:
   write_guide_h5ad: false
 
   archive: true
+
+# -------------------------------------------------------------------------
+# Compute Execution Layer
+# -------------------------------------------------------------------------
+compute:
+  backend: auto
+  n_jobs: 16
+  gpu_device: 0
+  gpu_min_cells: 200000
+  gpu_min_dense_elements: 50000000
+  gpu_memory_fraction: 0.80
+  cpu_parallel_backend: loky
+  blas_threads_per_worker: 1
+  log_backend_decisions: true
+

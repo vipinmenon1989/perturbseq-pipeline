@@ -79,6 +79,11 @@ import numpy as np
 import pandas as pd
 from scipy.stats import chi2_contingency, fisher_exact
 
+from .compute import (
+    log_compute_decision,
+    resolve_stage_backend,
+    run_parallel,
+)
 from .config import Config
 from .guides import (
     CLASS_NTC,
@@ -932,7 +937,9 @@ def _test_cluster_enrichment_standard(
     # Per-pair tests
     # -----------------------------------------------------------------------
 
-    rows: List[dict] = []
+    decision = resolve_stage_backend("enrichment", cfg, n_cells=expr.n_obs)
+    if cfg.compute.log_backend_decisions:
+        log_compute_decision(decision)
 
     strata_unique = (
         sorted(
@@ -944,8 +951,7 @@ def _test_cluster_enrichment_standard(
         else []
     )
 
-    for gene in testable:
-
+    def _eval_target_enrich_std(gene: str) -> List[dict]:
         tmask = (
             (targets_col == gene)
             & (
@@ -953,72 +959,27 @@ def _test_cluster_enrichment_standard(
                 == CLASS_TARGETING
             )
         )
-
-        n_target = int(
-            tmask.sum()
-        )
+        n_target = int(tmask.sum())
+        gene_rows = []
 
         for control in controls_used:
-
             rmask = _reference_mask(
                 control,
                 klass,
                 targets_col,
                 gene,
             )
-
-            n_ref = int(
-                rmask.sum()
-            )
+            n_ref = int(rmask.sum())
 
             for cluster in clusters:
+                cm = in_cluster[cluster]
+                a = int((tmask & cm).sum())
+                b = n_target - a
+                c_ref = int((rmask & cm).sum())
+                d = n_ref - c_ref
 
-                cm = in_cluster[
-                    cluster
-                ]
-
-                a = int(
-                    (
-                        tmask
-                        & cm
-                    ).sum()
-                )
-
-                b = (
-                    n_target
-                    - a
-                )
-
-                c_ref = int(
-                    (
-                        rmask
-                        & cm
-                    ).sum()
-                )
-
-                d = (
-                    n_ref
-                    - c_ref
-                )
-
-                pct_t = (
-                    100
-                    * a
-                    / max(
-                        n_target,
-                        1,
-                    )
-                )
-
-                pct_r = (
-                    100
-                    * c_ref
-                    / max(
-                        n_ref,
-                        1,
-                    )
-                )
-
+                pct_t = 100 * a / max(n_target, 1)
+                pct_r = 100 * c_ref / max(n_ref, 1)
                 odds = _odds_ratio(
                     a,
                     b,
@@ -1028,91 +989,36 @@ def _test_cluster_enrichment_standard(
                 )
 
                 if stratified:
-
                     tables = []
-
                     for stratum in strata_unique:
-
-                        sm = (
-                            strat_values
-                            == stratum
-                        )
-
+                        sm = strat_values == stratum
                         tables.append(
                             np.array(
                                 [
                                     [
-                                        int(
-                                            (
-                                                tmask
-                                                & cm
-                                                & sm
-                                            ).sum()
-                                        ),
-                                        int(
-                                            (
-                                                tmask
-                                                & ~cm
-                                                & sm
-                                            ).sum()
-                                        ),
+                                        int((tmask & cm & sm).sum()),
+                                        int((tmask & ~cm & sm).sum()),
                                     ],
                                     [
-                                        int(
-                                            (
-                                                rmask
-                                                & cm
-                                                & sm
-                                            ).sum()
-                                        ),
-                                        int(
-                                            (
-                                                rmask
-                                                & ~cm
-                                                & sm
-                                            ).sum()
-                                        ),
+                                        int((rmask & cm & sm).sum()),
+                                        int((rmask & ~cm & sm).sum()),
                                     ],
                                 ],
                                 dtype=float,
                             )
                         )
-
-                    pooled_or, pval = (
-                        _cmh_test(
-                            tables
-                        )
-                    )
-
-                    if (
-                        np.isfinite(
-                            pooled_or
-                        )
-                        and pooled_or > 0
-                    ):
-
-                        odds = (
-                            pooled_or
-                        )
-
+                    pooled_or, pval = _cmh_test(tables)
+                    if np.isfinite(pooled_or) and pooled_or > 0:
+                        odds = pooled_or
                 else:
-
-                    _, pval = (
-                        fisher_exact(
-                            [
-                                [
-                                    a,
-                                    b,
-                                ],
-                                [
-                                    c_ref,
-                                    d,
-                                ],
-                            ]
-                        )
+                    _, pval = fisher_exact(
+                        [
+                            [a, b],
+                            [c_ref, d],
+                        ]
                     )
 
-                rows.append(
+                gene_rows.append(
                     {
                         "target_gene": gene,
                         "cluster": cluster,
@@ -1124,11 +1030,7 @@ def _test_cluster_enrichment_standard(
                         "pct_of_reference": pct_r,
                         "odds_ratio": odds,
                         "log2_odds_ratio": (
-                            float(
-                                np.log2(
-                                    odds
-                                )
-                            )
+                            float(np.log2(odds))
                             if odds > 0
                             else np.nan
                         ),
@@ -1137,15 +1039,22 @@ def _test_cluster_enrichment_standard(
                             if pct_t > pct_r
                             else "depleted"
                         ),
-                        "pval": float(
-                            pval
-                        ),
+                        "pval": float(pval),
                         "low_power": (
-                            c_ref
-                            < ecfg.min_reference_cells
+                            c_ref < ecfg.min_reference_cells
                         ),
                     }
                 )
+        return gene_rows
+
+    results_nested = run_parallel(
+        _eval_target_enrich_std,
+        testable,
+        n_jobs=decision.n_jobs,
+        blas_threads=cfg.compute.blas_threads_per_worker,
+        backend=cfg.compute.cpu_parallel_backend,
+    )
+    rows: List[dict] = [item for sublist in results_nested for item in sublist]
 
     return _finalize_enrichment_results(
         expr=expr,
@@ -1764,13 +1673,11 @@ def _test_cluster_enrichment_large(
     # Pairwise inference from compact counts
     # -----------------------------------------------------------------------
 
-    rows: List[dict] = []
+    decision = resolve_stage_backend("enrichment", cfg, n_cells=expr.n_obs)
+    if cfg.compute.log_backend_decisions:
+        log_compute_decision(decision)
 
-    for gene_index, gene in enumerate(
-        testable,
-        start=1,
-    ):
-
+    def _eval_target_enrich_large(gene: str) -> List[dict]:
         gene_counts = (
             target_cluster.loc[
                 gene
@@ -1782,79 +1689,26 @@ def _test_cluster_enrichment_large(
                 gene
             ]
         )
+        gene_rows = []
 
         for control in controls_used:
-
             if control == CONTROL_NTC:
-
                 n_ref = total_ntc
-
             else:
-
-                # "other" excludes the focal target.
-                n_ref = (
-                    total_targeting
-                    - n_target
-                )
+                n_ref = total_targeting - n_target
 
             for cluster in clusters:
-
-                a = int(
-                    gene_counts.get(
-                        cluster,
-                        0,
-                    )
-                )
-
-                b = (
-                    n_target
-                    - a
-                )
+                a = int(gene_counts.get(cluster, 0))
+                b = n_target - a
 
                 if control == CONTROL_NTC:
-
-                    c_ref = int(
-                        ntc_cluster_counts.get(
-                            cluster,
-                            0,
-                        )
-                    )
-
+                    c_ref = int(ntc_cluster_counts.get(cluster, 0))
                 else:
+                    c_ref = int(targeting_cluster_totals.get(cluster, 0)) - a
 
-                    # All targeting cells in this cluster except focal gene.
-                    c_ref = (
-                        int(
-                            targeting_cluster_totals.get(
-                                cluster,
-                                0,
-                            )
-                        )
-                        - a
-                    )
-
-                d = (
-                    n_ref
-                    - c_ref
-                )
-
-                pct_t = (
-                    100.0
-                    * a
-                    / max(
-                        n_target,
-                        1,
-                    )
-                )
-
-                pct_r = (
-                    100.0
-                    * c_ref
-                    / max(
-                        n_ref,
-                        1,
-                    )
-                )
+                d = n_ref - c_ref
+                pct_t = 100.0 * a / max(n_target, 1)
+                pct_r = 100.0 * c_ref / max(n_ref, 1)
 
                 odds = _odds_ratio(
                     a,
@@ -1864,192 +1718,66 @@ def _test_cluster_enrichment_large(
                     ecfg.odds_pseudocount,
                 )
 
-                # -----------------------------------------------------------
-                # CMH using aggregated per-stratum counts
-                # -----------------------------------------------------------
-
                 if stratified:
-
                     tables = []
-
                     for stratum in strata:
-
-                        key = (
-                            gene,
-                            stratum,
-                        )
-
-                        if (
-                            key
-                            in target_stratum_cluster.index
-                        ):
-
-                            target_row = (
-                                target_stratum_cluster.loc[
-                                    key
-                                ]
-                            )
-
-                            a_s = int(
-                                target_row.get(
-                                    cluster,
-                                    0,
-                                )
-                            )
-
-                            target_total_s = int(
-                                targeting_stratum_totals.get(
-                                    key,
-                                    0,
-                                )
-                            )
-
+                        key = (gene, stratum)
+                        if key in target_stratum_cluster.index:
+                            target_row = target_stratum_cluster.loc[key]
+                            a_s = int(target_row.get(cluster, 0))
+                            target_total_s = int(targeting_stratum_totals.get(key, 0))
                         else:
-
                             a_s = 0
                             target_total_s = 0
 
-                        b_s = (
-                            target_total_s
-                            - a_s
-                        )
+                        b_s = target_total_s - a_s
 
                         if control == CONTROL_NTC:
-
-                            if (
-                                stratum
-                                in ntc_stratum_cluster.index
-                            ):
-
-                                c_s = int(
-                                    ntc_stratum_cluster.loc[
-                                        stratum
-                                    ].get(
-                                        cluster,
-                                        0,
-                                    )
-                                )
-
+                            if stratum in ntc_stratum_cluster.index:
+                                c_s = int(ntc_stratum_cluster.loc[stratum].get(cluster, 0))
                             else:
                                 c_s = 0
-
-                            ref_total_s = int(
-                                ntc_stratum_totals.get(
-                                    stratum,
-                                    0,
-                                )
-                            )
-
+                            ref_total_s = int(ntc_stratum_totals.get(stratum, 0))
                         else:
-
-                            # Total targeting counts in this stratum/cluster.
-                            # Compute from compact target × stratum data.
-                            if (
-                                cluster
-                                in target_stratum_cluster.columns
-                            ):
-
+                            if cluster in target_stratum_cluster.columns:
                                 try:
-
                                     cluster_total_s = int(
                                         target_stratum_cluster.xs(
                                             stratum,
                                             level="stratum",
-                                        )[
-                                            cluster
-                                        ].sum()
+                                        )[cluster].sum()
                                     )
-
                                 except KeyError:
-
                                     cluster_total_s = 0
-
                             else:
-
                                 cluster_total_s = 0
 
                             total_targeting_s = 0
-
                             try:
-
                                 total_targeting_s = int(
                                     targeting_stratum_totals.xs(
                                         stratum,
                                         level="stratum",
                                     ).sum()
                                 )
-
                             except KeyError:
-
                                 pass
 
-                            # Exclude focal target.
-                            c_s = (
-                                cluster_total_s
-                                - a_s
-                            )
+                            c_s = cluster_total_s - a_s
+                            ref_total_s = total_targeting_s - target_total_s
 
-                            ref_total_s = (
-                                total_targeting_s
-                                - target_total_s
-                            )
-
-                        d_s = (
-                            ref_total_s
-                            - c_s
-                        )
-
+                        d_s = ref_total_s - c_s
                         tables.append(
-                            np.array(
-                                [
-                                    [
-                                        a_s,
-                                        b_s,
-                                    ],
-                                    [
-                                        c_s,
-                                        d_s,
-                                    ],
-                                ],
-                                dtype=float,
-                            )
+                            np.array([[a_s, b_s], [c_s, d_s]], dtype=float)
                         )
 
-                    pooled_or, pval = (
-                        _cmh_test(
-                            tables
-                        )
-                    )
-
-                    if (
-                        np.isfinite(
-                            pooled_or
-                        )
-                        and pooled_or > 0
-                    ):
-
-                        odds = (
-                            pooled_or
-                        )
-
+                    pooled_or, pval = _cmh_test(tables)
+                    if np.isfinite(pooled_or) and pooled_or > 0:
+                        odds = pooled_or
                 else:
+                    _, pval = fisher_exact([[a, b], [c_ref, d]])
 
-                    _, pval = (
-                        fisher_exact(
-                            [
-                                [
-                                    a,
-                                    b,
-                                ],
-                                [
-                                    c_ref,
-                                    d,
-                                ],
-                            ]
-                        )
-                    )
-
-                rows.append(
+                gene_rows.append(
                     {
                         "target_gene": gene,
                         "cluster": cluster,
@@ -2061,11 +1789,7 @@ def _test_cluster_enrichment_large(
                         "pct_of_reference": pct_r,
                         "odds_ratio": odds,
                         "log2_odds_ratio": (
-                            float(
-                                np.log2(
-                                    odds
-                                )
-                            )
+                            float(np.log2(odds))
                             if odds > 0
                             else np.nan
                         ),
@@ -2074,26 +1798,22 @@ def _test_cluster_enrichment_large(
                             if pct_t > pct_r
                             else "depleted"
                         ),
-                        "pval": float(
-                            pval
-                        ),
+                        "pval": float(pval),
                         "low_power": (
-                            c_ref
-                            < ecfg.min_reference_cells
+                            c_ref < ecfg.min_reference_cells
                         ),
                     }
                 )
+        return gene_rows
 
-        if (
-            gene_index % 1000 == 0
-        ):
-
-            logger.info(
-                "Large-data enrichment progress: "
-                "%d / %d targets",
-                gene_index,
-                len(testable),
-            )
+    results_nested = run_parallel(
+        _eval_target_enrich_large,
+        testable,
+        n_jobs=decision.n_jobs,
+        blas_threads=cfg.compute.blas_threads_per_worker,
+        backend=cfg.compute.cpu_parallel_backend,
+    )
+    rows: List[dict] = [item for sublist in results_nested for item in sublist]
 
     return _finalize_enrichment_results(
         expr=expr,

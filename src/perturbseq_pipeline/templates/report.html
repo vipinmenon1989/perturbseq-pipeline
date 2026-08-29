@@ -85,6 +85,8 @@
   {% if ps %}<a href="#ps">5. Per-cell response</a>{% endif %}
   {% if lochness %}<a href="#lochness">6. lochNESS</a>{% endif %}
   {% if modules %}<a href="#modules">7. Modules &amp; programs</a>{% endif %}
+  {% if distance %}<a href="#distance">8. Perturbation distance</a>{% endif %}
+  {% if distance_space %}<a href="#distance_space">9. Distance space</a>{% endif %}
   <a href="#outputs">Outputs</a>
 </p>
 
@@ -461,6 +463,67 @@
   </div>
 </div>
 {% endif %}
+{% endif %}
+
+<!-- ===================== 8. Perturbation distance ===================== -->
+{% if distance %}
+<h2 id="distance">8. Perturbation distance vs control</h2>
+<p class="lede">
+  Quantifies the high-dimensional phenotypic displacement (in PCA space) between cells carrying each
+  perturbation and unperturbed control cells using <b>Energy Distance</b> (and optional MMD).
+  Statistical significance is assessed via a finite-permutation <b>DistanceTest</b> followed by
+  Benjamini–Hochberg FDR correction.
+</p>
+
+<div class="cards">
+  <div class="card"><div class="v">{{ distance.n_targets }}</div><div class="k">Targets tested</div></div>
+  <div class="card"><div class="v">{{ distance.n_hits }}</div><div class="k">Significant (FDR &lt; {{ distance.fdr_threshold }})</div></div>
+  <div class="card"><div class="v">{{ distance.top_target }}</div><div class="k">Max distance ({{ distance.top_distance }})</div></div>
+  <div class="card"><div class="v">{{ distance.primary_metric }}</div><div class="k">Primary metric</div></div>
+</div>
+
+<h3>8.1 Perturbation overview and atlas</h3>
+{% for f in figures.distance %}{{ render_figure(f) }}{% endfor %}
+
+<h3>8.2 Target-level distance statistics</h3>
+<div class="scroll">{{ tables.perturbation_distance }}</div>
+{% endif %}
+
+<!-- ===================== 9. Distance space & Phenotype modules ===================== -->
+{% if distance_space %}
+<h2 id="distance_space">9. Perturbation distance space &amp; phenotype modules</h2>
+<p class="lede">
+  Constructs a pairwise target &times; target phenotypic distance matrix, projects perturbations
+  into low-dimensional coordinates via classical <b>PCoA</b> (retaining positive eigenvalues),
+  identifies nearest phenotypic neighbors, and clusters perturbations into distinct <b>Phenotype Modules</b>.
+</p>
+
+<div class="cards">
+  <div class="card"><div class="v">{{ distance_space.n_targets }}</div><div class="k">Perturbations mapped</div></div>
+  <div class="card"><div class="v">{{ distance_space.n_modules }}</div><div class="k">Phenotype modules</div></div>
+  <div class="card"><div class="v">{{ distance_space.n_components }}</div><div class="k">PCoA dimensions</div></div>
+  <div class="card"><div class="v">{{ distance_space.linkage }}</div><div class="k">Linkage method</div></div>
+</div>
+
+<h3>9.1 Phenotype space and concordance</h3>
+{% for f in figures.distance_space %}{{ render_figure(f) }}{% endfor %}
+
+<h3>9.2 Phenotype module assignments</h3>
+<div class="scroll">{{ tables.phenotype_modules }}</div>
+
+<h3>9.3 Nearest phenotypic neighbors</h3>
+<div class="scroll">{{ tables.perturbation_neighbors }}</div>
+{% endif %}
+
+<!-- ===================== 10. Master perturbation meta table ===================== -->
+{% if tables.perturbation_meta %}
+<h2>10. Master perturbation meta table</h2>
+<p class="lede">
+  Merged reference table across all orthogonal biological dimensions: efficacy (log2FC, FDR),
+  penetrance (PS score, responder fractions), manifold topology (lochNESS enrichment),
+  phenotype magnitude (Energy distance, FDR), and biological organization (co-functional and phenotype modules).
+</p>
+<div class="scroll">{{ tables.perturbation_meta }}</div>
 {% endif %}
 
 <!-- ===================== Outputs ===================== -->

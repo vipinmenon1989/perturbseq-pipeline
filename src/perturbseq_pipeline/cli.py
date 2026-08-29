@@ -105,6 +105,22 @@ class PipelineResult:
         pd.DataFrame
     ] = None
 
+    distance_table: Optional[
+        pd.DataFrame
+    ] = None
+
+    distance_space_results: Optional[
+        object
+    ] = None
+
+    meta_table: Optional[
+        pd.DataFrame
+    ] = None
+
+    compute_profile: Optional[
+        pd.DataFrame
+    ] = None
+
     #: STANDARD / LARGE, useful for provenance.
     execution_mode: str = "standard"
 
@@ -736,19 +752,37 @@ def run_pipeline(
     import scanpy as sc
 
     from . import cluster as cluster_mod
+    from . import distance as dist_mod
     from . import enrichment as enrich_mod
     from . import guides as guides_mod
     from . import io as io_mod
     from . import lochness as loch_mod
+    from . import meta as meta_mod
     from . import modules as modules_mod
     from . import perturbation as pert_mod
     from . import plots as plots_mod
     from . import ps_score as ps_mod
     from . import qc as qc_mod
-
+    from .compute import (
+        ComputeProfiler,
+        detect_available_cpus,
+        detect_slurm_cpus,
+        is_gpu_available,
+        stage_profile,
+    )
     from .report import (
         ReportInputs,
         build_report,
+    )
+
+    profiler = ComputeProfiler()
+    slurm_cpus = detect_slurm_cpus()
+    logger.info(
+        "Compute environment: %d available CPUs%s, GPU available: %s, backend=%s",
+        detect_available_cpus(),
+        f" (SLURM: {slurm_cpus})" if slurm_cpus else "",
+        is_gpu_available(),
+        cfg.compute.backend,
     )
 
     sc.settings.verbosity = 1
@@ -792,7 +826,7 @@ def run_pipeline(
     # =====================================================================
 
     logger.info(
-        "=== Stage 1/11: loading input ==="
+        "=== Stage 1/14: loading input ==="
     )
 
     data = io_mod.load_data(
@@ -840,7 +874,7 @@ def run_pipeline(
     # =====================================================================
 
     logger.info(
-        "=== Stage 2/11: quality control ==="
+        "=== Stage 2/14: quality control ==="
     )
 
     expr = qc_mod.prefilter(
@@ -911,7 +945,7 @@ def run_pipeline(
     # =====================================================================
 
     logger.info(
-        "=== Stage 3/11: guide assignment ==="
+        "=== Stage 3/14: guide assignment ==="
     )
 
     expr = guides_mod.assign_guides(
@@ -1022,7 +1056,7 @@ def run_pipeline(
     # =====================================================================
 
     logger.info(
-        "=== Stage 4/11: normalization, embedding, clustering ==="
+        "=== Stage 4/14: normalization, embedding, clustering ==="
     )
 
     expr = cluster_mod.normalize(
@@ -1191,7 +1225,7 @@ def run_pipeline(
     # =====================================================================
 
     logger.info(
-        "=== Stage 5/11: perturbation strength ==="
+        "=== Stage 5/14: perturbation strength ==="
     )
 
     results = pert_mod.test_all_targets(
@@ -1280,7 +1314,7 @@ def run_pipeline(
     if cfg.enrichment.enabled:
 
         logger.info(
-            "=== Stage 6/11: perturbation enrichment across clusters ==="
+            "=== Stage 6/14: perturbation enrichment across clusters ==="
         )
 
         enrichment = (
@@ -1382,7 +1416,7 @@ def run_pipeline(
     if cfg.modules.enabled:
 
         logger.info(
-            "=== Stage 7/11: co-functional modules & gene programs ==="
+            "=== Stage 7/14: co-functional modules & gene programs ==="
         )
 
         modules_result = (
@@ -1492,19 +1526,13 @@ def run_pipeline(
                 modules_result.modules
             )
 
-            if (
-                not modules_result
-                .hubs
-                .empty
-            ):
-
-                _table_for_report(
-                    tables,
-                    "tf_hubs",
-                    modules_result.hubs,
-                    large_mode=large_mode,
-                    max_rows_large=cfg.scaling.report_preview_rows,
-                )
+            _table_for_report(
+                tables,
+                "tf_hubs",
+                modules_result.hubs,
+                large_mode=large_mode,
+                max_rows_large=cfg.scaling.report_preview_rows,
+            )
 
             if (
                 modules_result.note
@@ -1540,7 +1568,7 @@ def run_pipeline(
     # =====================================================================
 
     logger.info(
-        "=== Stage 8/11: per-cell perturbation scores ==="
+        "=== Stage 8/14: per-cell perturbation scores ==="
     )
 
     ps_results = ps_mod.compute_ps_scores(
@@ -1674,7 +1702,7 @@ def run_pipeline(
     if cfg.lochness.enabled:
 
         logger.info(
-            "=== Stage 9/11: lochNESS neighbourhood enrichment ==="
+            "=== Stage 9/14: lochNESS neighbourhood enrichment ==="
         )
 
         lochness = (
@@ -1772,11 +1800,265 @@ def run_pipeline(
         )
 
     # =====================================================================
-    # Stage 10: write outputs
+    # Stage 10: perturbation distance vs control
+    # =====================================================================
+
+    distance_results = None
+
+    if cfg.distance.enabled:
+
+        logger.info(
+            "=== Stage 10/14: perturbation distance vs control ==="
+        )
+
+        distance_results = (
+            dist_mod.compute_perturbation_distance(
+                expr,
+                cfg,
+            )
+        )
+
+        if (
+            distance_results is not None
+            and not distance_results.table.empty
+        ):
+
+            _write_table(
+                "perturbation_distance",
+                distance_results.table,
+                tabledir,
+                table_paths,
+            )
+
+            tables[
+                "perturbation_distance"
+            ] = (
+                distance_results.table
+            )
+
+            if (
+                not distance_results
+                .skipped
+                .empty
+            ):
+
+                _write_table(
+                    "distance_skipped",
+                    distance_results.skipped,
+                    tabledir,
+                    table_paths,
+                )
+
+                _table_for_report(
+                    tables,
+                    "distance_skipped",
+                    distance_results.skipped,
+                    large_mode=large_mode,
+                    max_rows_large=cfg.scaling.report_preview_rows,
+                )
+
+            _collect(
+                "perturbation distance",
+                cfg=cfg,
+                large_mode=large_mode,
+            )
+
+        elif (
+            distance_results is not None
+            and distance_results.note
+        ):
+
+            warnings.append(
+                distance_results.note
+            )
+
+    else:
+
+        logger.info(
+            "Perturbation distance disabled "
+            "(distance.enabled: false)"
+        )
+
+    # =====================================================================
+    # Stage 11: perturbation distance space
+    # =====================================================================
+
+    dist_space_results = None
+
+    if cfg.distance_space.enabled:
+
+        logger.info(
+            "=== Stage 11/14: perturbation distance space ==="
+        )
+
+        dist_space_results = (
+            dist_mod.compute_distance_space(
+                expr,
+                cfg,
+            )
+        )
+
+        if (
+            dist_space_results is not None
+            and not dist_space_results.distance_matrix.empty
+        ):
+
+            # Distance matrix saved outside H5AD as TSV
+            mat_path = (
+                tabledir
+                / "perturbation_distance_matrix.tsv"
+            )
+            dist_space_results.distance_matrix.to_csv(
+                mat_path,
+                sep="\t",
+            )
+            table_paths[
+                "perturbation_distance_matrix"
+            ] = mat_path
+
+            _write_table(
+                "perturbation_space_coordinates",
+                dist_space_results.coordinates,
+                tabledir,
+                table_paths,
+            )
+            tables[
+                "perturbation_space_coordinates"
+            ] = (
+                dist_space_results.coordinates
+            )
+
+            _write_table(
+                "perturbation_neighbors",
+                dist_space_results.neighbors,
+                tabledir,
+                table_paths,
+            )
+            tables[
+                "perturbation_neighbors"
+            ] = (
+                dist_space_results.neighbors
+            )
+
+            _write_table(
+                "phenotype_modules",
+                dist_space_results.phenotype_modules,
+                tabledir,
+                table_paths,
+            )
+            tables[
+                "phenotype_modules"
+            ] = (
+                dist_space_results.phenotype_modules
+            )
+
+            if (
+                not dist_space_results
+                .skipped
+                .empty
+            ):
+
+                _write_table(
+                    "distance_space_skipped",
+                    dist_space_results.skipped,
+                    tabledir,
+                    table_paths,
+                )
+
+                _table_for_report(
+                    tables,
+                    "distance_space_skipped",
+                    dist_space_results.skipped,
+                    large_mode=large_mode,
+                    max_rows_large=cfg.scaling.report_preview_rows,
+                )
+
+            _collect(
+                "distance space",
+                cfg=cfg,
+                large_mode=large_mode,
+            )
+
+        elif (
+            dist_space_results is not None
+            and dist_space_results.note
+        ):
+
+            warnings.append(
+                dist_space_results.note
+            )
+
+    else:
+
+        logger.info(
+            "Perturbation distance space disabled "
+            "(distance_space.enabled: false)"
+        )
+
+    # =====================================================================
+    # Stage 12: master perturbation meta table & plots
+    # =====================================================================
+
+    meta_table = None
+
+    if cfg.meta_analysis.enabled:
+
+        logger.info(
+            "=== Stage 12/14: master perturbation meta table ==="
+        )
+
+        meta_table = (
+            meta_mod.build_perturbation_meta(
+                cfg=cfg,
+                perturbation_table=results.table if results is not None else None,
+                ps_summary=ps_results.summary if ps_results is not None else None,
+                lochness_summary=lochness.summary if lochness is not None else None,
+                distance_table=distance_results.table if distance_results is not None else None,
+                cofunctional_modules=modules_result.modules if modules_result is not None else None,
+                phenotype_modules=dist_space_results.phenotype_modules if dist_space_results is not None else None,
+                primary_control=results.primary_control if results is not None else "ntc",
+            )
+        )
+
+        if not meta_table.empty:
+
+            _write_table(
+                "perturbation_meta",
+                meta_table,
+                tabledir,
+                table_paths,
+            )
+            tables[
+                "perturbation_meta"
+            ] = meta_table
+
+    # Generate distance and distance space plots
+    plots_mod.plot_distance_figures(
+        distance_results,
+        meta_table,
+        registry,
+        cfg,
+    )
+
+    plots_mod.plot_distance_space_figures(
+        dist_space_results,
+        meta_table,
+        registry,
+        cfg,
+    )
+
+    _collect(
+        "distance plots",
+        cfg=cfg,
+        large_mode=large_mode,
+    )
+
+    # =====================================================================
+    # Stage 13: write outputs
     # =====================================================================
 
     logger.info(
-        "=== Stage 10/11: writing outputs ==="
+        "=== Stage 13/14: writing outputs ==="
     )
 
     manifest = (
@@ -1924,11 +2206,11 @@ def run_pipeline(
     )
 
     # =====================================================================
-    # Stage 11: report
+    # Stage 14: report
     # =====================================================================
 
     logger.info(
-        "=== Stage 11/11: building report ==="
+        "=== Stage 14/14: building report ==="
     )
 
     n_hits = (
@@ -2048,6 +2330,9 @@ def run_pipeline(
         modules=modules_result,
         ps=ps_results,
         lochness=lochness,
+        distance=distance_results,
+        distance_space=dist_space_results,
+        meta_table=meta_table,
         tables=tables,
         warnings=warnings,
         summary_cards=summary_cards,
@@ -2105,6 +2390,13 @@ def run_pipeline(
         n_cells_input,
     )
 
+    # Save compute performance profile table
+    profile_df = profiler.to_dataframe()
+    profile_path = tabledir / "compute_profile.csv"
+    profiler.save_csv(profile_path)
+    table_paths["compute_profile"] = profile_path
+    tables["compute_profile"] = profile_df
+
     result = PipelineResult(
         outdir=outdir,
         report=report_path,
@@ -2123,6 +2415,10 @@ def run_pipeline(
         runtime_seconds=runtime,
         adata=expr,
         perturbation_table=results.table,
+        distance_table=distance_results.table if distance_results is not None else None,
+        distance_space_results=dist_space_results,
+        meta_table=meta_table,
+        compute_profile=profile_df if not profile_df.empty else None,
         execution_mode=execution_mode,
     )
 

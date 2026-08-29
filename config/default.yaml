@@ -149,6 +149,39 @@ lochness:
   enrichment_cut: 0.5
   noise_delta: 0.0
   top_n_report: 12
+distance:
+  enabled: true
+  representation: X_pca
+  primary_metric: edistance
+  secondary_metric: mmd
+  min_cells: 30
+  max_cells_per_target: 2000
+  max_control_cells: 5000
+  n_permutations: 1000
+  random_seed: 123
+  fdr_threshold: 0.05
+  stratify_by: null
+distance_space:
+  enabled: true
+  metric: edistance
+  representation: X_pca
+  n_components: 10
+  nearest_neighbors: 10
+  clustering: true
+  n_modules: null
+  cluster_distance_threshold: null
+  linkage_method: average
+  min_cells: 30
+  max_cells_per_target: 2000
+  random_seed: 123
+meta_analysis:
+  enabled: true
+visualization:
+  perturbation_atlas: true
+  ps_distance_map: true
+  perturbation_space: true
+  module_concordance: true
+  atlas_top_n: 50
 report:
   title: Perturb-seq analysis report
   embed_figures: true
@@ -187,3 +220,19 @@ scaling:
   collect_between_stages: true
   log_memory: true
   report_preview_rows: 500
+compute:
+  backend: auto
+  n_jobs: 16
+  gpu_device: 0
+  gpu_min_cells: 200000
+  gpu_min_dense_elements: 50000000
+  gpu_memory_fraction: 0.80
+  cpu_parallel_backend: loky
+  blas_threads_per_worker: 1
+  distance_n_jobs: null
+  perturbation_n_jobs: null
+  enrichment_n_jobs: null
+  modules_n_jobs: null
+  lochness_n_jobs: null
+  log_backend_decisions: true
+

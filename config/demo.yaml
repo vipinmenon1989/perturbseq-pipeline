@@ -103,3 +103,15 @@ output:
   # On Colab this is the shared Drive folder; set to null to keep them local.
   large_file_dir: "/content/drive/MyDrive/Colab Notebooks/scGPT/pancreatic/data/TF-PerturbSeq/small_scale/pipeline"
   large_file_threshold_mb: 50.0
+
+compute:
+  backend: auto
+  n_jobs: 16
+  gpu_device: 0
+  gpu_min_cells: 200000
+  gpu_min_dense_elements: 50000000
+  gpu_memory_fraction: 0.80
+  cpu_parallel_backend: loky
+  blas_threads_per_worker: 1
+  log_backend_decisions: true
+

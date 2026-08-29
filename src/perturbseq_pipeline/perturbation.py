@@ -64,6 +64,12 @@ from scipy import sparse
 from scipy.stats import ks_2samp, mannwhitneyu
 
 from .cluster import LOGNORM_LAYER
+from .compute import (
+    derive_seed,
+    log_compute_decision,
+    resolve_stage_backend,
+    run_parallel,
+)
 from .config import Config
 from .guides import (
     CLASS_NTC,
@@ -663,168 +669,86 @@ def _test_all_targets_standard(
         cfg,
     )
 
-    measured = set(
-        expr.var_names
-    )
+    decision = resolve_stage_backend("perturbation", cfg, n_cells=expr.n_obs)
+    if cfg.compute.log_backend_decisions:
+        log_compute_decision(decision)
 
-    rows: List[dict] = []
-    skipped: List[dict] = []
+    measured = set(expr.var_names)
+    layer = _expression_layer(expr)
+    var_dict = {g: i for i, g in enumerate(expr.var_names)}
 
-    for gene in all_targets:
-
-        pert_mask = (
-            (targets_col == gene)
-            & (
-                klass
-                == CLASS_TARGETING
-            )
-        )
-
-        n_pert = int(
-            pert_mask.sum()
-        )
+    def _eval_target_std(gene: str) -> Tuple[Optional[dict], Optional[dict]]:
+        pert_mask = (targets_col == gene) & (klass == CLASS_TARGETING)
+        n_pert = int(pert_mask.sum())
 
         if gene not in measured:
+            return None, {
+                "target_gene": gene,
+                "n_perturbed": n_pert,
+                "reason": "target gene not present in the expression matrix",
+            }
 
-            skipped.append(
-                {
-                    "target_gene": gene,
-                    "n_perturbed": n_pert,
-                    "reason": (
-                        "target gene not present "
-                        "in the expression matrix"
-                    ),
-                }
-            )
+        if n_pert < pcfg.min_cells_per_target:
+            return None, {
+                "target_gene": gene,
+                "n_perturbed": n_pert,
+                "reason": f"fewer than {pcfg.min_cells_per_target} perturbed cells",
+            }
 
-            continue
+        gene_idx = var_dict[gene]
+        col = layer[:, gene_idx]
+        if sparse.issparse(col):
+            col = col.toarray()
+        values = np.asarray(col).ravel().astype(np.float64)
 
-        if (
-            n_pert
-            < pcfg.min_cells_per_target
-        ):
-
-            skipped.append(
-                {
-                    "target_gene": gene,
-                    "n_perturbed": n_pert,
-                    "reason": (
-                        f"fewer than "
-                        f"{pcfg.min_cells_per_target} "
-                        "perturbed cells"
-                    ),
-                }
-            )
-
-            continue
-
-        values = _gene_vector(
-            expr,
-            gene,
-        )
-
-        primary_mask = (
-            _control_mask_for_target(
-                primary,
-                base,
-                targets_col,
-                gene,
-            )
-        )
-
+        primary_mask = _control_mask_for_target(primary, base, targets_col, gene)
         pct_expressing = (
-            float(
-                100
-                * np.mean(
-                    values[
-                        primary_mask
-                    ]
-                    > 0
-                )
-            )
+            float(100 * np.mean(values[primary_mask] > 0))
             if primary_mask.any()
             else 0.0
         )
 
-        if (
-            pct_expressing
-            < pcfg.min_pct_expressing_control
-        ):
+        if pct_expressing < pcfg.min_pct_expressing_control:
+            return None, {
+                "target_gene": gene,
+                "n_perturbed": n_pert,
+                "reason": (
+                    "not detectably expressed in control cells "
+                    f"({pct_expressing:.2f}% of controls, threshold "
+                    f"{pcfg.min_pct_expressing_control}%)"
+                ),
+            }
 
-            skipped.append(
-                {
-                    "target_gene": gene,
-                    "n_perturbed": n_pert,
-                    "reason": (
-                        "not detectably expressed in control cells "
-                        f"({pct_expressing:.2f}% of controls, "
-                        "threshold "
-                        f"{pcfg.min_pct_expressing_control}%)"
-                    ),
-                }
-            )
-
-            continue
-
-        row: Dict[
-            str,
-            object,
-        ] = {
+        row: Dict[str, object] = {
             "target_gene": gene,
             "n_perturbed": n_pert,
         }
 
         for control in controls_used:
+            cmask = _control_mask_for_target(control, base, targets_col, gene)
+            n_ctrl = int(cmask.sum())
+            row[f"n_control_{control}"] = n_ctrl
 
-            cmask = (
-                _control_mask_for_target(
-                    control,
-                    base,
-                    targets_col,
-                    gene,
-                )
-            )
-
-            n_ctrl = int(
-                cmask.sum()
-            )
-
-            row[
-                f"n_control_{control}"
-            ] = n_ctrl
-
-            if (
-                n_ctrl
-                < pcfg.min_control_cells
-            ):
-
-                _fill_missing_stats(
-                    row,
-                    control,
-                )
-
+            if n_ctrl < pcfg.min_control_cells:
+                _fill_missing_stats(row, control)
                 continue
 
-            stats = compare_groups(
-                values[
-                    pert_mask
-                ],
-                values[
-                    cmask
-                ],
-            )
+            stats = compare_groups(values[pert_mask], values[cmask])
+            for key, val in stats.items():
+                row[f"{key}_{control}"] = val
 
-            for key, val in (
-                stats.items()
-            ):
+        return row, None
 
-                row[
-                    f"{key}_{control}"
-                ] = val
+    results = run_parallel(
+        _eval_target_std,
+        all_targets,
+        n_jobs=decision.n_jobs,
+        blas_threads=cfg.compute.blas_threads_per_worker,
+        backend=cfg.compute.cpu_parallel_backend,
+    )
 
-        rows.append(
-            row
-        )
+    rows = [r for r, s in results if r is not None]
+    skipped = [s for r, s in results if s is not None]
 
     return _finalize_results(
         rows=rows,
@@ -1008,243 +932,100 @@ def _test_all_targets_large(
         len(targeting_indices),
     )
 
-    rows: List[dict] = []
-    skipped: List[dict] = []
+    decision = resolve_stage_backend("perturbation", cfg, n_cells=expr.n_obs)
+    if cfg.compute.log_backend_decisions:
+        log_compute_decision(decision)
 
-    for target_number, gene in enumerate(
-        all_targets,
-        start=1,
-    ):
-
-        pert_indices = (
-            target_indices.get(
-                gene,
-                np.empty(
-                    0,
-                    dtype=np.int64,
-                ),
-            )
+    def _eval_target_large(gene: str) -> Tuple[Optional[dict], Optional[dict]]:
+        pert_indices = target_indices.get(
+            gene,
+            np.empty(0, dtype=np.int64),
         )
-
-        n_pert = int(
-            pert_indices.size
-        )
-
-        # ---------------------------------------------------------------
-        # Testability
-        # ---------------------------------------------------------------
+        n_pert = int(pert_indices.size)
 
         if gene not in measured_index:
+            return None, {
+                "target_gene": gene,
+                "n_perturbed": n_pert,
+                "reason": "target gene not present in the expression matrix",
+            }
 
-            skipped.append(
-                {
-                    "target_gene": gene,
-                    "n_perturbed": n_pert,
-                    "reason": (
-                        "target gene not present "
-                        "in the expression matrix"
-                    ),
-                }
-            )
+        if n_pert < pcfg.min_cells_per_target:
+            return None, {
+                "target_gene": gene,
+                "n_perturbed": n_pert,
+                "reason": f"fewer than {pcfg.min_cells_per_target} perturbed cells",
+            }
 
-            continue
-
-        if (
-            n_pert
-            < pcfg.min_cells_per_target
-        ):
-
-            skipped.append(
-                {
-                    "target_gene": gene,
-                    "n_perturbed": n_pert,
-                    "reason": (
-                        f"fewer than "
-                        f"{pcfg.min_cells_per_target} "
-                        "perturbed cells"
-                    ),
-                }
-            )
-
-            continue
-
-        gene_index = measured_index[
-            gene
-        ]
-
-        perturbed_values = (
-            _gene_values_at_indices(
-                expr,
-                gene_index,
-                pert_indices,
-            )
+        gene_index = measured_index[gene]
+        perturbed_values = _gene_values_at_indices(
+            expr,
+            gene_index,
+            pert_indices,
         )
-
-        # ---------------------------------------------------------------
-        # Construct selected primary-control values first for the expression
-        # guard.
-        # ---------------------------------------------------------------
 
         if primary == CONTROL_NTC:
-
-            primary_indices = (
-                ntc_test_indices
-            )
-
+            primary_indices = ntc_test_indices
         else:
+            primary_indices = other_reference_indices[
+                other_reference_targets != gene
+            ]
 
-            primary_indices = (
-                other_reference_indices[
-                    other_reference_targets
-                    != gene
-                ]
-            )
+        if primary_indices.size < pcfg.min_control_cells:
+            return None, {
+                "target_gene": gene,
+                "n_perturbed": n_pert,
+                "reason": "insufficient primary-control cells after large-data reference sampling",
+            }
 
-        if (
-            primary_indices.size
-            < pcfg.min_control_cells
-        ):
-
-            skipped.append(
-                {
-                    "target_gene": gene,
-                    "n_perturbed": n_pert,
-                    "reason": (
-                        "insufficient primary-control cells "
-                        "after large-data reference sampling"
-                    ),
-                }
-            )
-
-            continue
-
-        primary_values = (
-            _gene_values_at_indices(
-                expr,
-                gene_index,
-                primary_indices,
-            )
+        primary_values = _gene_values_at_indices(
+            expr,
+            gene_index,
+            primary_indices,
         )
 
-        pct_expressing = float(
-            100
-            * np.mean(
-                primary_values > 0
-            )
-        )
+        pct_expressing = float(100 * np.mean(primary_values > 0))
 
-        if (
-            pct_expressing
-            < pcfg.min_pct_expressing_control
-        ):
+        if pct_expressing < pcfg.min_pct_expressing_control:
+            return None, {
+                "target_gene": gene,
+                "n_perturbed": n_pert,
+                "reason": (
+                    "not detectably expressed in sampled control cells "
+                    f"({pct_expressing:.2f}% of controls, threshold "
+                    f"{pcfg.min_pct_expressing_control}%)"
+                ),
+            }
 
-            skipped.append(
-                {
-                    "target_gene": gene,
-                    "n_perturbed": n_pert,
-                    "reason": (
-                        "not detectably expressed in sampled control cells "
-                        f"({pct_expressing:.2f}% of controls, threshold "
-                        f"{pcfg.min_pct_expressing_control}%)"
-                    ),
-                }
-            )
-
-            continue
-
-        row: Dict[
-            str,
-            object,
-        ] = {
+        row: Dict[str, object] = {
             "target_gene": gene,
             "n_perturbed": n_pert,
         }
 
-        # ---------------------------------------------------------------
-        # Control comparisons
-        # ---------------------------------------------------------------
-
         for control in controls_used:
-
             if control == CONTROL_NTC:
-
-                ctrl_indices = (
-                    ntc_test_indices
-                )
-
-                # Record full biological control population as well as sampled
-                # test population.
-                n_ctrl_full = int(
-                    ntc_indices.size
-                )
-
+                ctrl_indices = ntc_test_indices
+                n_ctrl_full = int(ntc_indices.size)
             else:
+                keep = other_reference_targets != gene
+                ctrl_indices = other_reference_indices[keep]
+                n_ctrl_full = int(targeting_indices.size - n_pert)
 
-                keep = (
-                    other_reference_targets
-                    != gene
-                )
+            n_ctrl_test = int(ctrl_indices.size)
+            row[f"n_control_{control}"] = n_ctrl_full
+            row[f"n_control_tested_{control}"] = n_ctrl_test
 
-                ctrl_indices = (
-                    other_reference_indices[
-                        keep
-                    ]
-                )
-
-                # True number of other-target cells.
-                n_ctrl_full = int(
-                    targeting_indices.size
-                    - n_pert
-                )
-
-            n_ctrl_test = int(
-                ctrl_indices.size
-            )
-
-            row[
-                f"n_control_{control}"
-            ] = (
-                n_ctrl_full
-            )
-
-            row[
-                f"n_control_tested_{control}"
-            ] = (
-                n_ctrl_test
-            )
-
-            if (
-                n_ctrl_test
-                < pcfg.min_control_cells
-            ):
-
-                _fill_missing_stats(
-                    row,
-                    control,
-                )
-
+            if n_ctrl_test < pcfg.min_control_cells:
+                _fill_missing_stats(row, control)
                 continue
 
-            if (
-                control == primary
-                and np.array_equal(
-                    ctrl_indices,
-                    primary_indices,
-                )
-            ):
-
-                control_values = (
-                    primary_values
-                )
-
+            if control == primary and np.array_equal(ctrl_indices, primary_indices):
+                control_values = primary_values
             else:
-
-                control_values = (
-                    _gene_values_at_indices(
-                        expr,
-                        gene_index,
-                        ctrl_indices,
-                    )
+                control_values = _gene_values_at_indices(
+                    expr,
+                    gene_index,
+                    ctrl_indices,
                 )
 
             stats = compare_groups(
@@ -1252,29 +1033,21 @@ def _test_all_targets_large(
                 control_values,
             )
 
-            for key, val in (
-                stats.items()
-            ):
+            for key, val in stats.items():
+                row[f"{key}_{control}"] = val
 
-                row[
-                    f"{key}_{control}"
-                ] = val
+        return row, None
 
-        rows.append(
-            row
-        )
+    results = run_parallel(
+        _eval_target_large,
+        all_targets,
+        n_jobs=decision.n_jobs,
+        blas_threads=cfg.compute.blas_threads_per_worker,
+        backend=cfg.compute.cpu_parallel_backend,
+    )
 
-        if (
-            target_number
-            % 500 == 0
-        ):
-
-            logger.info(
-                "Large-data perturbation-strength progress: "
-                "%d / %d targets",
-                target_number,
-                len(all_targets),
-            )
+    rows = [r for r, s in results if r is not None]
+    skipped = [s for r, s in results if s is not None]
 
     return _finalize_results(
         rows=rows,

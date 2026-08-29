@@ -1,0 +1,6 @@
+metric,value
+Cells after QC,600
+Cells with a targeting guide,300 (50.0%)
+Cells with a non-targeting guide,300 (50.0%)
+Ambiguous (no dominant guide),0 (0.0%)
+Unassigned (no guide counts),0 (0.0%)

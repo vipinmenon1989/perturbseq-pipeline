@@ -1,0 +1,4 @@
+lane_id,targeting,non-targeting,n_cells,pct_targeting,pct_non-targeting
+B_1,100,100,200,50.0,50.0
+B_2,100,100,200,50.0,50.0
+B_3,100,100,200,50.0,50.0

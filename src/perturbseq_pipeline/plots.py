@@ -92,6 +92,8 @@ SECTION_PS_LDA = "ps_score/lda"
 SECTION_LOCHNESS = "lochness"
 SECTION_LOCHNESS_PER_TARGET = "lochness/per_target"
 SECTION_MODULES = "modules"
+SECTION_DISTANCE = "distance"
+SECTION_DISTANCE_SPACE = "distance_space"
 
 
 _CLASS_COLORS = {
@@ -8254,3 +8256,504 @@ def plot_modules(
         results.n_modules,
         results.n_programs,
     )
+
+
+# ---------------------------------------------------------------------------
+# Perturbation Distance & Phenotype Space Plots
+# ---------------------------------------------------------------------------
+
+
+def _significance_stars(fdr: float) -> str:
+    """Format FDR significance stars for heatmap annotations."""
+    if pd.isna(fdr):
+        return ""
+    if fdr < 0.001:
+        return "***"
+    if fdr < 0.01:
+        return "**"
+    if fdr < 0.05:
+        return "*"
+    return ""
+
+
+def plot_perturbation_atlas(
+    meta_table: pd.DataFrame,
+    reg: FigureRegistry,
+    cfg: Config,
+) -> None:
+    """Perturbation Atlas: Multi-dimensional heatmap of efficacy, penetrance, topology, and phenotype magnitude.
+
+    Rows: Targets (sorted by Energy distance)
+    Columns:
+      1. Efficacy (KD Strength = -target_log2fc)
+      2. Penetrance (PS Median / Responder Fraction)
+      3. Topology (lochNESS mean)
+      4. Phenotype Magnitude (Energy Distance)
+    Columns are Z-scored for visualization; significance stars indicate FDR.
+    Side annotations show co-functional and phenotype module memberships.
+    """
+    if meta_table is None or meta_table.empty:
+        return
+
+    df = meta_table.copy()
+    if "target_gene" not in df.columns:
+        return
+
+    # Select top targets by energy distance (or another available metric)
+    sort_col = "energy_distance" if "energy_distance" in df.columns and df["energy_distance"].notna().any() else (
+        "ps_median" if "ps_median" in df.columns else "target_gene"
+    )
+    df = df.sort_values(sort_col, ascending=(sort_col == "target_gene")).reset_index(drop=True)
+
+    max_n = getattr(cfg.visualization, "atlas_top_n", 50)
+    if len(df) > max_n:
+        df = df.iloc[:max_n].copy()
+
+    # Identify candidate heatmap feature columns
+    col_specs = [
+        ("target_log2fc", "Efficacy\n(KD Strength)", True, "target_fdr"),
+        ("ps_median", "Penetrance\n(PS Median)", False, None),
+        ("lochness_mean", "Topology\n(lochNESS)", False, None),
+        ("energy_distance", "Phenotype\n(Energy Dist)", False, "distance_fdr"),
+    ]
+
+    active_cols = []
+    col_labels = []
+    fdr_cols = []
+    matrix_data = []
+
+    for col_name, label, invert, fdr_col in col_specs:
+        if col_name in df.columns and df[col_name].notna().any():
+            vals = df[col_name].to_numpy(dtype=float, na_value=np.nan)
+            if invert:
+                # Invert KD so higher = stronger depletion
+                vals = -vals
+            active_cols.append(col_name)
+            col_labels.append(label)
+            fdr_cols.append(fdr_col if fdr_col in df.columns else None)
+            matrix_data.append(vals)
+
+    if len(active_cols) < 2:
+        return
+
+    M = np.column_stack(matrix_data)
+    # Column-wise Z-scoring
+    M_z = np.zeros_like(M)
+    for j in range(M.shape[1]):
+        col_vals = M[:, j]
+        valid = ~np.isnan(col_vals)
+        if valid.sum() > 1:
+            mean = np.mean(col_vals[valid])
+            std = np.std(col_vals[valid])
+            std = std if std > 1e-8 else 1.0
+            M_z[valid, j] = (col_vals[valid] - mean) / std
+        else:
+            M_z[:, j] = 0.0
+
+    targets = df["target_gene"].tolist()
+    n_targets = len(targets)
+
+    # Side annotations
+    has_cofunc = "cofunctional_module" in df.columns and df["cofunctional_module"].notna().any()
+    has_pheno = "phenotype_module" in df.columns and df["phenotype_module"].notna().any()
+
+    n_side = int(has_cofunc) + int(has_pheno)
+    fig_height = max(6.0, 0.28 * n_targets + 2.0)
+    fig_width = 8.0 + (1.2 * n_side)
+
+    fig = plt.figure(figsize=(fig_width, fig_height))
+    gs = fig.add_gridspec(1, 1 + n_side + 1, width_ratios=[0.4] * n_side + [4.0, 0.2], wspace=0.15)
+
+    col_idx = 0
+    # 1. Co-functional module annotation
+    if has_cofunc:
+        ax_co = fig.add_subplot(gs[0, col_idx])
+        col_idx += 1
+        modules = df["cofunctional_module"].fillna("None").astype(str).tolist()
+        unique_m = sorted(set(modules))
+        cmap_co = plt.cm.tab20(np.linspace(0, 1, len(unique_m)))
+        m_map = {m: cmap_co[i] for i, m in enumerate(unique_m)}
+        colors_co = np.array([m_map[m] for m in modules])[:, :3]
+        ax_co.imshow(colors_co[:, None, :], aspect="auto", interpolation="nearest")
+        ax_co.set_xticks([0])
+        ax_co.set_xticklabels(["Co-func\nModule"], rotation=90, fontsize=8)
+        ax_co.set_yticks([])
+        for spine in ax_co.spines.values():
+            spine.set_visible(False)
+
+    # 2. Phenotype module annotation
+    if has_pheno:
+        ax_ph = fig.add_subplot(gs[0, col_idx])
+        col_idx += 1
+        pmodules = df["phenotype_module"].fillna("None").astype(str).tolist()
+        unique_pm = sorted(set(pmodules))
+        cmap_ph = plt.cm.Set2(np.linspace(0, 1, max(len(unique_pm), 1)))
+        pm_map = {m: cmap_ph[i % len(cmap_ph)] for i, m in enumerate(unique_pm)}
+        colors_ph = np.array([pm_map[m] for m in pmodules])[:, :3]
+        ax_ph.imshow(colors_ph[:, None, :], aspect="auto", interpolation="nearest")
+        ax_ph.set_xticks([0])
+        ax_ph.set_xticklabels(["Pheno\nModule"], rotation=90, fontsize=8)
+        ax_ph.set_yticks([])
+        for spine in ax_ph.spines.values():
+            spine.set_visible(False)
+
+    # 3. Main heatmap
+    ax_main = fig.add_subplot(gs[0, col_idx])
+    cbar_ax = fig.add_subplot(gs[0, col_idx + 1])
+
+    vmax = max(2.5, float(np.nanmax(np.abs(M_z))))
+    im = ax_main.imshow(M_z, aspect="auto", cmap="vlag", vmin=-vmax, vmax=vmax, interpolation="nearest")
+    fig.colorbar(im, cax=cbar_ax, label="Column Z-score")
+
+    ax_main.set_xticks(range(len(col_labels)))
+    ax_main.set_xticklabels(col_labels, rotation=0, fontsize=9, fontweight="bold")
+    ax_main.set_yticks(range(n_targets))
+    ax_main.set_yticklabels(targets, fontsize=8)
+
+    # Significance stars overlay
+    for i in range(n_targets):
+        for j in range(len(active_cols)):
+            f_col = fdr_cols[j]
+            if f_col and f_col in df.columns:
+                f_val = df.iloc[i][f_col]
+                stars = _significance_stars(f_val)
+                if stars:
+                    text_color = "black" if abs(M_z[i, j]) < 1.2 else "white"
+                    ax_main.text(j, i, stars, ha="center", va="center", color=text_color, fontsize=9, fontweight="bold")
+
+    ax_main.set_title("Perturbation Atlas", fontsize=12, fontweight="bold", pad=12)
+
+    reg.save(
+        fig,
+        "perturbation_atlas",
+        SECTION_DISTANCE,
+        "Perturbation Atlas",
+        "Multi-dimensional overview of perturbation efficacy, penetrance (PS score), "
+        "manifold topology (lochNESS), and phenotype magnitude (Energy distance). "
+        "Columns are Z-scored for visual comparison; asterisks indicate statistical significance (* FDR < 0.05, ** FDR < 0.01, *** FDR < 0.001).",
+    )
+
+
+def plot_ps_vs_distance(
+    meta_table: pd.DataFrame,
+    reg: FigureRegistry,
+    cfg: Config,
+) -> None:
+    """PS × Perturbation Distance map: penetrance vs phenotype distance."""
+    if meta_table is None or meta_table.empty:
+        return
+
+    df = meta_table.copy()
+    if "energy_distance" not in df.columns:
+        return
+
+    y_col = "ps_median" if "ps_median" in df.columns else (
+        "ps_responder_fraction" if "ps_responder_fraction" in df.columns else None
+    )
+    if y_col is None:
+        return
+
+    valid_mask = df["energy_distance"].notna() & df[y_col].notna()
+    if valid_mask.sum() < 3:
+        return
+
+    sub = df[valid_mask].copy()
+
+    fig, ax = plt.subplots(figsize=(8.0, 6.0))
+
+    # Point size by lochNESS
+    if "lochness_mean" in sub.columns and sub["lochness_mean"].notna().any():
+        l_vals = sub["lochness_mean"].fillna(0).to_numpy(dtype=float)
+        l_min, l_max = np.min(l_vals), np.max(l_vals)
+        norm_l = (l_vals - l_min) / (l_max - l_min + 1e-6)
+        sizes = 40.0 + 160.0 * norm_l
+    else:
+        sizes = np.full(len(sub), 60.0)
+
+    # Color by phenotype or cofunctional module
+    color_col = "phenotype_module" if "phenotype_module" in sub.columns and sub["phenotype_module"].notna().any() else (
+        "cofunctional_module" if "cofunctional_module" in sub.columns and sub["cofunctional_module"].notna().any() else None
+    )
+
+    if color_col:
+        cats = sub[color_col].fillna("None").astype(str)
+        unique_cats = sorted(set(cats))
+        palette = sns.color_palette("tab10", n_colors=len(unique_cats))
+        color_map = {c: palette[i % len(palette)] for i, c in enumerate(unique_cats)}
+        point_colors = [color_map[c] for c in cats]
+    else:
+        point_colors = "#2b6cb0"
+
+    # Significance styling
+    sig_col = "distance_significant" if "distance_significant" in sub.columns else (
+        "distance_fdr" if "distance_fdr" in sub.columns else None
+    )
+    if sig_col == "distance_significant":
+        is_sig = sub[sig_col].fillna(False).to_numpy(dtype=bool)
+    elif sig_col == "distance_fdr":
+        is_sig = (sub[sig_col].fillna(1.0) < cfg.distance.fdr_threshold).to_numpy(dtype=bool)
+    else:
+        is_sig = np.ones(len(sub), dtype=bool)
+
+    # Scatter points
+    ax.scatter(
+        sub.loc[is_sig, "energy_distance"],
+        sub.loc[is_sig, y_col],
+        s=sizes[is_sig],
+        c=[point_colors[i] for i in np.where(is_sig)[0]] if isinstance(point_colors, list) else point_colors,
+        alpha=0.85,
+        edgecolors="#1a202c",
+        linewidths=1.2,
+        label=f"Significant (FDR < {cfg.distance.fdr_threshold})",
+    )
+
+    if (~is_sig).sum() > 0:
+        ax.scatter(
+            sub.loc[~is_sig, "energy_distance"],
+            sub.loc[~is_sig, y_col],
+            s=sizes[~is_sig] * 0.7,
+            c=[point_colors[i] for i in np.where(~is_sig)[0]] if isinstance(point_colors, list) else point_colors,
+            alpha=0.35,
+            edgecolors="gray",
+            linewidths=0.8,
+            label="Not significant",
+        )
+
+    # Annotate top targets by distance
+    top_dist = sub.nlargest(min(12, len(sub)), "energy_distance")
+    for _, row in top_dist.iterrows():
+        ax.annotate(
+            str(row["target_gene"]),
+            (row["energy_distance"], row[y_col]),
+            xytext=(5, 5),
+            textcoords="offset points",
+            fontsize=8,
+            fontweight="bold",
+            alpha=0.9,
+        )
+
+    ax.set_xlabel("Phenotype Magnitude (Energy Distance from Control)", fontsize=10, fontweight="bold")
+    ax.set_ylabel(f"Penetrance ({y_col.replace('_', ' ').title()})", fontsize=10, fontweight="bold")
+    ax.set_title("Perturbation Penetrance vs Phenotype Distance Map", fontsize=11, fontweight="bold")
+
+    if color_col and isinstance(point_colors, list) and len(unique_cats) <= 10:
+        handles = [
+            plt.Line2D([0], [0], marker="o", color="w", markerfacecolor=color_map[c], markersize=8, label=c)
+            for c in unique_cats
+        ]
+        ax.legend(handles=handles, title=color_col.replace("_", " ").title(), loc="best", fontsize=8)
+
+    sns.despine(ax=ax)
+    reg.save(
+        fig,
+        "ps_vs_distance_map",
+        SECTION_DISTANCE,
+        "PS vs Perturbation Distance Map",
+        "Single-cell perturbation penetrance (PS score) plotted against global phenotype magnitude (Energy distance). "
+        "Point size reflects continuous manifold enrichment (lochNESS).",
+    )
+
+
+def plot_perturbation_space(
+    dist_space_res,
+    meta_table: Optional[pd.DataFrame],
+    reg: FigureRegistry,
+    cfg: Config,
+) -> None:
+    """Perturbation Phenotype Space: PCoA projections of pairwise distance manifold."""
+    if dist_space_res is None or dist_space_res.coordinates.empty:
+        return
+
+    coords = dist_space_res.coordinates.copy()
+    if "PCoA1" not in coords.columns or "PCoA2" not in coords.columns:
+        return
+
+    if meta_table is not None and not meta_table.empty:
+        coords = pd.merge(coords, meta_table, on="target_gene", how="left")
+
+    fig, axes = plt.subplots(1, 2, figsize=(13.0, 5.5))
+
+    # Panel 1: Colored by phenotype module
+    ax1 = axes[0]
+    if "phenotype_module" in coords.columns and coords["phenotype_module"].notna().any():
+        cats = coords["phenotype_module"].fillna("None").astype(str)
+        unique_cats = sorted(set(cats))
+        palette = sns.color_palette("tab10", n_colors=len(unique_cats))
+        c_map = {c: palette[i % len(palette)] for i, c in enumerate(unique_cats)}
+        for c in unique_cats:
+            sub = coords[cats == c]
+            ax1.scatter(sub["PCoA1"], sub["PCoA2"], c=[c_map[c]], label=c, s=50, alpha=0.85, edgecolors="none")
+        if len(unique_cats) <= 12:
+            ax1.legend(title="Phenotype Module", fontsize=8, loc="best")
+    else:
+        ax1.scatter(coords["PCoA1"], coords["PCoA2"], c="#2b6cb0", s=50, alpha=0.85)
+
+    ax1.set_xlabel("PCoA 1", fontsize=10, fontweight="bold")
+    ax1.set_ylabel("PCoA 2", fontsize=10, fontweight="bold")
+    ax1.set_title("Perturbation Phenotype Space (Modules)", fontsize=11, fontweight="bold")
+    sns.despine(ax=ax1)
+
+    # Panel 2: Colored by Energy distance from control (or PS score)
+    ax2 = axes[1]
+    color_metric = "energy_distance" if "energy_distance" in coords.columns and coords["energy_distance"].notna().any() else (
+        "ps_median" if "ps_median" in coords.columns and coords["ps_median"].notna().any() else None
+    )
+
+    if color_metric:
+        c_vals = coords[color_metric].to_numpy(dtype=float)
+        sc = ax2.scatter(coords["PCoA1"], coords["PCoA2"], c=c_vals, cmap="viridis", s=50, alpha=0.85, edgecolors="none")
+        fig.colorbar(sc, ax=ax2, label=color_metric.replace("_", " ").title())
+    else:
+        ax2.scatter(coords["PCoA1"], coords["PCoA2"], c="#4a5568", s=50, alpha=0.85)
+
+    ax2.set_xlabel("PCoA 1", fontsize=10, fontweight="bold")
+    ax2.set_ylabel("PCoA 2", fontsize=10, fontweight="bold")
+    ax2.set_title(f"Phenotype Space ({color_metric.replace('_', ' ').title() if color_metric else 'PCoA'})", fontsize=11, fontweight="bold")
+    sns.despine(ax=ax2)
+
+    reg.save(
+        fig,
+        "perturbation_phenotype_space",
+        SECTION_DISTANCE_SPACE,
+        "Perturbation Phenotype Space (PCoA)",
+        "Low-dimensional projection of pairwise perturbation Energy Distances via classical Multidimensional Scaling (PCoA).",
+    )
+
+
+def plot_module_concordance(
+    meta_table: pd.DataFrame,
+    reg: FigureRegistry,
+    cfg: Config,
+) -> None:
+    """Module concordance heatmap: Co-functional modules vs Phenotype modules."""
+    if meta_table is None or meta_table.empty:
+        return
+
+    df = meta_table
+    if "cofunctional_module" not in df.columns or "phenotype_module" not in df.columns:
+        return
+
+    valid = df["cofunctional_module"].notna() & df["phenotype_module"].notna()
+    if valid.sum() < 4:
+        return
+
+    sub = df[valid]
+    co_mods = sub["cofunctional_module"].astype(str)
+    ph_mods = sub["phenotype_module"].astype(str)
+
+    if co_mods.nunique() < 2 or ph_mods.nunique() < 2:
+        return
+
+    ct = pd.crosstab(co_mods, ph_mods)
+
+    # Compute ARI/NMI if sklearn available
+    metric_str = ""
+    try:
+        from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
+        ari = adjusted_rand_score(co_mods, ph_mods)
+        nmi = normalized_mutual_info_score(co_mods, ph_mods)
+        metric_str = f" (ARI = {ari:.3f}, NMI = {nmi:.3f})"
+    except Exception:
+        pass
+
+    fig, ax = plt.subplots(figsize=(max(5.0, 0.6 * ct.shape[1] + 2.0), max(4.5, 0.5 * ct.shape[0] + 1.5)))
+    sns.heatmap(
+        ct,
+        annot=True,
+        fmt="d",
+        cmap="Blues",
+        cbar_kws={"label": "Target Count"},
+        ax=ax,
+        linewidths=0.5,
+    )
+
+    ax.set_xlabel("Phenotype Modules (Distance Space)", fontsize=10, fontweight="bold")
+    ax.set_ylabel("Co-functional Modules (Gene Programs)", fontsize=10, fontweight="bold")
+    ax.set_title(f"Module Concordance{metric_str}", fontsize=11, fontweight="bold", pad=12)
+
+    reg.save(
+        fig,
+        "module_concordance",
+        SECTION_DISTANCE_SPACE,
+        "Module Concordance Heatmap",
+        f"Cross-tabulation comparing gene-effect co-functional modules with cell-state phenotype distance modules{metric_str}.",
+    )
+
+
+def plot_distance_overview(
+    dist_res,
+    reg: FigureRegistry,
+    cfg: Config,
+) -> None:
+    """Distance overview: Ranked bar plot of Energy Distance vs Control."""
+    if dist_res is None or dist_res.table.empty:
+        return
+
+    tbl = dist_res.table.copy()
+    if "energy_distance" not in tbl.columns:
+        return
+
+    tbl = tbl.sort_values("energy_distance", ascending=False).reset_index(drop=True)
+    max_bars = min(40, len(tbl))
+    sub = tbl.iloc[:max_bars]
+
+    fig, ax = plt.subplots(figsize=(max(6.0, 0.25 * max_bars + 1.5), 4.5))
+
+    is_sig = sub["significant"] if "significant" in sub.columns else pd.Series([True] * len(sub))
+    colors = ["#dd6b20" if s else "#a0aec0" for s in is_sig]
+
+    ax.bar(range(len(sub)), sub["energy_distance"], color=colors, edgecolor="none", width=0.8)
+    ax.set_xticks(range(len(sub)))
+    ax.set_xticklabels(sub["target_gene"], rotation=90, fontsize=8)
+    ax.set_ylabel("Energy Distance vs Control", fontsize=10, fontweight="bold")
+    ax.set_title("Perturbation Distance vs Control Ranking", fontsize=11, fontweight="bold")
+
+    handles = [
+        plt.Rectangle((0, 0), 1, 1, color="#dd6b20", label=f"FDR < {cfg.distance.fdr_threshold}"),
+        plt.Rectangle((0, 0), 1, 1, color="#a0aec0", label="Not significant"),
+    ]
+    ax.legend(handles=handles, fontsize=8, loc="upper right")
+
+    sns.despine(ax=ax)
+    fig.tight_layout()
+
+    reg.save(
+        fig,
+        "perturbation_distance_ranking",
+        SECTION_DISTANCE,
+        "Perturbation Distance vs Control Ranking",
+        "Ranked Energy Distance from unperturbed control cells across perturbation targets.",
+    )
+
+
+def plot_distance_figures(
+    dist_res,
+    meta_table: Optional[pd.DataFrame],
+    reg: FigureRegistry,
+    cfg: Config,
+) -> None:
+    """Generate all figures for Perturbation Distance and Perturbation Atlas."""
+    if dist_res is not None and not dist_res.table.empty:
+        plot_distance_overview(dist_res, reg, cfg)
+
+    if meta_table is not None and not meta_table.empty:
+        if cfg.visualization.perturbation_atlas:
+            plot_perturbation_atlas(meta_table, reg, cfg)
+        if cfg.visualization.ps_distance_map:
+            plot_ps_vs_distance(meta_table, reg, cfg)
+
+
+def plot_distance_space_figures(
+    dist_space_res,
+    meta_table: Optional[pd.DataFrame],
+    reg: FigureRegistry,
+    cfg: Config,
+) -> None:
+    """Generate all figures for Perturbation Distance Space and Phenotype Modules."""
+    if dist_space_res is not None and not dist_space_res.coordinates.empty:
+        if cfg.visualization.perturbation_space:
+            plot_perturbation_space(dist_space_res, meta_table, reg, cfg)
+
+    if meta_table is not None and not meta_table.empty:
+        if cfg.visualization.module_concordance:
+            plot_module_concordance(meta_table, reg, cfg)

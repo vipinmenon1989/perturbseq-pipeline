@@ -92,6 +92,11 @@ import pandas as pd
 from scipy import sparse
 
 from .cluster import LOGNORM_LAYER
+from .compute import (
+    log_compute_decision,
+    resolve_stage_backend,
+    run_parallel,
+)
 from .config import Config
 from .guides import (
     CLASS_NTC,
@@ -2346,6 +2351,10 @@ def compute_ps_scores(
         expr.n_obs,
         n_perturbations=n_testable_targets,
     )
+
+    decision = resolve_stage_backend("ps_score", cfg, n_cells=expr.n_obs)
+    if cfg.compute.log_backend_decisions:
+        log_compute_decision(decision)
 
     logger.info(
         "PS input: %d cells, %d testable targets",

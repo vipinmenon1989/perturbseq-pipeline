@@ -36,6 +36,8 @@ from .plots import (
     SECTION_PS_LDA,
     SECTION_PS_PER_TARGET,
     SECTION_QC,
+    SECTION_DISTANCE,
+    SECTION_DISTANCE_SPACE,
     FigureRecord,
     FigureRegistry,
 )
@@ -56,6 +58,9 @@ class ReportInputs:
     modules: object = None
     ps: object = None
     lochness: object = None
+    distance: object = None
+    distance_space: object = None
+    meta_table: Optional[pd.DataFrame] = None
     tables: Dict[str, pd.DataFrame] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
     summary_cards: List[tuple] = field(default_factory=list)
@@ -128,9 +133,13 @@ def build_report(inputs: ReportInputs, path: Path) -> Path:
         "lochness": reg.by_section(SECTION_LOCHNESS),
         "lochness_per_target": reg.by_section(SECTION_LOCHNESS_PER_TARGET),
         "modules": reg.by_section(SECTION_MODULES),
+        "distance": reg.by_section(SECTION_DISTANCE),
+        "distance_space": reg.by_section(SECTION_DISTANCE_SPACE),
     }
     extras = reg.extras(SECTION_PER_GENE)
     enrich_extras = reg.extras(SECTION_ENRICH_PER_TARGET)
+    distance_extras = reg.extras(SECTION_DISTANCE)
+    distance_space_extras = reg.extras(SECTION_DISTANCE_SPACE)
 
     tables_html = {
         key: _df_to_html(inputs.tables.get(key), cfg.report.max_table_rows)
@@ -149,6 +158,11 @@ def build_report(inputs: ReportInputs, path: Path) -> Path:
             "gene_programs",
             "module_program_strength",
             "tf_hubs",
+            "perturbation_distance",
+            "phenotype_modules",
+            "perturbation_neighbors",
+            "perturbation_meta",
+            "perturbation_space_coordinates",
         )
     }
     tables_html["outputs"] = _df_to_html(
@@ -249,6 +263,32 @@ def build_report(inputs: ReportInputs, path: Path) -> Path:
         }
     loch_extras = reg.extras(SECTION_LOCHNESS_PER_TARGET)
 
+    dist = inputs.distance
+    distance_ctx = None
+    if dist is not None and not dist.table.empty:
+        distance_ctx = {
+            "n_targets": int(len(dist.table)),
+            "n_hits": int(dist.table["significant"].sum()) if "significant" in dist.table.columns else 0,
+            "primary_metric": dist.primary_metric,
+            "secondary_metric": dist.secondary_metric,
+            "control_used": dist.control_used,
+            "fdr_threshold": cfg.distance.fdr_threshold,
+            "n_skipped": len(dist.skipped) if dist.skipped is not None else 0,
+            "top_target": dist.table.iloc[0]["target_gene"] if len(dist.table) > 0 else "",
+            "top_distance": f"{dist.table.iloc[0]['energy_distance']:.3f}" if len(dist.table) > 0 else "",
+        }
+
+    dist_space = inputs.distance_space
+    distance_space_ctx = None
+    if dist_space is not None and not dist_space.distance_matrix.empty:
+        distance_space_ctx = {
+            "n_targets": int(len(dist_space.distance_matrix)),
+            "n_components": dist_space.n_components,
+            "n_modules": int(dist_space.phenotype_modules["phenotype_module"].nunique()) if not dist_space.phenotype_modules.empty else 0,
+            "metric": dist_space.metric,
+            "linkage": dist_space.linkage_method,
+        }
+
     controls_described = " and ".join(CONTROL_LABELS[c] for c in res.controls_used)
     primary_fallback = res.primary_control != cfg.perturbation.primary_control
 
@@ -308,6 +348,18 @@ def build_report(inputs: ReportInputs, path: Path) -> Path:
             f"{r.name}.{cfg.report.figure_format}" for r in modules_extras
         ],
         modules_dir=str(reg.figdir / SECTION_MODULES),
+        distance=distance_ctx,
+        distance_extras=distance_extras,
+        distance_extra_names=[
+            f"{r.name}.{cfg.report.figure_format}" for r in distance_extras
+        ],
+        distance_dir=str(reg.figdir / SECTION_DISTANCE),
+        distance_space=distance_space_ctx,
+        distance_space_extras=distance_space_extras,
+        distance_space_extra_names=[
+            f"{r.name}.{cfg.report.figure_format}" for r in distance_space_extras
+        ],
+        distance_space_dir=str(reg.figdir / SECTION_DISTANCE_SPACE),
         enrichment=enrichment_ctx,
         enrichment_extras=enrich_extras,
         enrichment_extra_names=[
