@@ -1,5 +1,0 @@
-step,threshold,cells_before,cells_after,cells_removed,genes_before,genes_after,genes_removed
-input,-,600,600,0,120,120,0
-min genes per cell,>= 10,600,600,0,120,120,0
-max % mitochondrial,< 100%,600,600,0,120,120,0
-min cells per gene,>= 3,600,600,0,120,120,0

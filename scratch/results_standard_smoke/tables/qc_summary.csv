@@ -1,5 +1,0 @@
-lane,n_cells,median_genes,median_umis,median_pct_mt,median_pct_ribo
-B_1,200,93.5,179.0,0.0,0.0
-B_2,200,94.0,180.0,0.0,0.0
-B_3,200,93.0,181.0,0.0,0.0
-ALL,600,93.0,180.0,0.0,0.0

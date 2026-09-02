@@ -3,11 +3,12 @@
 #SBATCH --account=ihc
 #SBATCH --partition=ihc         # or whichever partition you use
 #SBATCH --nodelist=ihc-h200-1
+#SBATCH --cpus-per-task=128
 #SBATCH --gres=gpu:1
 #SBATCH --time=72:00:00          # 30 days
 #SBATCH --mem=350G
-#SBATCH --output=/local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/perturbseq-pipeline/flexCRISPRi_320.log
-#SBATCH --error=/local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/perturbseq-pipeline/flexCRISPRi_320.err
+#SBATCH --output=/local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/perturbseq-pipeline/diabetes.log
+#SBATCH --error=/local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/perturbseq-pipeline/diabetes.err
 
 cd /local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/perturbseq-pipeline/
 
@@ -15,6 +16,6 @@ source /local/projects-t3/lilab/vmenon/anaconda3/etc/profile.d/conda.sh
 
 conda activate perturbseq-pipeline
 
-perturbseq-pipeline run --config config/320CRISPRiflex.yaml
+perturbseq-pipeline run --config config/diabetes.yaml
 
 

@@ -8,8 +8,7 @@ DATA_DIR = Path("../data")
 
 def main():
     files = {
-        DATA_DIR / "KOLF_Pan_Genome_QC_Filtered.h5ad": "gene_target",
-        DATA_DIR / "ReplogleWeissman2022_K562_essential.h5ad": "gene",
+        DATA_DIR / "diabetes.h5ad": "genotype",
     }
 
     for path, column in files.items():
