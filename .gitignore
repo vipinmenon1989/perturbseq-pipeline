@@ -71,6 +71,8 @@
 *.svg
 *.pdf
 *.eps
+*.wmf
+*.emf
 
 
 # -------------------------------------------------------------------------
@@ -121,7 +123,34 @@ scratch/smoke_data/
 results/*
 !results/diabetes_specific/
 results/diabetes_specific/*
+
+# The canonical scientific report.
 !results/diabetes_specific/diabetes-progenitor-study.md
+
+# Curated report figures. These are the 21 figures embedded in the source
+# Word report, extracted byte-identical and referenced by relative path from
+# diabetes-progenitor-study.md. They are the documented exception to the
+# code-only policy: without them the canonical report does not render.
+# Bulk generated figures under results/**/figures/ stay ignored.
+!results/diabetes_specific/report_figures/
+!results/diabetes_specific/report_figures/*.png
+!results/diabetes_specific/report_figures/*.jpg
+!results/diabetes_specific/report_figures/*.jpeg
+!results/diabetes_specific/report_figures/*.svg
+!results/diabetes_specific/report_figures/*.md
+
+# Presentation / deck-generation code and its Markdown source documents.
+# Re-opening this directory tracks the .py and .md files inside it; the decks
+# themselves (*.pptx), extracted manuscript text (*.txt), rendered slide
+# previews (*.png/*.jpg) and figure PDFs stay ignored by the type rules above.
+!results/diabetes_specific/presentation/
+
+# Self-referencing symlink left behind by a deck script's relative-path
+# workaround (Presentation_Sep1/presentation -> .); recursive, never commit.
+results/diabetes_specific/presentation/Presentation_Sep1/presentation
+
+# Throwaway import smoke check, superseded by the deck builders themselves.
+results/diabetes_specific/presentation/Presentation_Sep1/test_script_structure.py
 
 
 # -------------------------------------------------------------------------
