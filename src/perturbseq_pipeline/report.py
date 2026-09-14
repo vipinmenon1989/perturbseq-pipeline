@@ -476,3 +476,70 @@ def _config_yaml(cfg: Config) -> str:
     import yaml
 
     return yaml.safe_dump(cfg.to_dict(), sort_keys=False, default_flow_style=False)
+
+
+# ---------------------------------------------------------------------------
+# Basic QC stage report
+# ---------------------------------------------------------------------------
+
+
+def build_qc_report(
+    cfg: Config,
+    registry: FigureRegistry,
+    path: Path,
+    *,
+    tables: Dict[str, pd.DataFrame],
+    cards: List[tuple],
+    outputs: Dict[str, str],
+    warnings: List[str],
+    provenance_text: str,
+) -> Path:
+    """Render the QC-only HTML report (no perturbation results required)."""
+    import datetime as _dt
+
+    from . import __version__
+    from .qc_plots import SECTION_DOUBLETS, SECTION_QC_SAMPLES
+
+    embed = cfg.report.embed_figures
+    env = Environment(loader=FileSystemLoader(str(TEMPLATE_DIR)), autoescape=select_autoescape(["html"]))
+    template = env.get_template("qc_report.html")
+
+    def _figs(section):
+        out = []
+        for rec in registry.by_section(section):
+            if embed:
+                src = rec.data_uri()
+            else:
+                try:
+                    src = str(Path(rec.path).relative_to(Path(path).parent))
+                except ValueError:
+                    src = str(rec.path)
+            out.append({"src": src, "title": rec.title, "caption": rec.caption})
+        return out
+
+    figures = {
+        "qc": _figs(SECTION_QC),
+        "qc_samples": _figs(SECTION_QC_SAMPLES),
+        "doublets": _figs(SECTION_DOUBLETS),
+        "guides": _figs(SECTION_GUIDES),
+    }
+    max_rows = cfg.report.max_table_rows
+    tables_html = {k: _df_to_html(v, max_rows) for k, v in tables.items()}
+    html = template.render(
+        title=cfg.report.title,
+        run_name=cfg.run.name,
+        timestamp=_dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+        version=__version__,
+        cards=cards,
+        tables=tables_html,
+        figures=figures,
+        outputs=outputs,
+        warnings=warnings,
+        provenance=provenance_text,
+        versions=_versions(),
+        config_yaml=_config_yaml(cfg),
+    )
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(html)
+    return path

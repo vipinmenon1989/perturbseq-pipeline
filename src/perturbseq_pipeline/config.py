@@ -101,6 +101,15 @@ class RunConfig:
     outdir: str = "results"
     seed: int = 0
 
+    #: Stop the run after the named stage. ``None`` runs everything.
+    #:
+    #: ``qc``
+    #:     Run the basic QC stage (load -> guide quantification -> per-sample
+    #:     expression QC -> doublet flagging -> guide-multiplet flagging ->
+    #:     concatenate -> write) and stop. Doublets and guide multiplets are
+    #:     annotated, never removed, in this stage.
+    stop_after: Optional[str] = None
+
 
 # ===========================================================================
 # Input
@@ -295,6 +304,16 @@ class QCConfig:
 
     hb_pattern: str = "^HB[^(P)]"
 
+    #: Sample-aware expression-QC thresholds used by the basic QC stage.
+    thresholds: "QCThresholdConfig" = field(
+        default_factory=lambda: QCThresholdConfig()
+    )
+
+    #: Doublet detection (annotation only) used by the basic QC stage.
+    doublets: "DoubletConfig" = field(
+        default_factory=lambda: DoubletConfig()
+    )
+
 
 # ===========================================================================
 # Guide calling
@@ -391,6 +410,7 @@ class GuideConfig:
             r"^ntc",
             r"scramble",
             r"^safe[-_. ]?harbor",
+            r"^no[-_. ]?target",
         ]
     )
 
@@ -399,6 +419,34 @@ class GuideConfig:
     ambiguous_label: str = "ambiguous"
 
     ntc_label: str = "non-targeting"
+
+    # ------------------------------------------------------------------
+    # Basic QC stage: guide quantification and guide QC
+    # ------------------------------------------------------------------
+
+    #: Where guide information comes from in ``samples`` mode.
+    #:
+    #: ``auto``
+    #:     Per sample: FASTQ if ``guide_fastq_dir``/``guide_fastqs`` is set,
+    #:     matrix if ``guide_matrix`` is set, otherwise no guide data.
+    #: ``fastq`` / ``matrix`` / ``none``
+    #:     Force one source for every sample (``none`` skips guide QC).
+    source: str = "auto"
+
+    #: Guide design reference (workbook / table of designed protospacers).
+    design: "GuideDesignConfig" = field(
+        default_factory=lambda: GuideDesignConfig()
+    )
+
+    #: Streaming guide FASTQ counter settings.
+    fastq: "GuideFastqConfig" = field(
+        default_factory=lambda: GuideFastqConfig()
+    )
+
+    #: Guide-derived multiplet flagging (annotation only).
+    multiplet: "GuideMultipletConfig" = field(
+        default_factory=lambda: GuideMultipletConfig()
+    )
 
 
 # ===========================================================================
@@ -1039,6 +1087,240 @@ class OutputConfig:
 
 
 # ===========================================================================
+# Basic QC stage: per-sample inputs
+# ===========================================================================
+
+
+@dataclass
+class SampleConfig:
+    """One GEM well / 10x library described under the top-level ``samples``.
+
+    Only ``gex_h5`` or ``gex_mtx_dir`` is mandatory. Guide inputs are
+    optional so GEX-only datasets and datasets whose guide libraries are not
+    yet quantified run through the same code path.
+    """
+
+    #: Cell Ranger ``filtered_feature_bc_matrix.h5`` (preferred).
+    gex_h5: Optional[str] = None
+    #: Alternative: a 10x MTX directory.
+    gex_mtx_dir: Optional[str] = None
+    #: Identifier of the paired guide (feature-barcode) library.
+    guide_library: Optional[str] = None
+    #: Directory searched (recursively) for guide FASTQ files.
+    guide_fastq_dir: Optional[str] = None
+    #: Explicit list of guide FASTQ files (the read carrying barcode + spacer).
+    guide_fastqs: Optional[List[str]] = None
+    #: Per-sample glob overriding ``guides.fastq.read_pattern``.
+    guide_fastq_pattern: Optional[str] = None
+    #: Pre-computed guide count matrix (10x MTX dir or .h5 with guide features).
+    guide_matrix: Optional[str] = None
+    #: Neutral experimental-condition code (e.g. "HF011"). Not interpreted.
+    condition_code: Optional[str] = None
+    #: GEM well / capture identifier (e.g. "A"). Not interpreted.
+    gem_well: Optional[str] = None
+    #: Any further per-sample obs annotations (constant per sample).
+    metadata: Dict[str, Any] = field(default_factory=dict)
+
+    def gex_path(self) -> str:
+        if self.gex_h5:
+            return self.gex_h5
+        if self.gex_mtx_dir:
+            return self.gex_mtx_dir
+        raise ValueError("sample has neither gex_h5 nor gex_mtx_dir")
+
+
+# ===========================================================================
+# Basic QC stage: expression thresholds
+# ===========================================================================
+
+
+@dataclass
+class QCThresholdConfig:
+    """Sample-aware expression-QC thresholds (flags only).
+
+    Every threshold is resolved *per sample* and recorded. Two layers combine:
+
+    absolute sanity bounds
+        ``min_genes_floor``, ``min_counts_floor``, ``max_genes_ceiling``,
+        ``max_counts_ceiling`` and the mitochondrial cap.
+
+    robust sample-specific bounds (``method: mad``)
+        ``median +/- n_mads * MAD`` computed per sample, optionally on the
+        log1p scale. The lower bound can never fall below the floor and the
+        upper bound can never exceed the ceiling.
+
+    ``method: fixed`` uses the floors/ceilings directly.
+    """
+
+    method: str = "mad"  # mad | fixed
+    n_mads: float = 3.0
+    log_transform: bool = True
+    #: Metrics receiving MAD bounds (subset of total_counts, n_genes_by_counts).
+    mad_metrics: List[str] = field(
+        default_factory=lambda: ["total_counts", "n_genes_by_counts"]
+    )
+    flag_low: bool = True
+    flag_high: bool = True
+
+    min_genes_floor: Optional[int] = 200
+    min_counts_floor: Optional[int] = 500
+    max_genes_ceiling: Optional[int] = None
+    max_counts_ceiling: Optional[int] = None
+
+    #: Absolute mitochondrial cap (percent). ``None`` disables the mt flag.
+    max_pct_mt: Optional[float] = 20.0
+    #: Also derive ``median + n_mads * MAD`` for pct_counts_mt and use the
+    #: stricter of the two bounds.
+    max_pct_mt_mad: bool = False
+    #: Per-condition mitochondrial caps keyed by ``obs[condition_key]``.
+    max_pct_mt_by_condition: Dict[str, float] = field(default_factory=dict)
+    condition_key: str = "condition_code"
+    #: Haemoglobin cap (percent). ``None`` disables the hb flag.
+    max_pct_hb: Optional[float] = None
+
+    #: Per-sample overrides of resolved values. Keys: min_genes, max_genes,
+    #: min_counts, max_counts, max_pct_mt, max_pct_hb.
+    per_sample: Dict[str, Dict[str, Any]] = field(default_factory=dict)
+
+
+# ===========================================================================
+# Basic QC stage: doublet annotation
+# ===========================================================================
+
+
+@dataclass
+class DoubletConfig:
+    """Doublet detection run independently per sample. Annotation only.
+
+    There is deliberately no ``remove`` switch: the basic QC stage stores
+    ``doublet_score`` / ``predicted_doublet`` and never subsets on them.
+    """
+
+    enabled: bool = True
+    method: str = "scrublet"
+    #: ``None`` keeps the Scrublet default (0.05). Never derive this from a
+    #: theoretical loading estimate; it is a prior, not a target.
+    expected_doublet_rate: Optional[float] = None
+    #: ``None`` lets Scrublet pick the threshold from the simulated-doublet
+    #: score distribution. When automatic thresholding fails every cell is
+    #: recorded as ``predicted_doublet = False`` and the failure is logged.
+    threshold: Optional[float] = None
+    sim_doublet_ratio: float = 2.0
+    n_prin_comps: int = 30
+    stdev_doublet_rate: float = 0.02
+    #: Genes with fewer counts than this across the sample are ignored inside
+    #: Scrublet (does not touch the stored matrix).
+    min_gene_counts: int = 3
+
+
+# ===========================================================================
+# Basic QC stage: guide design / counting / multiplets
+# ===========================================================================
+
+
+@dataclass
+class GuideDesignConfig:
+    """Designed-guide reference table (xlsx/csv/tsv).
+
+    Column names are auto-detected unless given explicitly. Every designed
+    guide is retained in the reference, whether or not it is observed.
+    """
+
+    path: Optional[str] = None
+    #: Sheet name or index for workbooks. ``None`` = first sheet.
+    sheet: Optional[Union[str, int]] = None
+    protospacer_column: Optional[str] = None
+    target_column: Optional[str] = None
+    guide_id_column: Optional[str] = None
+    scaffold_column: Optional[str] = None
+    #: Optional table mapping protospacer -> scaffold class when the design
+    #: workbook lacks a scaffold column.
+    scaffold_table: Optional[str] = None
+    #: Case-insensitive regexes recognising control guides by target label.
+    #: ``None`` falls back to ``guides.ntc_patterns``.
+    control_patterns: Optional[List[str]] = None
+    #: Template for synthetic guide ids when the table has no id column.
+    #: Fields: target (sanitised), n (1-based index within target).
+    id_format: str = "{target}_{n}"
+    #: Uppercase protospacers before matching.
+    uppercase: bool = True
+
+
+@dataclass
+class GuideFastqConfig:
+    """Read-structure parameters for the streaming guide counter.
+
+    Defaults describe 10x 5' feature-barcode reads where R1 carries
+    ``[barcode][UMI][TSO][0-n G][protospacer][scaffold]``. The protospacer is
+    located *relative to the scaffold anchor* rather than at a fixed offset so
+    variable non-templated G runs do not lose reads.
+    """
+
+    #: Glob (recursive) used to find the read carrying barcode + spacer.
+    read_pattern: str = "*_R1_*.fastq.gz"
+    barcode_length: int = 16
+    umi_length: int = 12
+    protospacer_length: int = 20
+    #: Scaffold class -> anchor sequence expected immediately after the
+    #: protospacer. Classes are free-form labels (e.g. A / C).
+    scaffolds: Dict[str, str] = field(
+        default_factory=lambda: {"A": "GTTTAAGAGCTA", "C": "GTTTCAGAGCTA"}
+    )
+    #: Earliest read position at which a scaffold anchor may start.
+    anchor_search_start: int = 40
+    #: Positional fallback: retry the exact spacer match shifted by up to this
+    #: many bases (still an exact sequence match). 0 disables.
+    position_shift: int = 1
+    #: Sequence mismatches tolerated in the spacer. 0 = exact only (default).
+    max_mismatches: int = 0
+    #: Template-switch oligo, recorded as a diagnostic only.
+    tso: Optional[str] = "TTTCTTATATGGG"
+    #: Restrict UMI-level counting to barcodes of the paired GEX matrix.
+    restrict_to_gex_barcodes: bool = True
+    #: Regex stripped from GEX barcodes before comparison with read barcodes.
+    barcode_suffix_regex: str = r"-\d+$"
+    #: Process at most this many reads per file (subset validation).
+    max_reads: Optional[int] = None
+    #: Worker processes (one per FASTQ file). ``None`` = min(files, CPUs).
+    n_workers: Optional[int] = None
+    #: Reads accumulated before an intermediate UMI de-duplication pass.
+    chunk_size: int = 2_000_000
+    #: Keep one in N unmatched protospacers for the diagnostics table.
+    unmatched_sample_rate: int = 50
+    #: Number of top unmatched protospacers to report.
+    unmatched_top_n: int = 50
+
+
+@dataclass
+class GuideMultipletConfig:
+    """Guide-derived multiplet flagging (annotation only)."""
+
+    #: UMI threshold for calling a guide detected in a cell. ``None`` uses
+    #: ``guides.detection_threshold``.
+    detection_threshold: Optional[int] = None
+    #: Optional depth-aware rule: a guide also needs at least this fraction of
+    #: the cell's top guide UMI count to count as detected. ``None`` = absolute
+    #: threshold only. Deep guide libraries push ambient guides over a small
+    #: absolute threshold; this keeps the rule explicit and configurable.
+    detection_min_fraction_of_top: Optional[float] = None
+    #: Grid evaluated for ``tables/guide_detection_sensitivity.tsv`` (flags are
+    #: recomputed at each setting for assessment only).
+    sensitivity_thresholds: List[int] = field(default_factory=lambda: [3, 5, 10, 20, 50])
+    sensitivity_fractions: List[float] = field(default_factory=lambda: [0.0, 0.02, 0.05, 0.1, 0.2])
+    #: More detected guides than this within one scaffold class flags the cell.
+    max_guides_per_scaffold: int = 1
+    #: Expected detected guides per scaffold class for ``guide_structure_pass``.
+    expected_guides_per_scaffold: int = 1
+    #: Used when no scaffold classes are available.
+    expected_guides_per_cell: int = 1
+    #: Minimum fraction of reads in the majority scaffold for a guide's
+    #: scaffold class to be inferred empirically.
+    scaffold_purity_min: float = 0.9
+    #: Minimum reads before a guide's scaffold class is inferred.
+    scaffold_min_reads: int = 20
+
+
+# ===========================================================================
 # Full configuration
 # ===========================================================================
 
@@ -1129,6 +1411,28 @@ class Config:
     output: OutputConfig = field(
         default_factory=OutputConfig
     )
+
+    #: Multi-sample (per GEM well) inputs for the basic QC stage. Keys are
+    #: sample ids; values follow :class:`SampleConfig`. Empty = legacy input.
+    samples: Dict[str, Dict[str, Any]] = field(
+        default_factory=dict
+    )
+
+    def __post_init__(self) -> None:
+        # Reject unknown per-sample keys at construction time, like every
+        # other section, rather than only inside validate().
+        self.resolved_samples()
+
+    def resolved_samples(self) -> Dict[str, "SampleConfig"]:
+        """Validate and build :class:`SampleConfig` objects from ``samples``."""
+        out: Dict[str, SampleConfig] = {}
+        for sid, raw in (self.samples or {}).items():
+            if raw is None:
+                raw = {}
+            if not isinstance(raw, dict):
+                raise ValueError(f"samples.{sid} must be a mapping")
+            out[str(sid)] = _build(SampleConfig, raw, f"samples.{sid}")
+        return out
 
     # ------------------------------------------------------------------
     # Construction
@@ -1312,10 +1616,11 @@ class Config:
             if (
                 not has_mtx
                 and not has_h5ad
+                and not self.samples
             ):
 
                 raise ValueError(
-                    "No input given: set input.mtx_dirs or input.h5ad."
+                    "No input given: set input.mtx_dirs, input.h5ad or samples."
                 )
 
         if inp.guide_mtx_dirs:
@@ -1351,6 +1656,12 @@ class Config:
                     "input.guide_mtx_dirs contains lanes not in mtx_dirs: "
                     f"{sorted(extra)}"
                 )
+
+        # ==============================================================
+        # Basic QC stage (samples / stop_after / thresholds / doublets)
+        # ==============================================================
+
+        self._validate_basic_qc()
 
         # ==============================================================
         # Guides
@@ -2173,6 +2484,128 @@ class Config:
                 "output.large_file_threshold_mb must be >=0"
             )
 
+    def _validate_basic_qc(self) -> None:
+        """Validate the sections added for the basic QC stage."""
+        if self.run.stop_after not in (None, "qc"):
+            raise ValueError(
+                "run.stop_after must be null or 'qc' "
+                f"(got {self.run.stop_after!r})"
+            )
+        samples = self.resolved_samples()
+        if samples:
+            if self.run.stop_after != "qc":
+                raise ValueError(
+                    "Top-level 'samples' inputs are currently supported only "
+                    "with run.stop_after: qc (the basic QC stage). Downstream "
+                    "stages expect a single assigned-perturbation object."
+                )
+            for sid, smp in samples.items():
+                if not smp.gex_h5 and not smp.gex_mtx_dir:
+                    raise ValueError(
+                        f"samples.{sid}: set gex_h5 or gex_mtx_dir"
+                    )
+                if smp.gex_h5 and smp.gex_mtx_dir:
+                    raise ValueError(
+                        f"samples.{sid}: set only one of gex_h5 / gex_mtx_dir"
+                    )
+                n_guide_sources = sum(
+                    bool(x) for x in (smp.guide_fastq_dir, smp.guide_fastqs, smp.guide_matrix)
+                )
+                if n_guide_sources > 1:
+                    raise ValueError(
+                        f"samples.{sid}: choose one guide source "
+                        "(guide_fastq_dir | guide_fastqs | guide_matrix)"
+                    )
+                for key in ("condition_code", "gem_well", "guide_library"):
+                    val = getattr(smp, key)
+                    if val is not None and not isinstance(val, (str, int)):
+                        raise ValueError(f"samples.{sid}.{key} must be a scalar")
+        thr = self.qc.thresholds
+        if thr.method not in ("mad", "fixed"):
+            raise ValueError(
+                f"qc.thresholds.method must be 'mad' or 'fixed' (got {thr.method!r})"
+            )
+        if thr.n_mads <= 0:
+            raise ValueError("qc.thresholds.n_mads must be > 0")
+        allowed_metrics = {"total_counts", "n_genes_by_counts"}
+        bad = set(thr.mad_metrics) - allowed_metrics
+        if bad:
+            raise ValueError(
+                f"qc.thresholds.mad_metrics has unsupported entries {sorted(bad)}; "
+                f"allowed: {sorted(allowed_metrics)}"
+            )
+        for key, val in thr.max_pct_mt_by_condition.items():
+            if val is not None and not (0 <= float(val) <= 100):
+                raise ValueError(
+                    f"qc.thresholds.max_pct_mt_by_condition[{key!r}] must be in [0, 100]"
+                )
+        if thr.max_pct_mt is not None and not (0 <= thr.max_pct_mt <= 100):
+            raise ValueError("qc.thresholds.max_pct_mt must be in [0, 100]")
+        allowed_override = {"min_genes", "max_genes", "min_counts", "max_counts", "max_pct_mt", "max_pct_hb"}
+        for sid, over in thr.per_sample.items():
+            if not isinstance(over, dict):
+                raise ValueError(f"qc.thresholds.per_sample.{sid} must be a mapping")
+            bad = set(over) - allowed_override
+            if bad:
+                raise ValueError(
+                    f"qc.thresholds.per_sample.{sid} has unknown keys {sorted(bad)}; "
+                    f"allowed: {sorted(allowed_override)}"
+                )
+        dbl = self.qc.doublets
+        if dbl.method != "scrublet":
+            raise ValueError("qc.doublets.method must be 'scrublet'")
+        if dbl.expected_doublet_rate is not None and not (0 < dbl.expected_doublet_rate < 1):
+            raise ValueError("qc.doublets.expected_doublet_rate must be in (0, 1)")
+        if dbl.threshold is not None and not (0 < dbl.threshold < 1):
+            raise ValueError("qc.doublets.threshold must be in (0, 1)")
+        if dbl.n_prin_comps < 2:
+            raise ValueError("qc.doublets.n_prin_comps must be >= 2")
+        g = self.guides
+        if g.source not in ("auto", "none", "fastq", "matrix"):
+            raise ValueError(
+                "guides.source must be one of 'auto', 'none', 'fastq', 'matrix' "
+                f"(got {g.source!r})"
+            )
+        fq = g.fastq
+        for key in ("barcode_length", "umi_length", "protospacer_length"):
+            if getattr(fq, key) <= 0:
+                raise ValueError(f"guides.fastq.{key} must be > 0")
+        if fq.position_shift < 0:
+            raise ValueError("guides.fastq.position_shift must be >= 0")
+        if fq.max_mismatches not in (0, 1):
+            raise ValueError("guides.fastq.max_mismatches must be 0 or 1")
+        if not fq.scaffolds:
+            raise ValueError(
+                "guides.fastq.scaffolds must define at least one scaffold anchor"
+            )
+        for name, anchor_seq in fq.scaffolds.items():
+            if not anchor_seq or set(str(anchor_seq).upper()) - set("ACGTN"):
+                raise ValueError(
+                    f"guides.fastq.scaffolds[{name!r}] must be a nucleotide string"
+                )
+        if fq.chunk_size <= 0:
+            raise ValueError("guides.fastq.chunk_size must be > 0")
+        if fq.max_reads is not None and fq.max_reads <= 0:
+            raise ValueError("guides.fastq.max_reads must be > 0 or null")
+        mp = g.multiplet
+        if mp.detection_threshold is not None and mp.detection_threshold < 1:
+            raise ValueError("guides.multiplet.detection_threshold must be >= 1")
+        if mp.max_guides_per_scaffold < 1:
+            raise ValueError("guides.multiplet.max_guides_per_scaffold must be >= 1")
+        if mp.detection_min_fraction_of_top is not None and not (0 < mp.detection_min_fraction_of_top <= 1):
+            raise ValueError("guides.multiplet.detection_min_fraction_of_top must be in (0, 1] or null")
+        if not (0 < mp.scaffold_purity_min <= 1):
+            raise ValueError("guides.multiplet.scaffold_purity_min must be in (0, 1]")
+        if samples and g.design.path is None:
+            uses_fastq = g.source == "fastq" or any(
+                (s.guide_fastq_dir or s.guide_fastqs) for s in samples.values()
+            )
+            if uses_fastq and g.source != "none":
+                raise ValueError(
+                    "Guide FASTQ counting requires guides.design.path "
+                    "(the designed-guide reference table)."
+                )
+
     # ------------------------------------------------------------------
     # Convenience
     # ------------------------------------------------------------------
@@ -2191,6 +2624,9 @@ class Config:
         self,
     ) -> str:
         """Effective input mode after ``auto`` resolution."""
+
+        if self.samples:
+            return "samples"
 
         if (
             self.input.mode

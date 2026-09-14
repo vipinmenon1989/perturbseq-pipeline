@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>{{ title }}</title>
+<style>
+  body { font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif; margin: 0; color: #0b0b0b; background: #fcfcfb; }
+  main { max-width: 1200px; margin: 0 auto; padding: 24px 32px 64px; }
+  h1 { font-size: 1.6rem; margin-bottom: 0.2em; }
+  h2 { font-size: 1.2rem; border-bottom: 1px solid #d9d8d4; padding-bottom: 4px; margin-top: 2em; }
+  h3 { font-size: 1rem; margin-top: 1.4em; color: #52514e; }
+  .cards { display: flex; flex-wrap: wrap; gap: 12px; margin: 16px 0; }
+  .card { background: #fff; border: 1px solid #d9d8d4; border-radius: 6px; padding: 10px 14px; min-width: 150px; }
+  .card .k { font-size: 0.75rem; color: #52514e; }
+  .card .v { font-size: 1.15rem; font-weight: 600; }
+  .callout { background: #fff4ec; border-left: 4px solid #eb6834; padding: 10px 14px; margin: 12px 0; font-size: 0.92rem; }
+  .warn { background: #fdecec; border-left: 4px solid #e34948; padding: 8px 12px; margin: 6px 0; font-size: 0.9rem; }
+  table { border-collapse: collapse; font-size: 0.8rem; margin: 8px 0 16px; }
+  th, td { border: 1px solid #e3e2de; padding: 3px 8px; text-align: right; }
+  th { background: #f1f0ec; text-align: left; }
+  td:first-child, th:first-child { text-align: left; }
+  .tablewrap { overflow-x: auto; }
+  figure { margin: 12px 0 20px; }
+  figure img { max-width: 100%; border: 1px solid #e3e2de; border-radius: 4px; }
+  figcaption { font-size: 0.8rem; color: #52514e; margin-top: 4px; }
+  pre { background: #f1f0ec; padding: 10px; font-size: 0.75rem; overflow-x: auto; }
+  nav a { margin-right: 14px; font-size: 0.85rem; }
+</style>
+</head>
+<body>
+<main>
+<h1>{{ title }}</h1>
+<p style="color:#52514e">Run <code>{{ run_name }}</code> · generated {{ timestamp }} · perturbseq-pipeline {{ version }} · stage: <strong>basic QC (stop_after: qc)</strong></p>
+
+<div class="callout"><strong>Annotation, not removal.</strong> Doublets (Scrublet) and guide-derived multiplets are detected and stored as flags
+(<code>predicted_doublet</code>, <code>guide_multiplet_flag</code>) but are <em>not removed</em> from any object written by this stage.
+<code>gex_qc_pass</code> depends only on expression-quality criteria. Guide detection is not perturbation assignment
+(<code>perturbation_assignable</code> is False throughout).</div>
+
+<nav>
+  <a href="#summary">Summary</a><a href="#samples">Per-sample QC</a><a href="#doublets">Doublets</a>
+  <a href="#guides">Guides</a><a href="#outputs">Outputs</a><a href="#provenance">Provenance</a>
+</nav>
+
+{% if warnings %}
+<h2>Warnings</h2>
+{% for w in warnings %}<div class="warn">{{ w }}</div>{% endfor %}
+{% endif %}
+
+<h2 id="summary">Summary</h2>
+<div class="cards">
+{% for k, v in cards %}<div class="card"><div class="k">{{ k }}</div><div class="v">{{ v }}</div></div>{% endfor %}
+</div>
+<h3>Sample QC summary</h3>
+<div class="tablewrap">{{ tables.sample_qc_summary }}</div>
+<h3>Resolved expression thresholds (per sample)</h3>
+<div class="tablewrap">{{ tables.qc_thresholds }}</div>
+<h3>Filtering summary (expression-QC object vs all-cells object)</h3>
+<div class="tablewrap">{{ tables.filtering_summary }}</div>
+{% for fig in figures.qc %}
+<figure><img src="{{ fig.src }}" alt="{{ fig.title }}"><figcaption><strong>{{ fig.title }}.</strong> {{ fig.caption }}</figcaption></figure>
+{% endfor %}
+
+<h2 id="samples">Per-sample expression QC</h2>
+{% for fig in figures.qc_samples %}
+<figure><img src="{{ fig.src }}" alt="{{ fig.title }}"><figcaption><strong>{{ fig.title }}.</strong> {{ fig.caption }}</figcaption></figure>
+{% endfor %}
+
+<h2 id="doublets">Doublet annotation (flag only)</h2>
+<div class="tablewrap">{{ tables.doublet_summary }}</div>
+<h3>Scrublet vs guide-derived multiplets</h3>
+<div class="tablewrap">{{ tables.scrublet_vs_guide_multiplet }}</div>
+{% for fig in figures.doublets %}
+<figure><img src="{{ fig.src }}" alt="{{ fig.title }}"><figcaption><strong>{{ fig.title }}.</strong> {{ fig.caption }}</figcaption></figure>
+{% endfor %}
+
+<h2 id="guides">Guide quantification and guide QC</h2>
+<div class="tablewrap">{{ tables.guide_qc_summary }}</div>
+<h3>Detection-rule sensitivity (assessment only; flags in the objects use the configured rule)</h3>
+<div class="tablewrap">{{ tables.guide_detection_sensitivity }}</div>
+{% for fig in figures.guides %}
+<figure><img src="{{ fig.src }}" alt="{{ fig.title }}"><figcaption><strong>{{ fig.title }}.</strong> {{ fig.caption }}</figcaption></figure>
+{% endfor %}
+
+<h2 id="outputs">Outputs</h2>
+<div class="tablewrap"><table><tr><th>Item</th><th>Path</th></tr>
+{% for k, v in outputs.items() %}<tr><td>{{ k }}</td><td style="text-align:left"><code>{{ v }}</code></td></tr>{% endfor %}
+</table></div>
+
+<h2 id="provenance">Provenance</h2>
+<pre>{{ provenance }}</pre>
+<h3>Software</h3>
+<pre>{{ versions }}</pre>
+<h3>Resolved configuration</h3>
+<pre>{{ config_yaml }}</pre>
+</main>
+</body>
+</html>

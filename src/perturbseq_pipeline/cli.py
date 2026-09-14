@@ -124,9 +124,24 @@ class PipelineResult:
     #: STANDARD / LARGE, useful for provenance.
     execution_mode: str = "standard"
 
+    #: :class:`perturbseq_pipeline.basic_qc.BasicQCResult` when the run
+    #: stopped after the basic QC stage.
+    basic_qc: object = None
+
     def summary(
         self,
     ) -> str:
+
+        if self.basic_qc is not None:
+            b = self.basic_qc
+            return (
+                f"BASIC QC | {b.n_cells_all:,} cells loaded, "
+                f"{b.n_cells_pass:,} pass expression QC x {b.n_genes:,} genes | "
+                f"predicted doublets retained {b.n_predicted_doublets_all:,} (all) / "
+                f"{b.n_predicted_doublets_pass:,} (QC object) | "
+                f"guide multiplets retained {b.n_guide_multiplets_all:,} / "
+                f"{b.n_guide_multiplets_pass:,} | report: {self.report}"
+            )
 
         return (
             f"{self.n_cells:,} cells x "
@@ -712,8 +727,14 @@ def _aligned_guides(
 def run_pipeline(
     cfg: Config,
     verbose: bool = False,
+    config_path: Optional[str] = None,
 ) -> PipelineResult:
-    """Run the full perturb-seq workflow."""
+    """Run the full perturb-seq workflow.
+
+    When ``run.stop_after == "qc"`` only the basic QC stage runs
+    (:mod:`perturbseq_pipeline.basic_qc`) and the function returns after the
+    QC-level objects, tables, figures and report have been written.
+    """
 
     start = (
         time.time()
@@ -820,6 +841,41 @@ def run_pipeline(
         str,
         Path,
     ] = {}
+
+    # =====================================================================
+    # Basic QC stage (stop_after: qc) — annotate, do not remove; then stop
+    # =====================================================================
+
+    if cfg.run.stop_after == "qc":
+        from . import basic_qc as basic_qc_mod
+
+        logger.info("=== Basic QC stage (run.stop_after = qc) ===")
+        qc_result = basic_qc_mod.run_basic_qc(
+            cfg, outdir, registry, config_path=config_path
+        )
+        profiler.save_csv(tabledir / "compute_profile.csv")
+        result = PipelineResult(
+            outdir=outdir,
+            report=qc_result.report,
+            h5ad=qc_result.pass_h5ad,
+            guide_h5ad=None,
+            unfiltered_h5ad=qc_result.allcells_h5ad,
+            tables=dict(qc_result.tables),
+            figures_dir=registry.figdir,
+            n_cells=qc_result.n_cells_pass,
+            n_genes=qc_result.n_genes,
+            runtime_seconds=time.time() - start,
+            execution_mode="basic_qc",
+        )
+        result.basic_qc = qc_result
+        logger.info(
+            "Basic QC complete: %d cells (all) / %d cells (expression-QC pass); "
+            "predicted doublets retained: %d / %d; guide multiplets retained: %d / %d",
+            qc_result.n_cells_all, qc_result.n_cells_pass,
+            qc_result.n_predicted_doublets_all, qc_result.n_predicted_doublets_pass,
+            qc_result.n_guide_multiplets_all, qc_result.n_guide_multiplets_pass,
+        )
+        return result
 
     # =====================================================================
     # Stage 1: load
@@ -2617,6 +2673,7 @@ def main(
         result = run_pipeline(
             cfg,
             verbose=args.verbose,
+            config_path=args.config,
         )
 
     except Exception as exc:

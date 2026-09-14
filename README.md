@@ -469,6 +469,142 @@ Non-targeting guides are detected by pattern (`non`, `non_targeting`, `NTC`,
 
 ---
 
+## Basic QC stage (`run.stop_after: qc`)
+
+The basic QC stage turns one or more Cell Ranger GEM wells into a
+**raw-count, fully annotated QC checkpoint** and then stops. It exists so
+that quality can be measured and recorded before any cell-removal decision is
+made:
+
+```text
+10x GEX h5 (per GEM well)
+   ↓ optional guide quantification (FASTQ | precomputed matrix | none)
+   ↓ per-well AnnData loading + neutral sample metadata
+   ↓ per-well expression QC metrics + flags          → gex_qc_pass
+   ↓ Scrublet per well                                → doublet_score, predicted_doublet   (FLAG ONLY)
+   ↓ guide QC / guide-derived multiplets              → guide_multiplet_flag                (FLAG ONLY)
+   ↓ per-well all-cell checkpoints
+   ↓ concatenate (not integrate)
+   ↓ combined all-cells object + expression-QC object, tables, figures, report
+   STOP
+```
+
+> **Doublets and guide multiplets are detected and annotated but are not
+> removed during basic QC.** `gex_qc_pass` depends only on expression-quality
+> flags. Guide detection is not perturbation assignment
+> (`perturbation_assignable` is always `False` at this stage).
+
+### Configuration
+
+```yaml
+run:
+  name: my_screen
+  outdir: results/my_screen_qc
+  stop_after: qc                      # run the basic QC stage and stop
+
+samples:                              # one entry per GEM well
+  W1:
+    gex_h5: /path/W1/filtered_feature_bc_matrix.h5
+    guide_library: W1F
+    guide_fastq_dir: /path/W1F/fastq  # or guide_fastqs: [...], or guide_matrix: <10x dir|h5>, or nothing
+    condition_code: COND1             # neutral labels; not interpreted by the code
+    gem_well: A
+  W2:
+    gex_mtx_dir: /path/W2/filtered_feature_bc_matrix   # MTX directories work too
+
+qc:
+  thresholds:                         # resolved per sample and recorded in tables/qc_thresholds.tsv
+    method: mad                       # mad | fixed
+    n_mads: 3.0
+    log_transform: true
+    min_genes_floor: 200              # absolute sanity bounds ...
+    min_counts_floor: 500
+    max_pct_mt: 20.0                  # ... combined with robust per-sample MAD bounds
+    max_pct_mt_by_condition: {COND1: 10.0}
+    per_sample: {W2: {min_genes: 300}}
+  doublets:
+    enabled: true                     # Scrublet per well; scores + calls are stored, cells are kept
+    expected_doublet_rate: null       # Scrublet default; never forced to a loading estimate
+    threshold: null                   # automatic
+
+guides:
+  source: auto                        # auto | fastq | matrix | none
+  design:
+    path: design.xlsx                 # all designed guides are kept in the reference
+  fastq:                              # 10x 5' feature-barcode read structure
+    scaffolds: {A: GTTTAAGAGCTA, C: GTTTCAGAGCTA}
+    position_shift: 1                 # exact spacer match, ±1 nt positional fallback
+    max_mismatches: 0                 # exact matching by default
+  multiplet:
+    max_guides_per_scaffold: 1        # >1 detected guide in a scaffold class → guide_multiplet_flag
+    detection_min_fraction_of_top: null   # optional depth-aware rule: UMIs ≥ this fraction of the cell's top guide
+```
+
+The detection rule matters at high guide depth: with thousands of guide UMIs
+per cell a small absolute threshold lets ambient guides count as detected.
+`tables/guide_detection_sensitivity.tsv` (and its figure) recompute the
+structure-pass and multiplet fractions over a grid of absolute thresholds and
+top-fractions so the rule can be chosen on evidence; the stored flags always
+use the configured rule. Likewise Scrublet's automatic threshold is checked
+for plausibility (`threshold_suspect` in `tables/doublet_summary.tsv`: the
+threshold sits beyond the observed scores or calls < 0.5% of cells); scores
+are stored for every cell so a manual `qc.doublets.threshold` can be applied
+later without recomputation of anything else.
+
+`config/hanrui_fang.yaml` is a complete four-well example. Existing
+`input.mtx_dirs` / `input.h5ad` inputs also work with `stop_after: qc`: the
+loaded object is split by lane and any guide features already in the matrix
+are treated as a precomputed guide matrix.
+
+### What the stage produces
+
+```text
+<outdir>/
+├── guide_counts/<sample>/     matrix.mtx.gz, barcodes.tsv.gz, features.tsv.gz (all designed guides),
+│                              <sample>_guide_summary.tsv, <sample>_guide_counting_stats.json,
+│                              <sample>_unmatched_protospacers.tsv
+├── per_sample/<sample>_qc_allcells.h5ad   every Cell Ranger-called cell of that well
+├── combined/<h5ad_name stem>_allcells.h5ad   all wells, all cells, all annotations
+├── combined/<h5ad_name>                      cells with gex_qc_pass == True (doublets/multiplets retained)
+├── figures/{qc,qc/per_sample,doublets,guides}/
+├── tables/  sample_qc_summary.tsv  cell_qc_summary.tsv  guide_qc_summary.tsv  filtering_summary.tsv
+│            doublet_summary.tsv  qc_thresholds.tsv  scrublet_vs_guide_multiplet.tsv
+│            guide_feature_table.tsv  guide_counting_per_file.tsv  expression_qc_flags.tsv
+│            guide_detection_sensitivity.tsv
+├── reports/qc_report.html, reports/provenance.json
+└── logs/run.log, logs/resolved_config.yaml
+```
+
+The QC objects keep raw integer counts in `X` and `layers["counts"]`
+(no normalisation, HVG, PCA, neighbours, UMAP, Leiden, Harmony or scVI).
+Guide UMI counts live in `obsm["guide_counts"]` (cells × designed guides) with
+the guide table in `uns["guide_features"]`; `uns` also records the sample
+manifest, the resolved thresholds, the Scrublet settings, the configuration and
+the run provenance (git commit, package versions, SLURM job, inputs).
+
+Per-cell `obs` columns:
+
+| Group | Columns |
+|---|---|
+| identity | `sample_id`, `condition_code`, `gem_well`, `guide_library`, `cell_barcode`, `lane_id` |
+| metrics | `total_counts`, `n_genes_by_counts`, `pct_counts_mt`, `pct_counts_ribo`, `pct_counts_hb`, `pct_counts_in_top_20_genes` |
+| expression flags | `qc_low_counts`, `qc_high_counts`, `qc_low_genes`, `qc_high_genes`, `qc_high_mt`, `qc_high_hb` → `gex_qc_pass` |
+| doublets (flag only) | `doublet_score`, `predicted_doublet` |
+| guides (flag only) | `guide_umi_total`, `n_guides`, `n_guides_<scaffold>`, `guide_umi_<scaffold>`, `top_guide`, `top_guide_<scaffold>`, `guide_detected`, `guide_structure_pass`, `guide_multiplet_flag`, `perturbation_assignable` |
+
+### Guide quantification from FASTQ
+
+The counter streams each guide read file through `pigz`/`gzip` (one worker
+process per file), extracts `[barcode][UMI]` from the read start, locates the
+configured scaffold anchors (which also classify the scaffold), takes the
+protospacer as the bases immediately upstream of the anchor, matches it
+exactly against the design reference, and collapses reads to unique
+(cell, guide, UMI) molecules restricted to the paired GEX barcode universe.
+Reads from non-cell barcodes, unmatched protospacers and anchor-less reads are
+tallied in the counting statistics. Scaffold classes of designed guides are
+taken from the design table when present, otherwise inferred from the pooled
+read evidence (majority class with purity ≥ `scaffold_purity_min`).
+
 ## Perturbation Distance & DistanceTest (Stage 10)
 
 ### Biological Purpose & Concept

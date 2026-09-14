@@ -1,0 +1,132 @@
+# =========================================================================
+# Hanrui Fang — BASIC QC SUBSET VALIDATION (HF011A only, L004 R1, first 10M reads)
+#
+# Four 10x 5' GEX GEM wells with four paired guide (feature-barcode)
+# libraries. This config runs the basic QC stage only (run.stop_after: qc):
+#
+#   load 10x h5 -> count guides from FASTQ -> per-well expression QC
+#   -> Scrublet (flag only) -> guide multiplet flags -> concatenate -> write
+#
+# Doublets and guide multiplets are ANNOTATED, never removed. No
+# normalisation, embedding, clustering, integration or perturbation
+# assignment happens here.
+#
+# Sample labels are neutral codes. HF011 vs HF012 and A vs B are NOT
+# interpreted biologically until experimenter metadata confirm them.
+#
+# The filtered h5 files are extracted from the Cell Ranger outs tars into the
+# output tree by jobs/stage_hanrui_cellranger.sh (never into the raw tree).
+# =========================================================================
+
+run:
+  name: hanrui_fang_qc_subset
+  outdir: /local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/outputs/hanrui_fang_qc_subset
+  seed: 0
+  stop_after: qc
+
+samples:
+  HF011A:
+    gex_h5: /local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/outputs/hanrui_fang_qc/cellranger/HF011A/filtered_feature_bc_matrix.h5
+    guide_library: HF011AF
+    guide_fastq_dir: /local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/data/260720_HANRUI_FANG_2_HUMAN_10X/HF011AF/fastq
+    condition_code: HF011
+    gem_well: A
+
+input:
+  var_names: gene_symbols
+  gex_feature_type: Gene Expression
+  feature_type_column: feature_types
+
+# -------------------------------------------------------------------------
+# Expression QC: flags only. Robust per-sample MAD bounds on the log scale,
+# bounded by absolute sanity floors; fixed mitochondrial cap per condition
+# code (audit 05_QC_STRATEGY starting points — review on the plots).
+# -------------------------------------------------------------------------
+qc:
+  mito_prefix: "MT-"
+  ribo_prefix: ["RPS", "RPL"]
+  hb_pattern: "^HB[^(P)]"
+  thresholds:
+    method: mad
+    n_mads: 3.0
+    log_transform: true
+    mad_metrics: [total_counts, n_genes_by_counts]
+    flag_low: true
+    flag_high: true
+    min_genes_floor: 500
+    min_counts_floor: 1000
+    max_genes_ceiling: null
+    max_counts_ceiling: null
+    max_pct_mt: 10.0
+    max_pct_mt_mad: false
+    max_pct_mt_by_condition:
+      HF011: 10.0
+      HF012: 15.0
+    condition_key: condition_code
+    max_pct_hb: null
+  doublets:
+    enabled: true
+    method: scrublet
+    expected_doublet_rate: null     # Scrublet default prior (0.05); never forced to the loading estimate
+    threshold: null                 # automatic; failure is recorded, not forced
+    sim_doublet_ratio: 2.0
+    n_prin_comps: 30
+
+# -------------------------------------------------------------------------
+# Guides: designed reference (all 560 protospacers), streaming FASTQ counter,
+# guide-derived multiplet flags. Final perturbation assignment is NOT done.
+# -------------------------------------------------------------------------
+guides:
+  source: fastq
+  detection_threshold: 3
+  ntc_patterns: ["^no[-_. ]?target", "^non[-_. ]?targeting", "^ntc", "scramble", "^safe[-_. ]?harbor"]
+  design:
+    path: /local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/data/260720_HANRUI_FANG_2_HUMAN_10X/web_summaries/design_out_v2.xlsx
+    sheet: null
+    protospacer_column: seq
+    target_column: gene
+    guide_id_column: null
+    scaffold_column: null           # scaffold class is inferred empirically from the reads
+    scaffold_table: null
+    control_patterns: null          # falls back to ntc_patterns (NO-TARGET is recognised)
+    id_format: "{target}_{n}"
+  fastq:
+    read_pattern: "*_L004_R1_001.fastq.gz"
+    barcode_length: 16
+    umi_length: 12
+    protospacer_length: 20
+    scaffolds:
+      A: GTTTAAGAGCTA
+      C: GTTTCAGAGCTA
+    anchor_search_start: 40
+    position_shift: 1               # exact sequence match, +/-1 nt positional fallback
+    max_mismatches: 0               # exact matching only
+    tso: TTTCTTATATGGG
+    restrict_to_gex_barcodes: true
+    barcode_suffix_regex: '-\d+$'
+    max_reads: 10000000
+    n_workers: null                 # one worker per FASTQ file (8 files)
+    chunk_size: 2000000
+  multiplet:
+    detection_threshold: null       # -> guides.detection_threshold
+    max_guides_per_scaffold: 1
+    expected_guides_per_scaffold: 1
+    scaffold_purity_min: 0.9
+    scaffold_min_reads: 20
+
+report:
+  title: "Hanrui Fang Perturb-seq — basic QC (annotation only)"
+  embed_figures: true
+  figure_format: png
+  figure_dpi: 120
+  max_table_rows: 100
+
+output:
+  h5ad_name: perttf_qc.h5ad
+  unfiltered_h5ad_name: perttf_qc_allcells.h5ad
+  report_name: qc_report.html
+  guide_obsm_key: guide_counts
+  archive: false
+
+compute:
+  backend: cpu

@@ -861,18 +861,30 @@ def write_h5ad(adata: ad.AnnData, path: Path, compression: str = "gzip") -> Path
 
     Object-dtype ``obs`` columns are cast to string/categorical first; mixed
     types are the usual cause of a write failing at the very end of a long run.
+
+    Newer anndata versions require an explicit opt-in before writing pandas
+    nullable string arrays.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
+
     # Sanitize in place rather than copying: an .h5ad of this size would
     # otherwise double peak memory just to fix a few column dtypes.
     for col in adata.obs.columns:
         if adata.obs[col].dtype == object:
             adata.obs[col] = pd.Categorical(adata.obs[col].astype(str))
+
     for col in adata.var.columns:
         if adata.var[col].dtype == object:
             adata.var[col] = adata.var[col].astype(str)
+
+    # anndata >= 0.11 may represent dataframe indices/columns with the pandas
+    # nullable StringDtype. Writing those requires explicit opt-in.
+    if hasattr(ad.settings, "allow_write_nullable_strings"):
+        ad.settings.allow_write_nullable_strings = True
+
     adata.write_h5ad(path, compression=compression)
+
     logger.info("Wrote %s (%.1f MB)", path, path.stat().st_size / 1e6)
     return path
 
@@ -970,3 +982,167 @@ def relocate_if_large(path: Path, cfg: Config) -> Path:
         shutil.copy2(path, dest)
         path.unlink()
     return dest
+
+
+# ---------------------------------------------------------------------------
+# Native 10x HDF5 loading (basic QC stage)
+# ---------------------------------------------------------------------------
+
+#: ``obs`` column preserving the original 10x cell barcode.
+BARCODE_KEY = "cell_barcode"
+
+
+def _to_int_csr(X, what: str):
+    """Return ``X`` as an integer CSR matrix, verifying values are integral."""
+    import scipy.sparse as sp
+
+    X = sp.csr_matrix(X) if not sp.isspmatrix_csr(X) else X
+    data = X.data
+    if data.size and not np.issubdtype(data.dtype, np.integer):
+        if not np.all(np.mod(data, 1) == 0):
+            raise ValueError(
+                f"{what}: matrix holds non-integer values; expected raw counts"
+            )
+        if data.size and data.max() < np.iinfo(np.int32).max:
+            X = sp.csr_matrix((data.astype(np.int32), X.indices, X.indptr), shape=X.shape)
+        else:
+            X = sp.csr_matrix((data.astype(np.int64), X.indices, X.indptr), shape=X.shape)
+    X.sort_indices()
+    return X
+
+
+def read_10x_h5(
+    path: str | Path,
+    sample_id: str,
+    *,
+    var_names: str = "gene_symbols",
+    gex_feature_type: str = "Gene Expression",
+    feature_type_column: str = "feature_types",
+) -> ad.AnnData:
+    """Load a Cell Ranger ``filtered_feature_bc_matrix.h5`` for one sample.
+
+    Guarantees
+    ----------
+    * ``X`` and ``layers['counts']`` are integer CSR raw counts.
+    * ``var`` keeps ``gene_ids``, ``feature_types`` and ``genome`` (when
+      present); ``var_names`` are gene symbols made unique.
+    * ``obs[BARCODE_KEY]`` holds the original 10x barcode; ``obs_names`` are
+      ``<sample_id>_<barcode>`` so cells stay unique across GEM wells.
+    * ``obs[LANE_KEY]`` and ``obs['sample_id']`` are set to ``sample_id``.
+
+    Only ``gex_feature_type`` features are kept; other feature types (e.g.
+    guide captures inside a combined matrix) are returned separately by
+    :func:`read_10x_h5_features`.
+    """
+    path = Path(path)
+    if not path.is_file():
+        raise FileNotFoundError(f"{sample_id}: 10x h5 not found: {path}")
+    adata = sc.read_10x_h5(path, gex_only=False)
+    n_features_total = adata.n_vars
+    if feature_type_column in adata.var.columns:
+        keep = adata.var[feature_type_column].astype(str) == gex_feature_type
+        if keep.sum() == 0:
+            raise ValueError(
+                f"{sample_id}: no {gex_feature_type!r} features in {path}; "
+                f"feature types present: {sorted(adata.var[feature_type_column].astype(str).unique())}"
+            )
+        if keep.sum() < adata.n_vars:
+            adata = adata[:, keep.to_numpy()].copy()
+    if var_names == "gene_ids" and "gene_ids" in adata.var.columns:
+        adata.var["gene_symbols"] = adata.var_names.astype(str)
+        adata.var_names = adata.var["gene_ids"].astype(str)
+    adata.var_names = adata.var_names.astype(str)
+    adata.var_names_make_unique()
+    adata.X = _to_int_csr(adata.X, f"{sample_id} ({path})")
+    adata.layers["counts"] = adata.X.copy()
+    barcodes = adata.obs_names.astype(str)
+    if barcodes.has_duplicates:
+        raise ValueError(f"{sample_id}: duplicate barcodes inside {path}")
+    adata.obs[BARCODE_KEY] = barcodes.to_numpy()
+    adata.obs_names = pd.Index([f"{sample_id}_{b}" for b in barcodes])
+    adata.obs[LANE_KEY] = pd.Categorical([sample_id] * adata.n_obs)
+    adata.obs["sample_id"] = pd.Categorical([sample_id] * adata.n_obs)
+    adata.uns["source_path"] = str(path)
+    logger.info(
+        "%s: loaded %d cells x %d genes from %s (%d features in file)",
+        sample_id, adata.n_obs, adata.n_vars, path.name, n_features_total,
+    )
+    return adata
+
+
+def read_10x_mtx_sample(
+    path: str | Path,
+    sample_id: str,
+    *,
+    var_names: str = "gene_symbols",
+    gex_feature_type: str = "Gene Expression",
+    feature_type_column: str = "feature_types",
+) -> ad.AnnData:
+    """MTX-directory counterpart of :func:`read_10x_h5` with the same contract."""
+    path = Path(path)
+    _check_mtx_dir(path, sample_id)
+    adata = sc.read_10x_mtx(path, var_names="gene_symbols", cache=False, gex_only=False)
+    if feature_type_column in adata.var.columns:
+        keep = adata.var[feature_type_column].astype(str) == gex_feature_type
+        if keep.sum() == 0:
+            raise ValueError(f"{sample_id}: no {gex_feature_type!r} features in {path}")
+        if keep.sum() < adata.n_vars:
+            adata = adata[:, keep.to_numpy()].copy()
+    if var_names == "gene_ids" and "gene_ids" in adata.var.columns:
+        adata.var["gene_symbols"] = adata.var_names.astype(str)
+        adata.var_names = adata.var["gene_ids"].astype(str)
+    adata.var_names = adata.var_names.astype(str)
+    adata.var_names_make_unique()
+    adata.X = _to_int_csr(adata.X, f"{sample_id} ({path})")
+    adata.layers["counts"] = adata.X.copy()
+    barcodes = adata.obs_names.astype(str)
+    adata.obs[BARCODE_KEY] = barcodes.to_numpy()
+    adata.obs_names = pd.Index([f"{sample_id}_{b}" for b in barcodes])
+    adata.obs[LANE_KEY] = pd.Categorical([sample_id] * adata.n_obs)
+    adata.obs["sample_id"] = pd.Categorical([sample_id] * adata.n_obs)
+    adata.uns["source_path"] = str(path)
+    logger.info("%s: loaded %d cells x %d genes from %s", sample_id, adata.n_obs, adata.n_vars, path)
+    return adata
+
+
+def read_10x_guide_features(
+    path: str | Path,
+    sample_id: str,
+    *,
+    guide_feature_types: Sequence[str] = ("CRISPR Guide Capture", "Custom"),
+    feature_type_column: str = "feature_types",
+) -> ad.AnnData:
+    """Read the guide (non-GEX) features of a 10x matrix (h5 or MTX dir).
+
+    Returns an AnnData of raw integer counts over the file's own barcodes
+    (``obs_names`` = bare barcodes); alignment to the GEX object is done by
+    the caller.
+    """
+    path = Path(path)
+    if path.is_dir():
+        adata = sc.read_10x_mtx(path, var_names="gene_ids", cache=False, gex_only=False)
+    else:
+        adata = sc.read_10x_h5(path, gex_only=False)
+        if "gene_ids" in adata.var.columns:
+            adata.var["guide_symbol"] = adata.var_names.astype(str)
+            adata.var_names = adata.var["gene_ids"].astype(str)
+    if feature_type_column in adata.var.columns:
+        keep = adata.var[feature_type_column].astype(str).isin(list(guide_feature_types))
+        if keep.sum() == 0:
+            raise ValueError(
+                f"{sample_id}: no guide features of type {list(guide_feature_types)} in {path}; "
+                f"present: {sorted(adata.var[feature_type_column].astype(str).unique())}"
+            )
+        adata = adata[:, keep.to_numpy()].copy()
+    adata.var_names = adata.var_names.astype(str)
+    adata.var_names_make_unique()
+    adata.X = _to_int_csr(adata.X, f"{sample_id} guides ({path})")
+    return adata
+
+
+def strip_barcode_suffix(barcodes: Sequence[str], suffix_regex: Optional[str]) -> np.ndarray:
+    """Remove a trailing GEM-group suffix (``-1``) from 10x barcodes."""
+    arr = pd.Index(barcodes).astype(str)
+    if suffix_regex:
+        arr = arr.str.replace(suffix_regex, "", regex=True)
+    return arr.to_numpy()
