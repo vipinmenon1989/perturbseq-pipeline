@@ -18,16 +18,19 @@ from perturbseq_pipeline.dual_guides import (
     OBS_SLOT_NSTRONG,
     OBS_SLOT_TARGET,
     STATUS_AMBIGUOUS_SLOT,
+    STATUS_PAIR_TARGET_NTC,
+    STATUS_PAIR_TARGET_NTC_PROVISIONAL,
+    STATUS_UNKNOWN_GUIDE,
+    OBS_SG_CLASS,
+    OBS_SG_TARGET,
+    single_guide_diagnostic_table,
     STATUS_BELOW_MIN_UMI,
-    STATUS_DESIGNED_PAIR,
     STATUS_DUAL_TARGET,
     STATUS_INCOMPLETE,
-    STATUS_INVALID_PAIR,
+    STATUS_UNRESOLVED,
     STATUS_NO_GUIDE,
-    STATUS_NTC_PAIR,
-    STATUS_SAME_TARGET,
-    STATUS_TARGET_NTC_PROVISIONAL,
-    STATUS_TARGET_NTC_UNCONFIRMED,
+    STATUS_PAIR_NTC,
+    STATUS_PAIR_TARGETING,
     pair_assignment_per_lane,
     pair_assignment_summary,
 )
@@ -66,7 +69,7 @@ CELLS = {
 }
 
 
-def _build(mode="dual_guide_pair", pair_map=None, policy="ambiguous", with_scaffold_var=True):
+def _build(mode="pair", pair_map=None, policy="ambiguous", with_scaffold_var=True, diagnostic=False):
     X = np.zeros((len(CELLS), len(GUIDES)))
     names = list(CELLS)
     for i, (cell, counts) in enumerate(CELLS.items()):
@@ -90,6 +93,7 @@ def _build(mode="dual_guide_pair", pair_map=None, policy="ambiguous", with_scaff
     cfg.guides.max_second_umi = -1
     cfg.guides.pair_map_file = pair_map
     cfg.guides.ntc_partner_policy = policy
+    cfg.guides.single_guide_diagnostic = diagnostic
     return expr, guides, cfg
 
 
@@ -110,19 +114,19 @@ def test_valid_same_target_pair():
     res = assign_guides(expr, guides, cfg)
     o = res.obs.loc["same_target"]
     assert o[OBS_CLASS] == CLASS_TARGETING and o[OBS_TARGET] == "X"
-    assert o[OBS_PAIR_STATUS] == STATUS_SAME_TARGET and o[OBS_PAIR] == "X"
+    assert o[OBS_PAIR_STATUS] == STATUS_PAIR_TARGETING and o[OBS_PAIR] == "X"
     assert o[OBS_GUIDE] == "A1|C1" and o[OBS_PAIR_ID] == "A1|C1"
     assert o[OBS_SLOT_ID.format(c="A")] == "A1" and o[OBS_SLOT_ID.format(c="C")] == "C1"
     assert o[OBS_SLOT_TARGET.format(c="A")] == "X" and o[OBS_SLOT_TARGET.format(c="C")] == "X"
     assert bool(o[OBS_PAIR_PROVISIONAL]) is True  # no explicit pair map
-    assert o[OBS_MODE] == "dual_guide_pair"
+    assert o[OBS_MODE] == "pair"
 
 
 def test_targeting_plus_ntc_pair_policies():
     expr, guides, cfg = _build(policy="ambiguous")
     res = assign_guides(expr, guides, cfg)
     o = res.obs.loc["target_ntc"]
-    assert o[OBS_CLASS] == CLASS_AMBIGUOUS and o[OBS_PAIR_STATUS] == STATUS_TARGET_NTC_UNCONFIRMED
+    assert o[OBS_CLASS] == CLASS_AMBIGUOUS and o[OBS_PAIR_STATUS] == STATUS_PAIR_TARGET_NTC
     assert o[OBS_PAIR] == "X"  # the intended target is still recorded
     assert o[OBS_SLOT_TARGET.format(c="C")] == "ntc"
 
@@ -130,7 +134,7 @@ def test_targeting_plus_ntc_pair_policies():
     res = assign_guides(expr, guides, cfg)
     o = res.obs.loc["target_ntc"]
     assert o[OBS_CLASS] == CLASS_TARGETING and o[OBS_TARGET] == "X"
-    assert o[OBS_PAIR_STATUS] == STATUS_TARGET_NTC_PROVISIONAL and bool(o[OBS_PAIR_PROVISIONAL])
+    assert o[OBS_PAIR_STATUS] == STATUS_PAIR_TARGET_NTC_PROVISIONAL and bool(o[OBS_PAIR_PROVISIONAL])
 
 
 def test_dual_target_pair_is_never_collapsed():
@@ -149,15 +153,15 @@ def test_invalid_and_designed_pairs_with_explicit_map(tmp_path):
     expr, guides, cfg = _build(pair_map=pm)
     res = assign_guides(expr, guides, cfg)
     ok = res.obs.loc["same_target"]
-    assert ok[OBS_CLASS] == CLASS_TARGETING and ok[OBS_PAIR_STATUS] == STATUS_DESIGNED_PAIR
+    assert ok[OBS_CLASS] == CLASS_TARGETING and ok[OBS_PAIR_STATUS] == STATUS_PAIR_TARGETING
     assert ok[OBS_PAIR_ID] == "V1" and not bool(ok[OBS_PAIR_PROVISIONAL])
     bad = res.obs.loc["cross_pair"]
-    assert bad[OBS_CLASS] == CLASS_AMBIGUOUS and bad[OBS_PAIR_STATUS] == STATUS_INVALID_PAIR
+    assert bad[OBS_CLASS] == CLASS_AMBIGUOUS and bad[OBS_PAIR_STATUS] == STATUS_UNRESOLVED
     assert bad[OBS_TARGET] == cfg.guides.ambiguous_label
     # under the provisional rule the same cell is a valid same-target pair
     expr, guides, cfg = _build(pair_map=_pair_map(tmp_path, explicit=False))
     res = assign_guides(expr, guides, cfg)
-    assert res.obs.loc["cross_pair", OBS_PAIR_STATUS] == STATUS_SAME_TARGET
+    assert res.obs.loc["cross_pair", OBS_PAIR_STATUS] == STATUS_PAIR_TARGETING
     assert bool(res.obs.loc["cross_pair", OBS_PAIR_PROVISIONAL])
 
 
@@ -166,7 +170,7 @@ def test_missing_c_guide_is_incomplete():
     res = assign_guides(expr, guides, cfg)
     o = res.obs.loc["missing_C"]
     assert o[OBS_CLASS] == CLASS_AMBIGUOUS
-    assert o[OBS_PAIR_STATUS] == STATUS_INCOMPLETE.format(c="A")
+    assert o[OBS_PAIR_STATUS] == STATUS_INCOMPLETE
     assert o[OBS_SLOT_ID.format(c="A")] == "A1"
     assert o[OBS_SLOT_ID.format(c="C")] == cfg.guides.unassigned_label
 
@@ -193,7 +197,7 @@ def test_weak_runner_ups_do_not_block_the_pair():
     expr, guides, cfg = _build()
     res = assign_guides(expr, guides, cfg)
     o = res.obs.loc["weak_second"]
-    assert o[OBS_CLASS] == CLASS_TARGETING and o[OBS_PAIR_STATUS] == STATUS_SAME_TARGET
+    assert o[OBS_CLASS] == CLASS_TARGETING and o[OBS_PAIR_STATUS] == STATUS_PAIR_TARGETING
     assert int(o[OBS_SLOT_NSTRONG.format(c="A")]) == 2  # A2 = 3 UMIs is "strong" but dominated
 
 
@@ -212,7 +216,7 @@ def test_ntc_pair_is_non_targeting():
     res = assign_guides(expr, guides, cfg)
     o = res.obs.loc["ntc_pair"]
     assert o[OBS_CLASS] == CLASS_NTC and o[OBS_TARGET] == "ntc"
-    assert o[OBS_PAIR_STATUS] == STATUS_NTC_PAIR and o[OBS_GUIDE] == "An|Cn"
+    assert o[OBS_PAIR_STATUS] == STATUS_PAIR_NTC and o[OBS_GUIDE] == "An|Cn"
 
 
 def test_zero_count_design_entry_is_kept_in_reference():
@@ -278,7 +282,47 @@ def test_config_rejects_bad_mode_and_policy():
     with pytest.raises(ValueError, match="ntc_partner_policy"):
         cfg.validate()
     cfg = _valid_cfg()
-    cfg.guides.assignment_mode = "dual_guide_pair"
+    cfg.guides.assignment_mode = "pair"
     cfg.guides.pair_map_file = "/nonexistent/pair_map.csv"
     with pytest.raises(ValueError, match="pair_map_file"):
         cfg.validate()
+
+
+def test_unknown_guide_and_single_guide_diagnostic():
+    expr, guides, cfg = _build(diagnostic=True)
+    # a cell whose only strong guide has no scaffold class
+    X = guides.X.toarray()
+    X[list(CELLS).index("zero"), COL["Z1"]] = 8
+    guides.X = sparse.csr_matrix(X)
+    res = assign_guides(expr, guides, cfg)
+    assert res.obs.loc["zero", OBS_PAIR_STATUS] == STATUS_UNKNOWN_GUIDE
+    assert res.obs.loc["zero", OBS_CLASS] == CLASS_AMBIGUOUS
+    # diagnostic columns reproduce the single-guide rule but never drive the primary labels
+    assert res.obs.loc["same_target", OBS_SG_CLASS] == CLASS_AMBIGUOUS  # 10 vs 8 fails dominance
+    assert res.obs.loc["same_target", OBS_CLASS] == CLASS_TARGETING
+    assert res.obs.loc["missing_C", OBS_SG_CLASS] == CLASS_TARGETING and res.obs.loc["missing_C", OBS_SG_TARGET] == "X"
+    assert res.obs.loc["missing_C", OBS_CLASS] == CLASS_AMBIGUOUS
+    tab = single_guide_diagnostic_table(res)
+    assert tab["n_cells"].sum() == res.n_obs
+
+
+def test_pair_reference_supplies_targets_when_var_lacks_them(tmp_path):
+    expr, guides, cfg = _build(pair_map=_pair_map(tmp_path, explicit=False), with_scaffold_var=False)
+    del guides.var["target_gene_name"]
+    cfg.guides.target_feature_column = None
+    res = assign_guides(expr, guides, cfg)
+    assert res.obs.loc["same_target", OBS_TARGET] == "X"
+    assert res.obs.loc["ntc_pair", OBS_CLASS] == CLASS_NTC
+    assert list(guides.var["scaffold"]) == SCAFFOLD
+
+
+def test_pair_mode_alias_and_pair_reference_key():
+    cfg = _valid_cfg()
+    cfg.guides.assignment_mode = "pair"
+    cfg.guides.pair_reference = "/nonexistent/ref.csv"
+    with pytest.raises(ValueError, match="pair_map_file"):
+        cfg.validate()
+    cfg = _valid_cfg()
+    cfg.guides.assignment_mode = "pair"
+    cfg.validate()
+    assert cfg.guides.assignment_mode == "dual_guide_pair"

@@ -165,6 +165,11 @@ class InputConfig:
 
     cache_mtx: bool = True
 
+    #: How cells from several MTX lanes are made unique: ``suffix`` (historical,
+    #: ``<barcode>-<lane>``) or ``prefix`` (``<lane>_<barcode>``). Applied to
+    #: single-lane runs too so per-lane and combined objects share one id scheme.
+    cell_id_format: str = "suffix"
+
     #: h5ad layer containing raw counts.
     counts_layer: Optional[str] = None
 
@@ -424,10 +429,33 @@ class GuideConfig:
     # Assignment mode (single-guide dominance vs dual-guide pair)
     # ------------------------------------------------------------------
 
-    #: ``single_guide`` (historical top-1 dominance rule) or
-    #: ``dual_guide_pair`` (strongest scaffold-A + strongest scaffold-C guide,
-    #: interpreted through ``pair_map_file``; see ``dual_guides.py``).
+    #: ``single_guide`` (historical top-1 dominance rule) or ``pair`` (alias
+    #: ``dual_guide_pair``): strongest scaffold-A + strongest scaffold-C guide,
+    #: interpreted through the pair reference; see ``dual_guides.py``.
     assignment_mode: str = "single_guide"
+
+    #: Pair reference table (CSV/TSV, one row per designed guide): alias of
+    #: ``pair_map_file`` used by the pair workflow; whichever is set is used.
+    pair_reference: Optional[str] = None
+
+    #: Pair assignment is the primary label set (perturbation_class / target_gene
+    #: are derived from pairs). Must be true in pair mode.
+    pair_assignment_primary: bool = True
+
+    #: Require both scaffold slots to be resolved for any assignment; incomplete
+    #: pairs are labelled ``incomplete_pair`` (ambiguous).
+    require_complete_pair: bool = True
+
+    #: What happens to unresolved pairs (``unresolved_pair`` etc.): ``exclude``
+    #: keeps them in the object as ambiguous and out of primary testing.
+    unresolved_pair_policy: str = "exclude"
+
+    #: Also compute the single-guide top-vs-second rule on the same matrix and
+    #: store it as ``single_guide_diagnostic_*`` obs columns (diagnostic only).
+    single_guide_diagnostic: bool = False
+
+    #: Column of the pair reference holding the designed protospacer (or ``auto``).
+    sequence_column: str = "auto"
 
     #: CSV/TSV with one row per designed guide (``guide_id``), optional
     #: ``pair_id_column`` (explicit vector pairing; authoritative when present)
@@ -435,10 +463,12 @@ class GuideConfig:
     #: using the scaffold class stored in ``guides.var``.
     pair_map_file: Optional[str] = None
 
-    #: ``guides.var`` (or pair-map) column holding the scaffold class per guide.
+    #: ``guides.var`` (or pair-map) column holding the scaffold class per guide
+    #: (``auto`` = detect among scaffold / scaffold_class / scaffold_id).
     scaffold_column: str = "scaffold"
 
-    #: Pair-map column holding the designed pair / vector id.
+    #: Pair-map column holding the designed pair / vector id (``auto`` = detect
+    #: among pair_id / construct_id / vector_id).
     pair_id_column: str = "pair_id"
 
     #: The two scaffold classes forming a pair (order: first, second slot).
@@ -1773,11 +1803,21 @@ class Config:
                 "ambiguous labels"
             )
 
-        if guide_cfg.assignment_mode not in ("single_guide", "dual_guide_pair"):
+        if guide_cfg.assignment_mode not in ("single_guide", "dual_guide_pair", "pair"):
             raise ValueError(
-                "guides.assignment_mode must be 'single_guide' or 'dual_guide_pair', "
+                "guides.assignment_mode must be 'single_guide', 'pair' or 'dual_guide_pair', "
                 f"got {guide_cfg.assignment_mode!r}"
             )
+        if guide_cfg.assignment_mode == "pair":
+            guide_cfg.assignment_mode = "dual_guide_pair"
+        if guide_cfg.pair_reference and not guide_cfg.pair_map_file:
+            guide_cfg.pair_map_file = guide_cfg.pair_reference
+        if guide_cfg.assignment_mode == "dual_guide_pair" and not guide_cfg.pair_assignment_primary:
+            raise ValueError("guides.pair_assignment_primary must be true when assignment_mode is 'pair'")
+        if guide_cfg.unresolved_pair_policy != "exclude":
+            raise ValueError("guides.unresolved_pair_policy: only 'exclude' is implemented")
+        if self.input.cell_id_format not in ("suffix", "prefix"):
+            raise ValueError("input.cell_id_format must be 'suffix' or 'prefix'")
 
         if guide_cfg.ntc_partner_policy not in ("ambiguous", "provisional_target"):
             raise ValueError(

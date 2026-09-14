@@ -1100,7 +1100,7 @@ def assign_guides(
 
     if guides is None:
 
-        if cfg.guides.assignment_mode == "dual_guide_pair":
+        if cfg.guides.assignment_mode in ("dual_guide_pair", "pair"):
             raise ValueError(
                 "guides.assignment_mode='dual_guide_pair' needs a guide count matrix; "
                 "label-based guide input cannot be pair-resolved"
@@ -1111,7 +1111,7 @@ def assign_guides(
             cfg,
         )
 
-    if cfg.guides.assignment_mode == "dual_guide_pair":
+    if cfg.guides.assignment_mode in ("dual_guide_pair", "pair"):
         from .dual_guides import assign_guide_pairs
 
         return assign_guide_pairs(expr, guides, cfg)

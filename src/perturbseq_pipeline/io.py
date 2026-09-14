@@ -34,6 +34,7 @@ LANE_KEY = "lane_id"
 #: ``obs`` column holding a pre-computed per-cell guide label, when the input
 #: supplies one instead of a guide count matrix.
 RAW_GUIDE_LABEL = "guide_id_raw"
+BARCODE_KEY = "cell_barcode"
 
 
 @dataclass
@@ -155,6 +156,26 @@ def _load_mtx(cfg: Config) -> LoadedData:
 
     adata.var_names_make_unique()
 
+    if cfg.input.cell_id_format == "prefix":
+        # ``<lane>_<barcode>``: identical for single-lane and combined runs, so a
+        # per-lane object is an exact row subset of the combined object.
+        lane_keys = list(lanes)
+        lane_of = adata.obs[LANE_KEY].astype(str).to_numpy()
+        if len(lane_keys) == 1:
+            bare = adata.obs_names.to_numpy().astype(str)
+        else:
+            # strip the "-<lane>" suffix appended by sc.concat(index_unique="-")
+            bare = np.array([n[: -(len(l) + 1)] if n.endswith("-" + l) else n for n, l in zip(adata.obs_names, lane_of)], dtype=object)
+        new_names = pd.Index([f"{l}_{b}" for l, b in zip(lane_of, bare)])
+        if not new_names.is_unique:
+            raise ValueError("input.cell_id_format=prefix produced non-unique cell ids")
+        rename = dict(zip(adata.obs_names, new_names))
+        adata.obs_names = new_names
+        adata.obs[BARCODE_KEY] = pd.Index(bare).astype(str)
+        if guides_all is not None:
+            guides_all.obs_names = pd.Index([rename[n] for n in guides_all.obs_names])
+        logger.info("Cell ids use the '<lane>_<barcode>' prefix format (e.g. %s)", new_names[0])
+
     if guides_all is not None:
         # Expression and guides came from separate quantifications; nothing was
         # split, so this path never calls split_features.
@@ -196,6 +217,22 @@ def _read_guide_mtx(
     g.var_names_make_unique()
 
     shared = cell_names.intersection(g.obs_names)
+    if len(shared) == 0:
+        # Reconcile the 10x "-<gem group>" suffix: separate quantifications often
+        # emit bare 16-mers while Cell Ranger appends "-1" (or vice versa).
+        import re as _re
+
+        strip = lambda names: pd.Index([_re.sub(r"-\d+$", "", str(n)) for n in names])
+        bare_expr = strip(cell_names)
+        bare_guide = strip(g.obs_names)
+        if bare_expr.is_unique and bare_guide.is_unique and len(bare_expr.intersection(bare_guide)) > 0:
+            to_full = dict(zip(bare_expr, cell_names))
+            g.obs_names = pd.Index([to_full.get(b, str(orig)) for b, orig in zip(bare_guide, g.obs_names)])
+            shared = cell_names.intersection(g.obs_names)
+            logger.info(
+                "Lane %s: guide barcodes matched the expression barcodes after reconciling the '-<n>' suffix (%d shared)",
+                lane_id, len(shared),
+            )
     if len(shared) == 0:
         raise ValueError(
             f"No barcode overlap between the expression and guide matrices for "
@@ -1003,7 +1040,6 @@ def relocate_if_large(path: Path, cfg: Config) -> Path:
 # ---------------------------------------------------------------------------
 
 #: ``obs`` column preserving the original 10x cell barcode.
-BARCODE_KEY = "cell_barcode"
 
 
 def _to_int_csr(X, what: str):
