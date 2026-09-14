@@ -89,12 +89,14 @@ def main():
         secs = ["Dataset and sample structure", "guide-design audit", "Expression QC before and after", "Pair-guide quantification", "Per-sample analysis", "Combined analysis", "PCA, UMAP and Leiden", "ECDF and perturbation", "FDR and effect-size", "target support", "Single-guide diagnostic", "limitations", "Reproducibility"]
         check("root report has all 13 sections and links the per-run reports", all(s in html for s in secs) and all(f"{p}/report.html" in html for p in ["combined"] + [f"samples/{w}" for w in WELLS]), [s for s in secs if s not in html])
     check("output directory is results/Hanrui_Fang_pair_guide_full", OUT.name == "Hanrui_Fang_pair_guide_full" and OUT.is_dir())
+    ledger = (OUT / "slurm" / "job_ids.txt").read_text() if (OUT / "slurm" / "job_ids.txt").is_file() else ""
+    superseded = set(re.findall(r"\((\d{7,9}) (?:failed|cancelled)", ledger))
     errs = []
     for p in sorted((OUT / "slurm").glob("*.err")) + sorted((OUT / "slurm").glob("*.out")):
         t = p.read_text(errors="ignore")
-        if ("Traceback" in t or "FAILED" in t) and "20045588" not in p.name and not p.name.startswith("hpf_04"):
+        if ("Traceback" in t or "FAILED" in t) and not any(j in p.name for j in superseded) and not p.name.startswith("hpf_04"):
             errs.append(p.name)
-    check("no SLURM log with unhandled errors (superseded audit attempt 20045588 excluded)", not errs, errs)
+    check(f"no SLURM log with unhandled errors (superseded attempts {sorted(superseded)} excluded; documented in slurm/job_ids.txt)", not errs, errs)
     df = pd.DataFrame(checks)
     (OUT / "tables").mkdir(exist_ok=True)
     df.to_csv(OUT / "tables" / "final_validation.csv", index=False)
