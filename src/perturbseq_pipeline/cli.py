@@ -933,6 +933,31 @@ def run_pipeline(
         "=== Stage 2/14: quality control ==="
     )
 
+    unfiltered_h5ad_path: Optional[Path] = None
+
+    # All-cells checkpoint: every loaded cell with QC metrics, written BEFORE
+    # any filtering so QC-failed cells are never lost. Previously this file
+    # was only written in the assigned_only branch (after QC), which made
+    # output.write_unfiltered_h5ad a silent no-op for default runs.
+    if (
+        cfg.output.write_unfiltered_h5ad
+        and not cfg.cluster.assigned_only
+    ):
+        all_cells = expr.copy()
+        qc_mod.compute_qc_metrics(all_cells, cfg)
+        all_cells.uns["qc_stage"] = (
+            "all loaded cells before any QC filtering (basic QC metrics only)"
+        )
+        unfiltered_h5ad_path = _write_unfiltered_object(
+            all_cells, guides, cfg, outdir, io_mod
+        )
+        logger.info(
+            "Wrote all-cells checkpoint (%d cells, pre-QC) to %s",
+            all_cells.n_obs, unfiltered_h5ad_path,
+        )
+        del all_cells
+        _collect("all-cells checkpoint", cfg=cfg, large_mode=large_mode)
+
     expr = qc_mod.prefilter(
         expr,
         cfg,
@@ -1120,9 +1145,6 @@ def run_pipeline(
         cfg,
     )
 
-    unfiltered_h5ad_path: Optional[
-        Path
-    ] = None
 
     singlets = (
         _assigned_singlet_mask(

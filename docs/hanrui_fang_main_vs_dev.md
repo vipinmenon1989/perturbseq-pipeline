@@ -41,6 +41,12 @@ changes noted below (`guides.ntc_patterns`, `io.write_h5ad` nullable-string opt-
 | Tests (run on SLURM, this env) | see "Run outcomes" | 247 passed (job 20045137) |
 | Required dependencies | scanpy, anndata, numpy, pandas, scipy, matplotlib, seaborn, leidenalg, igraph, statsmodels, jinja2, pyyaml | same + pertpy (never imported), joblib, threadpoolctl, psutil, h5py, openpyxl, scikit-image; `gpu` extra |
 | SLURM / HPC support | none | `compute.py` (SLURM CPU detection, optional GPU, CPU fallback), `scaling`/`storage` config, sbatch templates |
+| H5AD input support | yes (`input.mode: h5ad`); guides recovered from `var[feature_types]` (`split_features`), or `guide_h5ad`, `guide_table`, `guide_obs_column`; `counts_layer` / `normalized_layer` honoured (`apply_layer_choices`) | identical code (`io._load_h5ad`, `split_features`) |
+| Feature-type splitting | `split_features`: GEX = `var[feature_type_column] == gex_feature_type`; guides = `isin(guide_feature_types)`; guides re-indexed by `var["gene_ids"]`, original name kept as `guide_symbol`; extra guide var columns preserved | identical |
+| Guide-count handling (h5ad mode) | guide AnnData over the same cells; assignment via top-2 dominance on raw UMIs; merged back into `obsm["guide_counts"]` at output | identical; in addition `target_feature_column` reads the target from a guide `var` column (e.g. `target_gene_name`) |
+| Cluster enrichment | `enrichment.enabled` (default true): per target × Leiden cluster odds ratios vs `ntc`/`other`, BH FDR, optional CMH `stratify_by`, guide concordance, permutation omnibus | identical module |
+| Optional dependencies | `harmony`, `demo`, `networks`, `ps` (pertps), `dev` | same + `gpu`; hard deps add pertpy (unused), joblib, threadpoolctl, psutil, h5py, openpyxl, scikit-image |
+| Disabling advanced modules | `modules.enabled`, `ps_score.enabled`, `lochness.enabled` exist; no distance / distance-space / meta stages | `modules`, `ps_score`, `lochness`, `distance`, `distance_space`, `meta_analysis` all have `enabled`; `visualization.*` toggles the atlas/space figures |
 | Branch-specific issues | `write_h5ad` lacks the anndata ≥ 0.11 nullable-string opt-in → h5ad writing was expected to fail with anndata ≥ 0.11 — **not reproduced**: the comparison run wrote `processed.h5ad` fine; no `target_feature_column`, so the `NO-TARGET` label parses to `NO` under default delimiters and controls are lost unless `target_split_delims` **and** `ntc_patterns` are both overridden | `pertpy` is an unused hard dependency; stages 10–12 (distance, distance space, meta) default on; `guides.var["target_gene"]` written to a copy, so `uns["guide_target_genes"]` is empty (shared with `main`); `ps_score` skips cleanly when `pertps` is missing |
 
 Shared limitation relevant to this dataset: the assignment rule is **single-guide**. Every cell in
@@ -61,7 +67,7 @@ Guide features are written as `id = <TARGET>_<n>`, `name = <raw design label>` (
 
 These are guide-metadata interpretation settings, not QC or statistical tuning.
 
-## Run outcomes
+## Run outcomes (MTX-mode comparison, 2026-09-13 first pass)
 
 All jobs ran on SLURM inside the `perturbseq-pipeline` conda env (Python 3.11.15, scanpy 1.11.5,
 anndata 0.12.19, pertps 0.1.0 installed).
@@ -117,3 +123,39 @@ Caveats that apply to **both** branches and are carried into the final analysis:
 dominance rule labels 53 % of cells ambiguous in this dual-guide (A + C) library; the pipeline never
 writes QC-failed cells (the pre-QC object used for before/after figures comes from the basic-QC
 stage); design labels that are not HGNC symbols are untestable without an alias table.
+
+
+## h5ad-mode comparison (core workflow, this run)
+
+Both branches were run on the **same combined H5AD** (`work/Hanrui_fang/Hanrui_fang_combined.h5ad`,
+163,991 cells × 38,606 genes + 560 guide features) with default QC / clustering / perturbation
+settings and the advanced modules disabled (`main`: modules, ps_score, lochness off; `dev`: those plus
+distance, distance_space, meta_analysis off). Earlier MTX-mode outputs in the same directories were moved
+to `stale_mtx_mode_run_20045141_2/` subfolders.
+
+| Job | Branch | Result |
+|---|---|---|
+| 20045157 | `dev` | pytest **248 passed** (247 + new all-cells checkpoint test) |
+| 20045175 | `main` | `config/Hanrui_fang_main_default.yaml`, 12 min, 37.8 GB peak, 0 warnings |
+| 20045176 | `dev` | `config/Hanrui_fang_dev_default.yaml`, 16 min, 37.4 GB peak, 0 warnings |
+| 20045177 | `dev` (final) | `config/Hanrui_fang.yaml` → `results/Hanrui_fang/`, 15 min, 38.4 GB, 0 warnings; numerically identical to 20045176 |
+
+| Quantity | `main_default` | `dev_default` / final |
+|---|---:|---:|
+| Loaded → prefilter (≥ 200 genes) → ≥ 1000 genes → mt < 20 % | 163,991 → 163,868 → 161,649 → 161,594 | identical |
+| Genes after `min_cells_per_gene` | 28,198 | 28,198 |
+| Guide classes (targeting / NTC / ambiguous / unassigned) | 50,268 / 27,071 / 84,252 / 3 | identical |
+| Distinct targets | 42 (rsID labels collapse; requires `target_split_delims: ["_"]` + hand-added `^no[-_.]?target` pattern) | 44 (`target_feature_column: target_gene_name`; labels verbatim) |
+| Leiden clusters (res 1.0) | 22 | 22 |
+| Targets tested / passing (KS-FDR < 0.05 & log2FC < 0 vs NTC) | 35 / 28 | 34 / 28 |
+| Targets skipped | 7 | 10 (three rsID labels + `CEBPb`, `C6orf106`, `CCBL2` non-HGNC; `BNC2`, `SMIM22` not expressed; `CBWD1`, `RAPGEF5` absent after gene filter) |
+| Cluster enrichment (vs NTC) | 39 significant target×cluster pairs | 39 / 38 |
+| `Hanrui_fang_all_cells.h5ad` written | no (`write_unfiltered_h5ad` gated on `assigned_only`) | yes — pre-QC object with all 163,991 cells (fix in this branch, `cli.py` Stage 2) |
+| Figures / tables | 238 / 28 | 244 / 36 |
+
+Per-target statistics agree wherever the cell sets agree; `LIPA` (Δlog2FC 0.25) and `FHL3` (0.13) differ
+only because `main` merges the rsID guide sets into the gene-level sets.
+
+**Decision unchanged: `dev`** (`de12b52` + `37c536b` + this task's all-cells checkpoint fix), for the same
+reasons as above; in h5ad mode the only functional differences are `target_feature_column` (correct control
+recognition and rsID-distinct targets without rewriting guide ids) and the all-cells checkpoint.

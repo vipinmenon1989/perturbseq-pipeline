@@ -1455,3 +1455,21 @@ def test_benjamini_hochberg_tolerates_nan():
 
     q = benjamini_hochberg([0.01, np.nan, 0.5])
     assert np.isnan(q[1]) and not np.isnan(q[0])
+
+
+def test_all_cells_checkpoint_is_written_before_qc_for_default_runs(mtx_run, synthetic):
+    """output.write_unfiltered_h5ad (default true) must produce a pre-QC object
+    holding every loaded cell, not only in the assigned_only branch."""
+    import anndata as ad
+
+    assert mtx_run.unfiltered_h5ad is not None and Path(mtx_run.unfiltered_h5ad).is_file()
+    allc = ad.read_h5ad(mtx_run.unfiltered_h5ad)
+    n_input = sum(
+        len(pd.read_csv(Path(p) / "barcodes.tsv.gz", header=None)) for p in synthetic["lanes"].values()
+    )
+    assert allc.n_obs == n_input
+    assert allc.n_obs >= mtx_run.n_cells
+    for col in ("total_counts", "n_genes_by_counts", "pct_counts_mt", "lane_id"):
+        assert col in allc.obs.columns
+    assert "guide_counts" in allc.obsm
+    assert "lognorm" not in allc.layers

@@ -1,34 +1,174 @@
-# =========================================================================
-# Hanrui Fang — BRANCH COMPARISON RUN (main defaults, HF011A + HF011B)
-# Schema of origin/main f5a8fa0. main has no guides.target_feature_column,
-# so target labels must be parsed from the guide id "<TARGET>_<n>": splitting
-# on "_" only keeps "NO-TARGET" intact (the default delimiters would yield
-# "NO"); rsID-specific labels collapse onto the gene symbol on main.
-# =========================================================================
+# Branch comparison run: origin/main f5a8fa0 schema, combined H5AD input, advanced modules disabled
 run:
   name: Hanrui_fang_main_default
   outdir: /local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/perturbseq-pipeline/results/Hanrui_fang/pipeline_comparison/main_default
   seed: 0
-
 input:
-  mode: mtx
-  mtx_dirs:
-    HF011A: /local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/outputs/hanrui_fang_inputs/cellranger/HF011A/filtered_feature_bc_matrix
-    HF011B: /local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/outputs/hanrui_fang_inputs/cellranger/HF011B/filtered_feature_bc_matrix
-  guide_mtx_dirs:
-    HF011A: /local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/outputs/hanrui_fang_inputs/guides/HF011A
-    HF011B: /local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/outputs/hanrui_fang_inputs/guides/HF011B
-  cache_mtx: false
-
+  mode: h5ad
+  mtx_dirs: null
+  guide_mtx_dirs: null
+  h5ad: /local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/perturbseq-pipeline/work/Hanrui_fang/Hanrui_fang_combined.h5ad
+  guide_h5ad: null
+  guide_obs_column: null
+  feature_type_column: feature_types
+  gex_feature_type: Gene Expression
+  guide_feature_types:
+  - CRISPR Guide Capture
+  var_names: gene_symbols
+  cache_mtx: true
+  counts_layer: counts
+  normalized_layer: null
+  guide_table: null
+  guide_table_cell_column: cell
+  guide_table_gene_column: gene
+  guide_table_guide_column: sgrna
+  guide_table_count_column: umi_count
+  guide_table_strip_prefix: true
 metadata:
-  file: config/Hanrui_fang_sample_manifest.csv
+  file: null
   key_column: lane_id
   require_for_multilane: true
-
+qc:
+  min_genes_per_cell: 200
+  min_cells_per_gene: 3
+  min_genes_final: 1000
+  max_pct_mt: 20.0
+  max_pct_hb: null
+  min_counts_per_cell: null
+  mito_prefix: MT-
+  ribo_prefix:
+  - RPS
+  - RPL
+  hb_pattern: ^HB[^(P)]
 guides:
-  target_split_delims: ["_"]
-  ntc_patterns: ["^non[-_.]?targeting", "^non$", "^ntc", "scramble", "^safe[-_.]?harbor", "^no[-_.]?target"]
-
+  min_umi: 3
+  dominance_ratio: 2.0
+  max_second_umi: -1
+  detection_threshold: 3
+  target_regex: null
+  target_split_delims:
+  - _
+  ntc_patterns:
+  - ^non[-_.]?targeting
+  - ^non$
+  - ^ntc
+  - scramble
+  - ^safe[-_.]?harbor
+  - ^no[-_.]?target
+  unassigned_label: unassigned
+  ambiguous_label: ambiguous
+  ntc_label: ntc
+cluster:
+  target_sum: null
+  n_top_genes: 3000
+  n_pcs: 50
+  n_neighbors: 15
+  leiden_resolution: 1.0
+  umap_min_dist: 0.5
+  batch_key: null
+  regress_out: []
+  scale_max_value: 10.0
+  assigned_only: false
+perturbation:
+  controls:
+  - ntc
+  - other
+  primary_control: ntc
+  min_cells_per_target: 10
+  min_control_cells: 10
+  min_pct_expressing_control: 1.0
+  fdr_alpha: 0.05
+  max_log2fc_for_hit: 0.0
+  top_n_report: 12
+  umap_background_fraction: 0.1
+enrichment:
+  enabled: true
+  cluster_key: leiden
+  controls:
+  - ntc
+  - other
+  primary_control: ntc
+  fdr_alpha: 0.05
+  min_cells_per_target: 10
+  min_cells_per_cluster: 20
+  min_reference_cells: 10
+  odds_pseudocount: 0.5
+  stratify_by: null
+  guide_concordance: true
+  min_cells_per_guide: 5
+  permutations: 1000
+  top_n_report: 12
+modules:
+  enabled: false
+  cluster_key: leiden
+  gene_selection: cluster_markers
+  n_marker_genes_per_cluster: 100
+  marker_method: wilcoxon
+  min_cells_per_perturbation: 20
+  control: ntc
+  program_correlation: pearson
+  module_correlation: spearman
+  linkage_method: average
+  n_programs: 4
+  n_modules: 9
+  cluster_distance_threshold: 0.7
+  score_programs: true
+  hub_lfc_threshold: 0.5
+  de_fdr_alpha: 0.05
+  draw_networks: true
+  min_perturbations: 5
+  min_genes: 10
+  top_n_report: 12
+ps_score:
+  enabled: false
+  require: false
+  top_n_biomarkers: 100
+  scale_factor: 3.0
+  ps_threshold: 0.5
+  expression_cut: mean
+  expression_cut_quantile: 0.75
+  min_cells_per_target: 10
+  min_control_cells: 10
+  top_n_report: 12
+  compute_lda_umap: true
+  lda_n_pcs: 40
+  lda_max_genes: 5000
+  lda_highlight_threshold: 0.8
+lochness:
+  enabled: false
+  genotype_key: target_gene
+  n_neighbors: 300
+  n_pcs: 20
+  use_rep: null
+  recompute_neighbors: true
+  min_cells_per_target: 10
+  enrichment_cut: 0.5
+  noise_delta: 0.0
+  top_n_report: 12
+report:
+  title: "Hanrui Fang \u2014 main-branch comparison run"
+  embed_figures: true
+  figure_format: png
+  figure_dpi: 120
+  max_table_rows: 100
 output:
+  h5ad_name: Hanrui_fang_processed.h5ad
+  report_name: report.html
   write_unfiltered_h5ad: true
+  unfiltered_h5ad_name: Hanrui_fang_all_cells.h5ad
+  large_file_dir: null
+  large_file_threshold_mb: 50.0
+  merge_guides_into_h5ad: true
+  guide_obsm_key: guide_counts
+  write_guide_h5ad: false
+  save_figures_pdf: false
   archive: false
+  archive_name: null
+  archive_exclude:
+  - '*.h5ad'
+  - '*.h5'
+  - '*.loom'
+  - '*.tar.gz'
+  write_guide_table: true
+  guide_table_name: null
+  guide_table_min_umi: 3
