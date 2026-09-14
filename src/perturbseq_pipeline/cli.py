@@ -1112,6 +1112,17 @@ def run_pipeline(
             table_paths,
         )
 
+    if cfg.guides.assignment_mode == "dual_guide_pair":
+        from . import dual_guides as dual_mod
+
+        pair_summary = dual_mod.pair_assignment_summary(expr)
+        tables["pair_assignment_summary"] = pair_summary
+        _write_table("pair_assignment_summary", pair_summary, tabledir, table_paths)
+        pair_per_lane = dual_mod.pair_assignment_per_lane(expr)
+        if pair_per_lane is not None:
+            tables["pair_assignment_per_lane"] = pair_per_lane
+            _write_table("pair_assignment_per_lane", pair_per_lane, tabledir, table_paths)
+
     warnings.extend(
         qc_mod.check_guide_qc(
             expr,

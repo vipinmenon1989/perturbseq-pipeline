@@ -241,8 +241,10 @@ def count_fastq_file(
     codes: List[int] = []
     chunks: List[np.ndarray] = []
 
-    n = n_anchor = n_tso = n_matched = n_shift = n_mm = 0
+    n = n_anchor = n_tso = n_matched = n_shift = n_mm = n_mm_pos1 = 0
     n_bc_hit = n_bc_miss = n_bad_umi = n_unmatched_sampled_total = 0
+    # designed protospacer per guide index, to classify 1-mismatch rescues
+    designed_by_index: Dict[int, bytes] = {i: k for k, i in exact_index.items()}
 
     def flush():
         if codes:
@@ -282,6 +284,9 @@ def count_fastq_file(
                 n_shift += 1
             elif how == 2:
                 n_mm += 1
+                # 5' (position 1) substitution, e.g. the U6 +1 G: same 19-nt suffix
+                if seq[p - L + 1:p] == designed_by_index[g][1:]:
+                    n_mm_pos1 += 1
             guide_reads[g] += 1
             guide_scaf[g][scaf] += 1
             c = barcode_index.get(seq[:B])
@@ -310,6 +315,7 @@ def count_fastq_file(
         "reads_spacer_matched": n_matched,
         "reads_spacer_matched_via_shift": n_shift,
         "reads_spacer_matched_via_mismatch": n_mm,
+        "reads_spacer_matched_via_mismatch_pos1": n_mm_pos1,
         "reads_spacer_unmatched": n_anchor - n_matched,
         "reads_matched_barcode_in_gex": n_bc_hit,
         "reads_matched_barcode_not_in_gex": n_bc_miss,
@@ -514,7 +520,8 @@ def _aggregate_stats(stats: List[Dict[str, object]], spec: GuideReadSpec) -> Dic
     agg: Dict[str, object] = {}
     sum_keys = [
         "reads_total", "reads_with_tso", "reads_with_scaffold_anchor", "reads_spacer_matched",
-        "reads_spacer_matched_via_shift", "reads_spacer_matched_via_mismatch", "reads_spacer_unmatched",
+        "reads_spacer_matched_via_shift", "reads_spacer_matched_via_mismatch",
+        "reads_spacer_matched_via_mismatch_pos1", "reads_spacer_unmatched",
         "reads_matched_barcode_in_gex", "reads_matched_barcode_not_in_gex", "reads_invalid_umi",
     ] + [f"reads_scaffold_{n}" for n in spec.scaffold_names]
     for k in sum_keys:

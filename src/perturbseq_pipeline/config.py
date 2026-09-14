@@ -421,6 +421,35 @@ class GuideConfig:
     ntc_label: str = "non-targeting"
 
     # ------------------------------------------------------------------
+    # Assignment mode (single-guide dominance vs dual-guide pair)
+    # ------------------------------------------------------------------
+
+    #: ``single_guide`` (historical top-1 dominance rule) or
+    #: ``dual_guide_pair`` (strongest scaffold-A + strongest scaffold-C guide,
+    #: interpreted through ``pair_map_file``; see ``dual_guides.py``).
+    assignment_mode: str = "single_guide"
+
+    #: CSV/TSV with one row per designed guide (``guide_id``), optional
+    #: ``pair_id_column`` (explicit vector pairing; authoritative when present)
+    #: and optional ``scaffold_column``. ``None`` = provisional same-target rule
+    #: using the scaffold class stored in ``guides.var``.
+    pair_map_file: Optional[str] = None
+
+    #: ``guides.var`` (or pair-map) column holding the scaffold class per guide.
+    scaffold_column: str = "scaffold"
+
+    #: Pair-map column holding the designed pair / vector id.
+    pair_id_column: str = "pair_id"
+
+    #: The two scaffold classes forming a pair (order: first, second slot).
+    scaffold_classes: List[str] = field(default_factory=lambda: ["A", "C"])
+
+    #: How a resolved targeting + NTC pair is treated when no explicit pair map
+    #: confirms it: ``ambiguous`` (conservative) or ``provisional_target``
+    #: (assigned to the targeting guide's target, flagged provisional).
+    ntc_partner_policy: str = "ambiguous"
+
+    # ------------------------------------------------------------------
     # Basic QC stage: guide quantification and guide QC
     # ------------------------------------------------------------------
 
@@ -1743,6 +1772,27 @@ class Config:
                 "guides.ntc_label must differ from the unassigned and "
                 "ambiguous labels"
             )
+
+        if guide_cfg.assignment_mode not in ("single_guide", "dual_guide_pair"):
+            raise ValueError(
+                "guides.assignment_mode must be 'single_guide' or 'dual_guide_pair', "
+                f"got {guide_cfg.assignment_mode!r}"
+            )
+
+        if guide_cfg.ntc_partner_policy not in ("ambiguous", "provisional_target"):
+            raise ValueError(
+                "guides.ntc_partner_policy must be 'ambiguous' or 'provisional_target', "
+                f"got {guide_cfg.ntc_partner_policy!r}"
+            )
+
+        if len(guide_cfg.scaffold_classes) != 2 or len(set(guide_cfg.scaffold_classes)) != 2:
+            raise ValueError("guides.scaffold_classes must list exactly two distinct scaffold classes")
+
+        if guide_cfg.assignment_mode == "dual_guide_pair" and guide_cfg.pair_map_file:
+            if not Path(guide_cfg.pair_map_file).is_file():
+                raise ValueError(
+                    f"guides.pair_map_file not found: {guide_cfg.pair_map_file}"
+                )
 
         # ==============================================================
         # Clustering

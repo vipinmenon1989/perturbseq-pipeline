@@ -830,6 +830,13 @@ def merge_guides_into_expr(
         expr.uns["guide_target_genes"] = np.asarray(
             aligned.var["target_gene"].astype(str), dtype=object
         )
+    for var_col, uns_key in (
+        (cfg.guides.scaffold_column, "guide_scaffolds"),
+        (cfg.guides.pair_id_column, "guide_pair_ids"),
+        ("target_gene_name", "guide_target_gene_names"),
+    ):
+        if var_col in aligned.var.columns:
+            expr.uns[uns_key] = np.asarray(aligned.var[var_col].astype(str), dtype=object)
     logger.info(
         "Merged the guide matrix into obsm[%r] (%d guides)", key, aligned.n_vars
     )
@@ -851,6 +858,13 @@ def guides_from_obsm(adata: ad.AnnData, cfg: Config) -> Optional[ad.AnnData]:
     guides.var_names = pd.Index(names)
     if "guide_target_genes" in adata.uns:
         guides.var["target_gene"] = [str(t) for t in adata.uns["guide_target_genes"]]
+    for var_col, uns_key in (
+        (cfg.guides.scaffold_column, "guide_scaffolds"),
+        (cfg.guides.pair_id_column, "guide_pair_ids"),
+        ("target_gene_name", "guide_target_gene_names"),
+    ):
+        if uns_key in adata.uns and len(adata.uns[uns_key]) == guides.n_vars:
+            guides.var[var_col] = [str(t) for t in adata.uns[uns_key]]
     guides.layers["counts"] = guides.X.copy()
     logger.info("Recovered %d guides from obsm[%r]", guides.n_vars, key)
     return guides
