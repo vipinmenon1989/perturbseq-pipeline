@@ -867,9 +867,11 @@ def merge_guides_into_expr(
         expr.uns["guide_target_genes"] = np.asarray(
             aligned.var["target_gene"].astype(str), dtype=object
         )
+    _scol = cfg.guides.scaffold_column if cfg.guides.scaffold_column != "auto" else "scaffold"
+    _pcol = cfg.guides.pair_id_column if cfg.guides.pair_id_column != "auto" else "pair_id"
     for var_col, uns_key in (
-        (cfg.guides.scaffold_column, "guide_scaffolds"),
-        (cfg.guides.pair_id_column, "guide_pair_ids"),
+        (_scol, "guide_scaffolds"),
+        (_pcol, "guide_pair_ids"),
         ("target_gene_name", "guide_target_gene_names"),
     ):
         if var_col in aligned.var.columns:
@@ -895,9 +897,11 @@ def guides_from_obsm(adata: ad.AnnData, cfg: Config) -> Optional[ad.AnnData]:
     guides.var_names = pd.Index(names)
     if "guide_target_genes" in adata.uns:
         guides.var["target_gene"] = [str(t) for t in adata.uns["guide_target_genes"]]
+    _scol = cfg.guides.scaffold_column if cfg.guides.scaffold_column != "auto" else "scaffold"
+    _pcol = cfg.guides.pair_id_column if cfg.guides.pair_id_column != "auto" else "pair_id"
     for var_col, uns_key in (
-        (cfg.guides.scaffold_column, "guide_scaffolds"),
-        (cfg.guides.pair_id_column, "guide_pair_ids"),
+        (_scol, "guide_scaffolds"),
+        (_pcol, "guide_pair_ids"),
         ("target_gene_name", "guide_target_gene_names"),
     ):
         if uns_key in adata.uns and len(adata.uns[uns_key]) == guides.n_vars:

@@ -133,6 +133,8 @@ def test_pair_mode_end_to_end(tmp_path):
         assert (out / f).is_file() and (out / f).stat().st_size > 0, f
     html = (out / "report.html").read_text()
     assert "Pair-guide assignment is the primary label set" in html
+    # scaffold classes round-trip into uns even with scaffold_column: auto
+    assert "guide_scaffolds" in result.adata.uns and set(map(str, result.adata.uns["guide_scaffolds"])) <= {"A", "C", "unknown"}
     # root report over runs
     root = tmp_path / "root"
     build_root_report(cfg, {"L1": str(out), "combined": str(out)}, root, audit_dir=None, config_path=None, job_ids=["1"])
