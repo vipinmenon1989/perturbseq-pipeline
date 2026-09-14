@@ -1,0 +1,34 @@
+# =========================================================================
+# Hanrui Fang — BRANCH COMPARISON RUN (main defaults, HF011A + HF011B)
+# Schema of origin/main f5a8fa0. main has no guides.target_feature_column,
+# so target labels must be parsed from the guide id "<TARGET>_<n>": splitting
+# on "_" only keeps "NO-TARGET" intact (the default delimiters would yield
+# "NO"); rsID-specific labels collapse onto the gene symbol on main.
+# =========================================================================
+run:
+  name: Hanrui_fang_main_default
+  outdir: /local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/perturbseq-pipeline/results/Hanrui_fang/pipeline_comparison/main_default
+  seed: 0
+
+input:
+  mode: mtx
+  mtx_dirs:
+    HF011A: /local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/outputs/hanrui_fang_inputs/cellranger/HF011A/filtered_feature_bc_matrix
+    HF011B: /local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/outputs/hanrui_fang_inputs/cellranger/HF011B/filtered_feature_bc_matrix
+  guide_mtx_dirs:
+    HF011A: /local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/outputs/hanrui_fang_inputs/guides/HF011A
+    HF011B: /local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/outputs/hanrui_fang_inputs/guides/HF011B
+  cache_mtx: false
+
+metadata:
+  file: config/Hanrui_fang_sample_manifest.csv
+  key_column: lane_id
+  require_for_multilane: true
+
+guides:
+  target_split_delims: ["_"]
+  ntc_patterns: ["^non[-_.]?targeting", "^non$", "^ntc", "scramble", "^safe[-_.]?harbor", "^no[-_.]?target"]
+
+output:
+  write_unfiltered_h5ad: true
+  archive: false

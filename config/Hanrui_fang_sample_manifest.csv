@@ -1,0 +1,5 @@
+lane_id,sample,lane,gem_well,guide_library,cell_line,condition,replicate,replicate_type,condition_status
+HF011A,HF011A,HF011A,A,HF011AF,unknown,HF011,A,unknown,inferred
+HF011B,HF011B,HF011B,B,HF011BF,unknown,HF011,B,unknown,inferred
+HF012A,HF012A,HF012A,A,HF012AF,unknown,HF012,A,unknown,inferred
+HF012B,HF012B,HF012B,B,HF012BF,unknown,HF012,B,unknown,inferred

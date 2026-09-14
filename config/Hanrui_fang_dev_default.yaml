@@ -1,0 +1,41 @@
+# =========================================================================
+# Hanrui Fang Perturb-seq — BRANCH COMPARISON RUN (dev defaults, HF011A + HF011B)
+#
+# Inputs: Cell Ranger filtered MTX directories per GEM well + scaffold-aware
+# guide UMI count MTX directories (outputs/hanrui_fang_inputs, prepared by
+# jobs/prepare_hanrui_inputs.py). All biological / QC / clustering /
+# perturbation parameters are the pipeline defaults. Only input paths,
+# metadata, output location/name, guide-metadata interpretation and
+# provenance/retention options are set here.
+# =========================================================================
+run:
+  name: Hanrui_fang_dev_default
+  outdir: /local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/perturbseq-pipeline/results/Hanrui_fang/pipeline_comparison/dev_default
+  seed: 0
+
+input:
+  mode: mtx
+  mtx_dirs:
+    HF011A: /local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/outputs/hanrui_fang_inputs/cellranger/HF011A/filtered_feature_bc_matrix
+    HF011B: /local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/outputs/hanrui_fang_inputs/cellranger/HF011B/filtered_feature_bc_matrix
+  guide_mtx_dirs:
+    HF011A: /local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/outputs/hanrui_fang_inputs/guides/HF011A
+    HF011B: /local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/outputs/hanrui_fang_inputs/guides/HF011B
+  cache_mtx: false                      # do not litter the repo cache/ with 4 GEM wells
+
+metadata:
+  file: config/Hanrui_fang_sample_manifest.csv
+  key_column: lane_id
+  require_for_multilane: true
+
+guides:
+  # Guide metadata interpretation (not QC tuning): the guide features carry
+  # the raw design target label in the 10x "name" column (-> var.gene_symbols),
+  # e.g. "NO-TARGET", "LIPA (rs1412444)". Use it as the authoritative target
+  # and recognise the experiment's control label "NO-TARGET".
+  target_feature_column: gene_symbols
+  ntc_patterns: ["^non[-_. ]?targeting", "^non$", "^ntc", "scramble", "^safe[-_. ]?harbor", "^no[-_. ]?target"]
+
+output:
+  write_unfiltered_h5ad: true           # keep the pre-filter object next to processed.h5ad
+  archive: false
