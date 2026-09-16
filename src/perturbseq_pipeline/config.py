@@ -348,6 +348,12 @@ class GuideConfig:
 
     dominance_ratio: float = 2.0
 
+    #: Pseudocount of the per-slot dominance ratio used by the pair mode:
+    #: ``(top_umi + pseudocount) / (second_umi + pseudocount) >= dominance_ratio``.
+    #: With 1.0 and integer counts this equals ``top > dominance_ratio * second``
+    #: for dominance_ratio 2; the ratio is stored per scaffold slot in obs.
+    dominance_pseudocount: float = 1.0
+
     #: -1 disables the runner-up UMI gate.
     max_second_umi: int = -1
 
@@ -478,6 +484,18 @@ class GuideConfig:
     #: confirms it: ``ambiguous`` (conservative) or ``provisional_target``
     #: (assigned to the targeting guide's target, flagged provisional).
     ntc_partner_policy: str = "ambiguous"
+
+    #: Delimiter separating several designed pair / construct ids in the pair
+    #: reference when one guide feature belongs to more than one construct
+    #: (e.g. ``ACYP1_1F;ACYP1_S1``). A pair is designed when the two slot
+    #: features share at least one construct id.
+    pair_id_delimiter: str = ";"
+
+    #: Explicit-reference mode: are designed targeting + NTC constructs (e.g.
+    #: single-guide ``_S1`` vectors with an NTC filler) strict primary targeting
+    #: labels (``True``) or a sensitivity stratum kept out of primary testing
+    #: (``False``; status ``pair_targeting_plus_ntc``, class ambiguous)?
+    designed_targeting_plus_ntc_primary: bool = True
 
     # ------------------------------------------------------------------
     # Basic QC stage: guide quantification and guide QC
@@ -1101,6 +1119,10 @@ class OutputConfig:
 
     report_name: str = "report.html"
 
+    #: Companion Markdown report written next to ``report_name`` (``None``
+    #: disables it). Mirrors the HTML report's tables and figure references.
+    report_markdown_name: Optional[str] = "report.md"
+
     write_unfiltered_h5ad: bool = True
 
     unfiltered_h5ad_name: Optional[
@@ -1348,6 +1370,12 @@ class GuideFastqConfig:
     unmatched_sample_rate: int = 50
     #: Number of top unmatched protospacers to report.
     unmatched_top_n: int = 50
+    #: Count each designed protospacer separately per scaffold class, i.e. the
+    #: count-matrix features are ``<guide_id>:<scaffold>`` (designed spacer x
+    #: scaffold anchor). Required when one spacer is cloned behind more than one
+    #: scaffold (e.g. an NTC filler used in several constructs) and it turns
+    #: wrong-scaffold (chimeric) reads into explicit off-design features.
+    scaffold_specific_features: bool = False
 
 
 @dataclass

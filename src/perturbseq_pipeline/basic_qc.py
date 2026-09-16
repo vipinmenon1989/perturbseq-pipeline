@@ -294,6 +294,10 @@ def run_basic_qc(cfg: Config, outdir: Path, registry, config_path: Optional[str]
         fastq_jobs.append(GuideCountJob(sample_id=sid, fastq_files=files, cell_barcodes=list(bare)))
     if fastq_jobs:
         guide_results.update(count_guides(fastq_jobs, design, cfg))
+        # scaffold-specific features: the shared reference becomes the feature-level design
+        fd = next((r.feature_design for r in guide_results.values() if r.feature_design is not None), None)
+        if fd is not None:
+            design = fd
     for sid, smp in samples.items():
         if guide_sources[sid] != "matrix":
             continue

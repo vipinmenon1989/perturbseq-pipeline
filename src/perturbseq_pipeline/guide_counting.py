@@ -215,13 +215,18 @@ def count_fastq_file(
     chunk_size: int = 2_000_000,
     unmatched_sample_rate: int = 50,
     decompressor: str = "auto",
+    split_by_scaffold: bool = False,
 ) -> Dict[str, object]:
     """Stream one FASTQ file and return compact per-file results.
 
-    Returns a dict with ``codes`` (unique int64 (cell, guide, UMI) codes for
-    cells in the barcode universe), ``guide_reads`` (matched reads per guide
-    over all barcodes), ``guide_scaffold_reads`` (guides x scaffolds),
+    Returns a dict with ``codes`` (unique int64 (cell, feature, UMI) codes for
+    cells in the barcode universe), ``guide_reads`` (matched reads per feature
+    over all barcodes), ``guide_scaffold_reads`` (features x scaffolds),
     ``unmatched`` (sampled Counter of unmatched protospacers) and ``stats``.
+
+    With ``split_by_scaffold`` a feature is a (designed protospacer, scaffold
+    class) combination indexed ``guide * n_scaffolds + scaffold``; otherwise a
+    feature is the designed protospacer regardless of the scaffold it carries.
     """
     t0 = time.time()
     anchor_re = spec.anchor_regex()
@@ -231,11 +236,12 @@ def count_fastq_file(
     search_start = spec.anchor_search_start
     shift = spec.position_shift
     n_scaf = len(spec.scaffold_anchors)
+    n_features = n_guides * n_scaf if split_by_scaffold else n_guides
     tso = spec.tso.encode() if spec.tso else None
     tso_lo, tso_hi = umi_end - 4, umi_end + (len(tso) if tso else 0) + 8
 
-    guide_reads = [0] * n_guides
-    guide_scaf = [[0] * n_scaf for _ in range(n_guides)]
+    guide_reads = [0] * n_features
+    guide_scaf = [[0] * n_scaf for _ in range(n_features)]
     scaf_reads = [0] * n_scaf
     unmatched: collections.Counter = collections.Counter()
     codes: List[int] = []
@@ -287,8 +293,9 @@ def count_fastq_file(
                 # 5' (position 1) substitution, e.g. the U6 +1 G: same 19-nt suffix
                 if seq[p - L + 1:p] == designed_by_index[g][1:]:
                     n_mm_pos1 += 1
-            guide_reads[g] += 1
-            guide_scaf[g][scaf] += 1
+            f = g * n_scaf + scaf if split_by_scaffold else g
+            guide_reads[f] += 1
+            guide_scaf[f][scaf] += 1
             c = barcode_index.get(seq[:B])
             if c is None:
                 n_bc_miss += 1
@@ -299,7 +306,7 @@ def count_fastq_file(
             except ValueError:
                 n_bad_umi += 1
                 continue
-            codes.append(((c * n_guides + g) << umi_bits) | u)
+            codes.append(((c * n_features + f) << umi_bits) | u)
             if len(codes) >= chunk_size:
                 flush()
     finally:
@@ -329,7 +336,7 @@ def count_fastq_file(
     return {
         "codes": all_codes,
         "guide_reads": np.asarray(guide_reads, dtype=np.int64),
-        "guide_scaffold_reads": np.asarray(guide_scaf, dtype=np.int64).reshape(n_guides, n_scaf),
+        "guide_scaffold_reads": np.asarray(guide_scaf, dtype=np.int64).reshape(n_features, n_scaf),
         "unmatched": unmatched,
         "stats": stats,
     }
@@ -360,6 +367,10 @@ class GuideCountResult:
     per_file: List[Dict[str, object]] = field(default_factory=list)
     unmatched_top: Optional[pd.DataFrame] = None
     source: str = "fastq"
+    #: Feature-level design frame when features are (spacer x scaffold)
+    #: combinations (``guides.fastq.scaffold_specific_features``); ``None``
+    #: when features are the designed guides themselves.
+    feature_design: Optional[pd.DataFrame] = None
 
     @property
     def n_cells(self) -> int:
@@ -404,6 +415,37 @@ class GuideCountJob:
     cell_barcodes: List[str]
 
 
+FEATURE_SEP = ":"
+
+
+def expand_design_by_scaffold(design: pd.DataFrame, scaffold_names: Sequence[str]) -> pd.DataFrame:
+    """One feature row per (designed guide x scaffold class), ids ``<guide_id>:<scaffold>``.
+
+    Row order is ``guide-major`` (guide 0 x every scaffold, guide 1 x ...), matching
+    the feature index ``guide * n_scaffolds + scaffold`` used by the counter. The
+    designed guide's own columns are kept; ``design_guide_id`` holds the original
+    id, ``scaffold`` the class of the feature and ``designed_slot`` whether the
+    design table declared that class for the guide (``True`` when the design has
+    no scaffold information at all).
+    """
+    names = [str(n) for n in scaffold_names]
+    rows = []
+    has_scaf = "scaffold" in design.columns and (design["scaffold"].astype(str) != "unknown").any()
+    for _, r in design.reset_index(drop=True).iterrows():
+        declared = {x.strip() for x in str(r.get("scaffold", "unknown")).split(";")} if has_scaf else set()
+        for cls in names:
+            row = r.to_dict()
+            row["design_guide_id"] = r["guide_id"]
+            row["guide_id"] = f"{r['guide_id']}{FEATURE_SEP}{cls}"
+            row["scaffold"] = cls
+            row["scaffold_source"] = "feature_split_by_read_anchor"
+            row["designed_slot"] = (cls in declared) if has_scaf else True
+            rows.append(row)
+    out = pd.DataFrame(rows)
+    out["design_index"] = np.arange(len(out), dtype=int)
+    return out
+
+
 def count_guides(
     jobs: Sequence[GuideCountJob],
     design: pd.DataFrame,
@@ -414,11 +456,14 @@ def count_guides(
     fq = cfg.guides.fastq
     spec = GuideReadSpec.from_config(fq)
     protospacers = design["protospacer"].astype(str).tolist()
-    guide_ids = design["guide_id"].astype(str).tolist()
-    n_guides = len(guide_ids)
+    n_guides = len(protospacers)
+    split = bool(fq.scaffold_specific_features)
+    feature_design = expand_design_by_scaffold(design, spec.scaffold_names) if split else None
+    guide_ids = (feature_design if split else design)["guide_id"].astype(str).tolist()
+    n_features = len(guide_ids)
     exact, mm = build_protospacer_index(protospacers, spec.max_mismatches)
     for job in jobs:
-        top = (len(job.cell_barcodes) * n_guides) << spec.umi_bits
+        top = (len(job.cell_barcodes) * n_features) << spec.umi_bits
         if top >= 2 ** 62:
             raise ValueError(
                 f"{job.sample_id}: cells x guides x UMI space does not fit the int64 code; "
@@ -438,8 +483,9 @@ def count_guides(
     workers = max(1, min(workers, len(tasks)))
     logger.info(
         "Guide counting: %d FASTQ file(s) across %d sample(s) with %d worker(s); "
-        "%d designed guides, %d scaffold class(es) %s, position_shift=%d, max_mismatches=%d",
-        len(tasks), len(jobs), workers, n_guides, len(spec.scaffold_names), list(spec.scaffold_names),
+        "%d designed guides -> %d features (%s), %d scaffold class(es) %s, position_shift=%d, max_mismatches=%d",
+        len(tasks), len(jobs), workers, n_guides, n_features,
+        "spacer x scaffold class" if split else "spacer only", len(spec.scaffold_names), list(spec.scaffold_names),
         spec.position_shift, spec.max_mismatches,
     )
     per_file: Dict[str, List[Dict[str, object]]] = {j.sample_id: [] for j in jobs}
@@ -448,6 +494,7 @@ def count_guides(
         chunk_size=fq.chunk_size,
         unmatched_sample_rate=max(1, fq.unmatched_sample_rate),
         decompressor="auto",
+        split_by_scaffold=split,
     )
     t0 = time.time()
     if workers == 1:
@@ -474,9 +521,9 @@ def count_guides(
     for job in jobs:
         results = sorted(per_file[job.sample_id], key=lambda r: r["stats"]["file"])
         codes = np.unique(np.concatenate([r["codes"] for r in results])) if results else np.zeros(0, dtype=np.int64)
-        counts = _codes_to_matrix(codes, len(job.cell_barcodes), n_guides, spec.umi_bits)
-        guide_reads = np.sum([r["guide_reads"] for r in results], axis=0) if results else np.zeros(n_guides, dtype=np.int64)
-        gsr = np.sum([r["guide_scaffold_reads"] for r in results], axis=0) if results else np.zeros((n_guides, len(spec.scaffold_names)), dtype=np.int64)
+        counts = _codes_to_matrix(codes, len(job.cell_barcodes), n_features, spec.umi_bits)
+        guide_reads = np.sum([r["guide_reads"] for r in results], axis=0) if results else np.zeros(n_features, dtype=np.int64)
+        gsr = np.sum([r["guide_scaffold_reads"] for r in results], axis=0) if results else np.zeros((n_features, len(spec.scaffold_names)), dtype=np.int64)
         unmatched: collections.Counter = collections.Counter()
         for r in results:
             unmatched.update(r["unmatched"])
@@ -486,6 +533,8 @@ def count_guides(
         stats["total_guide_umis_in_matrix"] = int(counts.sum())
         stats["guides_detected_any_umi"] = int((counts.sum(axis=0) > 0).sum())
         stats["guides_designed"] = n_guides
+        stats["features"] = n_features
+        stats["scaffold_specific_features"] = split
         stats["cells_in_gex_universe"] = len(job.cell_barcodes)
         stats["cells_with_any_guide_umi"] = int((counts.sum(axis=1) > 0).sum())
         top = pd.DataFrame(
@@ -498,20 +547,21 @@ def count_guides(
             cell_barcodes=list(job.cell_barcodes),
             counts=counts,
             guide_reads=np.asarray(guide_reads, dtype=np.int64),
-            guide_scaffold_reads=np.asarray(gsr, dtype=np.int64).reshape(n_guides, len(spec.scaffold_names)),
+            guide_scaffold_reads=np.asarray(gsr, dtype=np.int64).reshape(n_features, len(spec.scaffold_names)),
             scaffold_names=list(spec.scaffold_names),
             stats=stats,
             per_file=[r["stats"] for r in results],
             unmatched_top=top,
             source="fastq",
+            feature_design=feature_design,
         )
         logger.info(
             "%s: %s reads, %.1f%% with scaffold anchor, %.1f%% spacer-matched, %.1f%% of matched "
-            "reads in GEX barcodes; %d/%d guides observed, %d unique cell-guide UMIs",
+            "reads in GEX barcodes; %d/%d features observed, %d unique cell-guide UMIs",
             job.sample_id, f"{stats['reads_total']:,}",
             100 * stats["frac_reads_with_scaffold_anchor"], 100 * stats["frac_reads_spacer_matched"],
             100 * stats["frac_matched_reads_in_gex_barcodes"],
-            stats["guides_detected_any_umi"], n_guides, codes.size,
+            stats["guides_detected_any_umi"], n_features, codes.size,
         )
     return out
 
@@ -646,6 +696,10 @@ def write_guide_counts(result: GuideCountResult, design: pd.DataFrame, outdir: P
 
     outdir = Path(outdir)
     outdir.mkdir(parents=True, exist_ok=True)
+    if result.feature_design is not None and len(result.feature_design) == result.n_guides:
+        design = result.feature_design
+    if len(design) != result.n_guides:
+        raise ValueError(f"{result.sample_id}: design has {len(design)} rows but the count matrix has {result.n_guides} features")
     paths: Dict[str, Path] = {}
     mtx = outdir / "matrix.mtx.gz"
     with gzip.open(mtx, "wb") as fh:
@@ -662,7 +716,7 @@ def write_guide_counts(result: GuideCountResult, design: pd.DataFrame, outdir: P
             fh.write(f"{gid}\t{tgt}\t{GUIDE_FEATURE_TYPE}\n")
     paths["features"] = feats
 
-    summary = design[[c for c in ("guide_id", "protospacer", "target", "target_raw", "is_control", "scaffold", "scaffold_source") if c in design.columns]].copy()
+    summary = design[[c for c in ("guide_id", "design_guide_id", "protospacer", "target", "target_raw", "is_control", "scaffold", "scaffold_source", "designed_slot") if c in design.columns]].copy()
     summary["reads_matched"] = result.guide_reads
     summary["umis_in_cells"] = result.guide_umis()
     summary["cells_positive_any_umi"] = result.guide_positive_cells(1)

@@ -1,0 +1,488 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{ title }}</title>
+<style>
+  :root {
+    --fg: #1a202c; --muted: #4a5568; --line: #e2e8f0; --bg: #ffffff;
+    --accent: #2b6cb0; --warn-bg: #fffaf0; --warn-line: #dd6b20;
+    --card: #f7fafc; --hit: #c53030;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--fg);
+    font: 16px/1.6 -apple-system, BlinkMacSystemFont, "Segoe UI", Helvetica, Arial, sans-serif;
+  }
+  .wrap { max-width: 1100px; margin: 0 auto; padding: 32px 24px 80px; }
+  header { border-bottom: 3px solid var(--accent); padding-bottom: 16px; margin-bottom: 8px; }
+  h1 { font-size: 28px; margin: 0 0 6px; }
+  h2 {
+    font-size: 22px; margin: 48px 0 4px; padding-top: 16px;
+    border-top: 1px solid var(--line);
+  }
+  h3 { font-size: 17px; margin: 28px 0 6px; color: var(--muted); }
+  .sub { color: var(--muted); font-size: 14px; }
+  .lede { color: var(--muted); margin: 4px 0 20px; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; margin: 12px 0; }
+  th, td { border: 1px solid var(--line); padding: 6px 9px; text-align: left; }
+  th { background: var(--card); font-weight: 600; }
+  tr:nth-child(even) td { background: #fcfdfe; }
+  .scroll { overflow-x: auto; max-height: 520px; overflow-y: auto; border: 1px solid var(--line); }
+  .scroll table { margin: 0; }
+  figure { margin: 22px 0; }
+  figure img { max-width: 100%; height: auto; border: 1px solid var(--line); border-radius: 4px; }
+  figcaption { font-size: 13px; color: var(--muted); margin-top: 6px; }
+  figcaption b { color: var(--fg); }
+  .cards { display: flex; flex-wrap: wrap; gap: 12px; margin: 18px 0; }
+  .card {
+    flex: 1 1 150px; background: var(--card); border: 1px solid var(--line);
+    border-radius: 6px; padding: 12px 14px;
+  }
+  .card .v { font-size: 22px; font-weight: 600; }
+  .card .k { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: .03em; }
+  .warn {
+    background: var(--warn-bg); border-left: 4px solid var(--warn-line);
+    padding: 10px 14px; margin: 16px 0; font-size: 14px; border-radius: 0 4px 4px 0;
+  }
+  .warn ul { margin: 6px 0 0 18px; padding: 0; }
+  .note {
+    background: var(--card); border-left: 4px solid var(--accent);
+    padding: 10px 14px; margin: 16px 0; font-size: 14px; border-radius: 0 4px 4px 0;
+  }
+  code, .mono { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12.5px; }
+  details { margin: 16px 0; }
+  summary { cursor: pointer; font-weight: 600; color: var(--accent); }
+  pre {
+    background: var(--card); border: 1px solid var(--line); border-radius: 4px;
+    padding: 12px; overflow-x: auto; font-size: 12px; line-height: 1.45;
+  }
+  .toc a { color: var(--accent); text-decoration: none; margin-right: 18px; font-size: 14px; }
+  .toc a:hover { text-decoration: underline; }
+  .filelist { columns: 2; font-size: 12.5px; color: var(--muted); }
+  footer { margin-top: 60px; padding-top: 16px; border-top: 1px solid var(--line);
+           color: var(--muted); font-size: 12.5px; }
+  .gallery { display: grid; grid-template-columns: repeat(auto-fill, minmax(340px, 1fr)); gap: 14px; margin: 12px 0; }
+  .gallery figure { margin: 0; }
+  .gallery figure img { max-width: 100%; }
+  .tag { display: inline-block; padding: 1px 7px; border-radius: 10px; font-size: 11.5px; background: var(--card); border: 1px solid var(--line); color: var(--muted); margin-left: 6px; }
+  .tag.primary { background: #ebf8ff; border-color: #90cdf4; color: #2b6cb0; }
+  .tag.sens { background: #fffaf0; border-color: #fbd38d; color: #c05621; }
+  .tag.amb { background: #fff5f5; border-color: #feb2b2; color: #c53030; }
+  .tblmeta { font-size: 12.5px; color: var(--muted); margin: 4px 0 0; }
+  .tblmeta a, .figlink a, .runlinks a { color: var(--accent); }
+  .figlink { font-size: 12px; color: var(--muted); }
+  .kv th { width: 230px; }
+  .runlinks li { margin: 3px 0; }
+  .section-links { font-size: 13px; color: var(--muted); margin: 6px 0 0; }
+</style>
+</head>
+<body>
+<div class="wrap">
+
+<header>
+  <h1>{{ title }}</h1>
+  <div class="sub">
+    Run <b>{{ run_name }}</b> &middot; {{ report_kind }} &middot; generated {{ generated_at }} &middot;
+    perturbseq-pipeline v{{ version }} &middot; branch <span class="mono">{{ git.branch }}</span> commit <span class="mono">{{ git.commit_short }}</span>
+  </div>
+</header>
+
+<p class="toc">
+  <a href="#summary">Summary</a>
+  {% if is_root %}<a href="#index">Per-run index</a>{% endif %}
+  <a href="#qc">1. Quality control</a>
+  <a href="#guides">2. Pair-guide QC</a>
+  <a href="#clustering">3. Clustering</a>
+  <a href="#perturbation">4. Perturbation strength</a>
+  <a href="#enrichment">5. Perturbation enrichment</a>
+  {% if has_ps %}<a href="#ps">6. PS score</a>{% endif %}
+  {% if has_lochness %}<a href="#lochness">7. lochNESS</a>{% endif %}
+  {% if has_distance %}<a href="#distance">8. Energy distance / MMD</a>{% endif %}
+  {% if has_distance_space %}<a href="#distance_space">9. Perturbation space</a>{% endif %}
+  {% if has_modules %}<a href="#modules">10. Modules &amp; programs</a>{% endif %}
+  {% if has_meta %}<a href="#meta">11. Meta table</a>{% endif %}
+  {% if is_root %}<a href="#support">12. Cross-sample support</a><a href="#previous">13. Previous run</a>{% endif %}
+  <a href="#repro">Reproducibility</a>
+</p>
+
+<!-- ===================== Run summary ===================== -->
+<h2 id="summary">Run summary</h2>
+<div class="cards">
+  {% for k, v in summary_cards %}
+  <div class="card"><div class="v">{{ v }}</div><div class="k">{{ k }}</div></div>
+  {% endfor %}
+</div>
+
+<table class="kv">
+  {% for k, v in meta_rows %}<tr><th>{{ k }}</th><td class="mono">{{ v }}</td></tr>{% endfor %}
+</table>
+
+<div class="note">
+  <b>Primary cell-assignment rule (pair-guide mode).</b> {{ rule_text }}
+</div>
+
+<div class="warn">
+  <b>Limitations and scientific caveats</b>
+  <ul>{% for w in warnings %}<li>{{ w }}</li>{% endfor %}</ul>
+</div>
+
+{% if is_root %}
+<!-- ===================== Per-run index ===================== -->
+<h2 id="index">Per-run index</h2>
+<p class="lede">The combined object (four wells, no batch correction) is the primary body of this report; each well was also analysed independently with the same configuration. Every per-run report follows the same layout.</p>
+{{ tables.run_index }}
+<ul class="runlinks">
+  {% for r in run_links %}<li><b>{{ r.name }}</b>: <a href="{{ r.html }}">report.html</a> &middot; <a href="{{ r.md }}">report.md</a> &middot; <a href="{{ r.figures }}">figures/</a> &middot; <a href="{{ r.tables }}">tables/</a>{% if r.h5ad %} &middot; <a href="{{ r.h5ad }}">processed h5ad</a>{% endif %}</li>{% endfor %}
+</ul>
+{% endif %}
+
+<!-- ===================== 1. QC ===================== -->
+<h2 id="qc">1. Quality control</h2>
+<p class="lede">
+  Standard single-cell metrics computed on every loaded cell before any filtering (so the distributions show what the thresholds acted on),
+  then the expression filters: permissive gene filter &ge; {{ cfg.qc.min_genes_per_cell }} genes, genes in &ge; {{ cfg.qc.min_cells_per_gene }} cells,
+  final gene filter &ge; {{ cfg.qc.min_genes_final }} genes, mitochondrial fraction &lt; {{ cfg.qc.max_pct_mt }} %.
+</p>
+<h3>1.1 Filtering steps</h3>
+{{ tables.qc_steps }}
+<h3>1.2 Per-lane summary</h3>
+{{ tables.qc_summary }}
+<h3>1.3 Cells before and after QC</h3>
+{{ tables.cell_counts_before_after }}
+{{ tables.qc_metrics_per_lane_before_after }}
+<h3>1.4 Cell QC diagnostics</h3>
+{% for f in figures.qc %}{{ f }}{% endfor %}
+
+<!-- ===================== 2. Pair-guide QC ===================== -->
+<h2 id="guides">2. Pair-guide QC</h2>
+<p class="lede">
+  Guide features are scaffold-specific (<code>&lt;design id&gt;:&lt;A|C&gt;</code>). For <b>each scaffold slot separately</b> the strongest feature must reach
+  <code>min_umi = {{ cfg.guides.min_umi }}</code> UMIs and satisfy the dominance rule
+  <code>(top guide UMI + {{ pseudocount }}) / (second guide UMI + {{ pseudocount }}) &ge; {{ cfg.guides.dominance_ratio }}</code>.
+  A cell becomes a <b>strict primary construct pair</b> only when both slots pass, the two features share a documented construct id
+  (<code>{{ pair_reference_name }}</code>) and the construct is targeting&ndash;targeting (<code>pair_targeting</code>) or NTC&ndash;NTC (<code>pair_non_targeting</code>, the primary control).
+  Designed targeting+NTC constructs form the <b>targeting-plus-NTC sensitivity class</b> (<code>pair_targeting_plus_ntc</code>, class <i>ambiguous</i>, excluded from primary testing).
+  Same-target A/C combinations that are not constructs (<b>same-target inferred pairs</b>), two different targets (<b>dual-target ambiguity</b>), several strong features in a slot (<b>scaffold ambiguity</b>),
+  one resolved slot (<b>incomplete pair</b>) and every other non-designed combination (<b>unresolved pair</b>) stay in the object as ambiguous and never enter primary perturbation testing.
+  The <b>single-guide diagnostic</b> (top guide of the whole cell) is computed for comparison only and drives no result.
+</p>
+<div class="cards">
+  {% for k, v in guide_cards %}
+  <div class="card"><div class="v">{{ v }}</div><div class="k">{{ k }}</div></div>
+  {% endfor %}
+</div>
+<h3>2.1 Pair-assignment status per lane</h3>
+{{ tables.pair_assignment_per_lane }}
+<h3>2.2 Assignment categories and resolution details</h3>
+<p class="lede">Every category with its class (<span class="tag primary">primary</span> enters testing; <span class="tag sens">sensitivity</span> is reported separately; <span class="tag amb">ambiguous / excluded</span> never becomes a perturbation label).</p>
+{{ tables.pair_resolution_detail_per_lane }}
+{{ tables.construct_type_per_lane }}
+<h3>2.3 Per-slot dominance: top guide, second guide and ratio</h3>
+<p class="lede">
+  Per assignment category: median top-guide UMIs, second-guide UMIs and dominance ratio of the scaffold-A and scaffold-C slots. The per-cell values
+  (cell id, lane, status, class, primary-versus-sensitivity flag, construct, and for both scaffolds the guide id, top count, second count, dominance ratio and slot status) are in
+  <code>{{ per_cell_table_name }}</code>{% if per_cell_table_href %} (<a href="{{ per_cell_table_href }}">CSV</a>){% endif %}; the first rows are shown below.
+</p>
+{{ tables.pair_slot_summary_by_status }}
+{{ tables.pair_assignment_per_cell }}
+{{ tables.pair_guide_qc_per_lane }}
+{{ tables.strong_guides_per_scaffold_per_lane }}
+<h3>2.4 Guide and target representation</h3>
+{{ tables.guide_gex_barcode_overlap }}
+{{ tables.off_design_umi_fraction_per_lane }}
+{{ tables.target_cells_per_lane }}
+{{ tables.construct_cells_per_lane }}
+{{ tables.guide_representation }}
+{{ tables.guide_feature_representation }}
+<h3>2.5 Guide QC figures</h3>
+{% for f in figures.guides %}{{ f }}{% endfor %}
+<h3>2.6 Diagnostic only: single-guide rule versus pair status</h3>
+<p class="lede">The historical single-guide top-vs-second rule is cross-tabulated against the pair status. It is <b>not</b> used for any primary result.</p>
+{{ tables.single_guide_diagnostic_vs_pair }}
+
+<!-- ===================== 3. Clustering ===================== -->
+<h2 id="clustering">3. Clustering analysis</h2>
+<p class="lede">
+  Counts were library-size normalised and log1p-transformed, {{ cfg.cluster.n_top_genes }} highly variable genes selected, reduced to {{ cfg.cluster.n_pcs }} principal components
+  ({% if cfg.cluster.batch_key %}Harmony on <code>{{ cfg.cluster.batch_key }}</code>{% else %}no batch correction, <code>batch_key: null</code>{% endif %}),
+  embedded with UMAP ({{ cfg.cluster.n_neighbors }} neighbours) and clustered with Leiden at resolution {{ cfg.cluster.leiden_resolution }}. All expression-QC-pass cells are clustered; pair status is an annotation.
+</p>
+<h3>3.1 Cluster overview</h3>
+{{ tables.clusters }}
+{{ tables.cluster_sizes }}
+<h3>3.2 Cluster composition</h3>
+{{ tables.cluster_composition }}
+<h3>3.3 Embedding diagnostics</h3>
+{% for f in figures.clustering %}{{ f }}{% endfor %}
+
+<!-- ===================== 4. Perturbation ===================== -->
+<h2 id="perturbation">4. Perturbation strength</h2>
+<p class="lede">
+  For every target whose transcript is measured in the expression matrix, the transcript's log-normalised expression is compared between
+  <b>strict primary targeting pairs</b> and <b>designed NTC pairs</b> (primary control). Two-sided Kolmogorov&ndash;Smirnov test (plus one-sided Mann&ndash;Whitney),
+  log2FC of de-logged means with pseudocount, BH-FDR within lane &times; control &times; stratum.
+</p>
+<div class="note">
+  <b>Control definitions.</b> <code>ntc</code> = designed NTC&ndash;NTC constructs (<code>pair_non_targeting</code>); <code>other</code> = strict pairs of all other targets (secondary control, reported in the tables only).<br>
+  <b>Exact hit rule.</b> <code>fdr_ks &lt; {{ cfg.perturbation.fdr_alpha }}</code> and <code>log2fc &lt; {{ cfg.perturbation.max_log2fc_for_hit }}</code>, with &ge; {{ cfg.perturbation.min_cells_per_target }} target cells and &ge; {{ cfg.perturbation.min_control_cells }} control cells.
+  Raw FDR is reported as <code>fdr_ks</code>; <code>neg_log10_fdr = -log10(max(fdr_ks, 1e-300))</code>.<br>
+  <b>Strata.</b> <code>primary_pair_targeting</code> (strict pairs, the only stratum used for hit calls) versus the sensitivity strata
+  <code>single_guide_plus_ntc_constructs_only</code>, <code>sensitivity_incl_targeting_plus_ntc</code> and <code>sensitivity_incl_same_target_not_designed</code>.
+</div>
+<h3>4.1 Results across all targets</h3>
+<div class="cards">
+  {% for k, v in perturbation_cards %}
+  <div class="card"><div class="v">{{ v }}</div><div class="k">{{ k }}</div></div>
+  {% endfor %}
+</div>
+{{ tables.pair_perturbation_hit_counts_per_lane }}
+{% for f in figures.perturbation %}{{ f }}{% endfor %}
+<h3>4.2 Target-level results (strict primary pairs versus NTC pairs)</h3>
+{{ tables.pair_perturbation_primary }}
+<h3>4.3 Construct / pair-level results</h3>
+{{ tables.pair_perturbation_by_pair }}
+<h3>4.4 Primary versus sensitivity strata</h3>
+{{ tables.strata_comparison }}
+<h3>4.5 Ranked target table (pipeline perturbation stage, same labels)</h3>
+{{ tables.perturbation }}
+<h3>4.6 Targets that could not be tested</h3>
+{{ tables.skipped }}
+<h3>4.7 Target support within this run</h3>
+{{ tables.target_support_matrix }}
+{% if topsix.perturbation %}
+<h3>4.8 Best six targets (direct perturbation)</h3>
+<div class="note"><b>Ranking rule.</b> {{ topsix.perturbation.rule }} {{ topsix.perturbation.note }}</div>
+{{ topsix.perturbation.table }}
+{% for f in topsix.perturbation.figures %}{{ f }}{% endfor %}
+{% endif %}
+<h3>4.9 All per-target perturbation figures ({{ galleries.per_gene|length }})</h3>
+<p class="lede">Each panel: cumulative distribution of the target transcript, violins, and the perturbed cells in the embedding. The first {{ n_per_gene_inline }} are shown inline; the rest are in the expandable gallery.</p>
+{% for f in galleries.per_gene[:n_per_gene_inline] %}{{ f }}{% endfor %}
+{% if galleries.per_gene|length > n_per_gene_inline %}
+<details><summary>Show the remaining {{ galleries.per_gene|length - n_per_gene_inline }} per-target figures</summary>
+<div class="gallery">{% for f in galleries.per_gene[n_per_gene_inline:] %}{{ f }}{% endfor %}</div>
+</details>
+{% endif %}
+<h3>4.10 Per-target ECDF figures ({{ galleries.ecdf|length }})</h3>
+<p class="lede">Target-transcript ECDFs per lane: strict targeting pairs (left) and NTC pairs (right), one figure per tested target.</p>
+<details open><summary>ECDF gallery ({{ galleries.ecdf|length }} targets)</summary>
+<div class="gallery">{% for f in galleries.ecdf %}{{ f }}{% endfor %}</div>
+</details>
+
+<!-- ===================== 5. Enrichment ===================== -->
+<h2 id="enrichment">5. Perturbation enrichment across clusters</h2>
+{% if enrichment %}
+<p class="lede">
+  Did losing a target push cells into a particular transcriptional state? Every target (strict primary pairs) is tested against every Leiden cluster with Fisher's exact test against
+  <b>{{ enrichment.control_label }}</b>, BH-FDR across all {{ enrichment.n_tests }} target/cluster pairs. Guide concordance (<i>Guides agreeing / Guides tested</i>) and low-power flags are carried in the table.
+</p>
+<div class="cards">
+  <div class="card"><div class="v">{{ enrichment.n_hits }}</div><div class="k">Significant pairs</div></div>
+  <div class="card"><div class="v">{{ enrichment.n_targets_with_hits }}</div><div class="k">Targets with a hit</div></div>
+  <div class="card"><div class="v">{{ enrichment.n_tests }}</div><div class="k">Pairs tested</div></div>
+  <div class="card"><div class="v">{{ enrichment.n_clusters }}</div><div class="k">Clusters</div></div>
+  <div class="card"><div class="v">{{ enrichment.n_low_power }}</div><div class="k">Low-power pairs</div></div>
+</div>
+<h3>5.1 Omnibus association</h3>
+<p class="lede">{{ enrichment.omnibus_text }}</p>
+{% if enrichment.n_low_power > 0 %}<div class="warn"><b>Low power.</b> {{ enrichment.n_low_power }} target/cluster pair(s) are flagged low-power (too few reference cells in that cluster); their odds ratios should not be interpreted.</div>{% endif %}
+<h3>5.2 Enrichment across all targets and clusters</h3>
+{% for f in figures.enrichment %}{{ f }}{% endfor %}
+<h3>5.3 Significant target/cluster pairs</h3>
+{{ tables.enrichment }}
+<h3>5.4 Effect magnitude and composition</h3>
+{{ tables.enrichment_effect_magnitude }}
+{{ tables.enrichment_composition }}
+<h3>5.5 Per-target enrichment figures ({{ galleries.enrichment_per_target|length }})</h3>
+<details open><summary>Per-target enrichment gallery ({{ galleries.enrichment_per_target|length }} targets)</summary>
+<div class="gallery">{% for f in galleries.enrichment_per_target %}{{ f }}{% endfor %}</div>
+</details>
+{% else %}
+<p class="lede">The enrichment stage was not run for this object.</p>
+{% endif %}
+
+{% if enrichment and topsix.enrichment %}
+<h3>5.6 Best six targets (cluster enrichment)</h3>
+<div class="note"><b>Ranking rule.</b> {{ topsix.enrichment.rule }} {{ topsix.enrichment.note }}</div>
+{{ topsix.enrichment.table }}
+{% for f in topsix.enrichment.figures %}{{ f }}{% endfor %}
+{% endif %}
+
+<!-- ===================== 6. PS score ===================== -->
+{% if has_ps %}
+<h2 id="ps">6. Per-cell perturbation response (PS score)</h2>
+<p class="lede">
+  pertps perturbation scores: for every target with &ge; {{ cfg.ps_score.min_cells_per_target }} strict targeting-pair cells and &ge; {{ cfg.ps_score.min_control_cells }} strict NTC-pair cells, the {{ cfg.ps_score.top_n_biomarkers }} best biomarker genes
+  separate perturbed from control cells and each cell receives a perturbation score (PS); a cell is called <i>knocked down</i> when PS &ge; {{ cfg.ps_score.ps_threshold }} and its target expression is below the
+  <code>{{ cfg.ps_score.expression_cut }}</code> cut. Labels = pair-derived <code>target_gene</code> of strict primary pairs; controls = <code>pair_non_targeting</code> cells only.
+</p>
+{% if ps_cards %}<div class="cards">{% for k, v in ps_cards %}<div class="card"><div class="v">{{ v }}</div><div class="k">{{ k }}</div></div>{% endfor %}</div>{% endif %}
+<h3>6.1 Knockdown efficiency across targets</h3>
+{% for f in figures.ps_score %}{{ f }}{% endfor %}
+<h3>6.2 Per-target summary (all targets)</h3>
+{{ tables.ps_score }}
+{{ tables.ps_vs_perturbation }}
+{{ tables.ps_skipped }}
+{% if topsix.ps_score %}
+<h3>6.3 Best six targets (PS score)</h3>
+<div class="note"><b>Ranking rule.</b> {{ topsix.ps_score.rule }} {{ topsix.ps_score.note }}</div>
+{{ topsix.ps_score.table }}
+{% for f in topsix.ps_score.figures %}{{ f }}{% endfor %}
+{% endif %}
+<h3>6.4 All per-target PS figures ({{ galleries.ps_per_target|length }}) and LDA embedding ({{ galleries.ps_lda|length }})</h3>
+{% for f in figures.ps_lda_overview %}{{ f }}{% endfor %}
+<details><summary>PS quadrant gallery ({{ galleries.ps_per_target|length }} targets)</summary><div class="gallery">{% for f in galleries.ps_per_target %}{{ f }}{% endfor %}</div></details>
+<details><summary>LDA gallery ({{ galleries.ps_lda|length }} figures)</summary><div class="gallery">{% for f in galleries.ps_lda %}{{ f }}{% endfor %}</div></details>
+{% endif %}
+
+<!-- ===================== 7. lochNESS ===================== -->
+{% if has_lochness %}
+<h2 id="lochness">7. lochNESS neighbourhood enrichment</h2>
+<p class="lede">
+  For every target the local enrichment of its cells among the {{ cfg.lochness.n_neighbors }} nearest neighbours (kNN graph in {{ cfg.lochness.n_pcs }} PCs{% if cfg.lochness.recompute_neighbors %}, recomputed for this analysis{% endif %})
+  relative to the expected fraction; labels = pair-derived <code>{{ cfg.lochness.genotype_key }}</code> of strict targeting pairs (&ge; {{ cfg.lochness.min_cells_per_target }} cells). Per-cell scores for every target are stored in the H5AD
+  (<code>lochness_&lt;target&gt;</code>, HDF5-safe names with the mapping in <code>uns['column_name_mapping']</code>) and summarised in the tables.
+</p>
+{% if lochness_cards %}<div class="cards">{% for k, v in lochness_cards %}<div class="card"><div class="v">{{ v }}</div><div class="k">{{ k }}</div></div>{% endfor %}</div>{% endif %}
+<h3>7.1 Across all perturbations</h3>
+{% for f in figures.lochness %}{{ f }}{% endfor %}
+<h3>7.2 Per-target summary (all targets)</h3>
+{{ tables.lochness }}
+{{ tables.lochness_by_cluster }}
+{% if topsix.lochness %}
+<h3>7.3 Best six targets (lochNESS)</h3>
+<div class="note"><b>Ranking rule.</b> {{ topsix.lochness.rule }} {{ topsix.lochness.note }}</div>
+{{ topsix.lochness.table }}
+{% for f in topsix.lochness.figures %}{{ f }}{% endfor %}
+{% endif %}
+<h3>7.4 All per-target lochNESS maps ({{ galleries.lochness_per_target|length }})</h3>
+<details><summary>lochNESS gallery ({{ galleries.lochness_per_target|length }} targets)</summary><div class="gallery">{% for f in galleries.lochness_per_target %}{{ f }}{% endfor %}</div></details>
+{% endif %}
+
+<!-- ===================== 8. Distance ===================== -->
+{% if has_distance %}
+<h2 id="distance">8. Perturbation distance versus control (energy distance / MMD)</h2>
+<p class="lede">
+  Energy distance ({{ cfg.distance.primary_metric }}){% if cfg.distance.secondary_metric %} and {{ cfg.distance.secondary_metric|upper }}{% endif %} between each target's strict pair cells and strict NTC-pair cells in <code>{{ cfg.distance.representation }}</code> space
+  (&ge; {{ cfg.distance.min_cells }} cells, at most {{ cfg.distance.max_cells_per_target }} target and {{ cfg.distance.max_control_cells }} control cells), {{ cfg.distance.n_permutations }} label permutations per target, BH-FDR &lt; {{ cfg.distance.fdr_threshold }}.
+</p>
+{% if distance_cards %}<div class="cards">{% for k, v in distance_cards %}<div class="card"><div class="v">{{ v }}</div><div class="k">{{ k }}</div></div>{% endfor %}</div>{% endif %}
+{% for f in figures.distance %}{{ f }}{% endfor %}
+<h3>8.1 All targets</h3>
+{{ tables.perturbation_distance }}
+{% if topsix.distance %}
+<h3>8.2 Best six targets (distance)</h3>
+<div class="note"><b>Ranking rule.</b> {{ topsix.distance.rule }} {{ topsix.distance.note }}</div>
+{{ topsix.distance.table }}
+{% endif %}
+{% endif %}
+
+<!-- ===================== 9. Distance space ===================== -->
+{% if has_distance_space %}
+<h2 id="distance_space">9. Perturbation distance space and phenotype modules</h2>
+<p class="lede">
+  Pairwise {{ cfg.distance_space.metric }} between all targets in <code>{{ cfg.distance_space.representation }}</code> space, embedded by PCoA ({{ cfg.distance_space.n_components }} components), nearest phenotypic neighbours ({{ cfg.distance_space.nearest_neighbors }}) and
+  hierarchical phenotype modules ({{ cfg.distance_space.linkage_method }} linkage).
+</p>
+{% for f in figures.distance_space %}{{ f }}{% endfor %}
+<h3>9.1 Phenotype modules and coordinates</h3>
+{{ tables.phenotype_modules }}
+{{ tables.perturbation_space_coordinates }}
+<h3>9.2 Nearest phenotypic neighbours</h3>
+{{ tables.perturbation_neighbors }}
+{% if topsix.distance_space %}
+<h3>9.3 Best six targets (perturbation space)</h3>
+<div class="note"><b>Ranking rule.</b> {{ topsix.distance_space.rule }} {{ topsix.distance_space.note }}</div>
+{{ topsix.distance_space.table }}
+{% endif %}
+{% endif %}
+
+<!-- ===================== 10. Modules ===================== -->
+{% if has_modules %}
+<h2 id="modules">10. Co-functional modules, gene programs and networks</h2>
+<p class="lede">
+  Perturbation &times; gene log2FC matrix versus strict NTC pairs on {{ cfg.modules.n_marker_genes_per_cluster }} {{ cfg.modules.marker_method }} marker genes per Leiden cluster; genes grouped into {{ cfg.modules.n_programs }} programs ({{ cfg.modules.program_correlation }} correlation), perturbations into up to {{ cfg.modules.n_modules }} co-functional modules
+  ({{ cfg.modules.module_correlation }} correlation, {{ cfg.modules.linkage_method }} linkage, distance threshold {{ cfg.modules.cluster_distance_threshold }}); hub perturbations by number of DE genes (|log2FC| &gt; {{ cfg.modules.hub_lfc_threshold }}, FDR &lt; {{ cfg.modules.de_fdr_alpha }});
+  program pathway enrichment by over-representation against the built-in {{ cfg.modules.program_enrichment.sources|join(', ') }} collections.
+</p>
+{% if modules_cards %}<div class="cards">{% for k, v in modules_cards %}<div class="card"><div class="v">{{ v }}</div><div class="k">{{ k }}</div></div>{% endfor %}</div>{% endif %}
+<h3>10.1 Regulome map, module &times; program strength, networks and program activity</h3>
+{% for f in figures.modules %}{{ f }}{% endfor %}
+<h3>10.2 Co-functional modules and hub perturbations</h3>
+{{ tables.cofunctional_modules }}
+{{ tables.tf_hubs }}
+{{ tables.module_program_strength }}
+{{ tables.module_connectivity }}
+{% if topsix.modules %}
+<h3>10.3 Best six perturbations (network hubs)</h3>
+<div class="note"><b>Ranking rule.</b> {{ topsix.modules.rule }} {{ topsix.modules.note }}</div>
+{{ topsix.modules.table }}
+{% endif %}
+<h3>10.4 Gene programs and pathway enrichment</h3>
+{{ tables.program_summary }}
+{{ tables.program_enrichment }}
+{{ tables.gene_programs }}
+{{ tables.program_activity_by_cluster }}
+{% endif %}
+
+<!-- ===================== 11. Meta table ===================== -->
+{% if has_meta %}
+<h2 id="meta">11. Master perturbation meta table</h2>
+<p class="lede">One row per target merging efficacy (log2FC, FDR), PS-score penetrance, lochNESS, energy distance and module membership.</p>
+{{ tables.perturbation_meta }}
+{% endif %}
+
+{% if is_root %}
+<!-- ===================== 12. Cross-sample support ===================== -->
+<h2 id="support">12. Target and construct support across samples</h2>
+<p class="lede">Agreement of the primary hit call across the four independent per-sample runs and the combined run. HF011/HF012 and A/B are not defined by any experimental document, so this is <b>well-level</b> support, not biological replication.</p>
+{{ tables.support_classes }}
+{{ tables.target_support_matrix_across_runs }}
+{{ tables.pair_perturbation_hit_counts_all_runs }}
+{{ tables.pair_assignment_per_lane_all_runs }}
+<h3>12.1 Per-sample key figures</h3>
+{% for r in run_links %}{% if r.name != 'combined' %}
+<h4>{{ r.name }} &mdash; <a href="{{ r.html }}">full report</a></h4>
+<div class="gallery">{% for f in r.key_figures %}{{ f }}{% endfor %}</div>
+{% endif %}{% endfor %}
+
+{{ tables.module_status_all_runs }}
+<!-- ===================== 13. Previous run ===================== -->
+<h2 id="previous">13. Comparison with the previous run (supplemental)</h2>
+<p class="lede">Reference-level and run-level differences relative to <code>{{ previous_run }}</code>. The previous result directory was not modified; no value of this report is taken from it except in this section.</p>
+{{ tables.previous_vs_new_reference_comparison }}
+{{ tables.previous_vs_new_summary }}
+{{ tables.previous_vs_new_target_hits }}
+{% endif %}
+
+<!-- ===================== Reproducibility ===================== -->
+<h2 id="repro">Reproducibility</h2>
+<table class="kv">
+  {% for k, v in repro_rows %}<tr><th>{{ k }}</th><td class="mono">{{ v }}</td></tr>{% endfor %}
+</table>
+<h3>Module completion status</h3>
+{{ tables.module_status }}
+<h3>Inputs</h3>
+{{ tables.inputs }}
+<h3>Outputs</h3>
+{{ tables.outputs }}
+<details><summary>Exact configuration used for this run (resolved)</summary><pre>{{ config_yaml }}</pre></details>
+<details><summary>Execution commands and SLURM jobs</summary><pre>{{ execution_md }}</pre></details>
+<details><summary>Code changes versus the base commit</summary><pre>{{ code_changes }}</pre></details>
+<details><summary>Software versions</summary><pre>{{ versions }}</pre></details>
+<details><summary>Figure manifest ({{ n_figures }} figures, {{ n_embedded }} embedded in this report)</summary>{{ tables.figure_manifest }}</details>
+{% if audit_rows %}
+<details><summary>Experimental information and audit files</summary>
+<table class="kv">{% for k, v in audit_rows %}<tr><th>{{ k }}</th><td>{{ v }}</td></tr>{% endfor %}</table>
+</details>
+{% endif %}
+
+<footer>
+  Generated by <b>perturbseq-pipeline</b> v{{ version }} ({{ renderer }}) &middot; {{ generated_at }} &middot; run <span class="mono">{{ run_name }}</span>
+</footer>
+
+</div>
+</body>
+</html>

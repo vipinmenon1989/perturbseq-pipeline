@@ -15,9 +15,14 @@ class*; optional ``max_second_umi``). Each class slot is therefore
 The (A, C) pair is then interpreted:
 
 * explicit pair/construct ids in the pair reference: the pair is valid only if
-  both guides share the designed id -> ``pair_targeting`` /
+  both guides share a designed construct id (a guide may list several ids,
+  separated by ``guides.pair_id_delimiter``) -> ``pair_targeting`` /
   ``pair_non_targeting`` / ``pair_targeting_plus_ntc`` (designed target+NTC
-  construct, assigned to the target); otherwise ``unresolved_pair``;
+  construct, assigned to the target); two different targets ->
+  ``dual_target_ambiguous``; every other non-designed combination ->
+  ``unresolved_pair`` with the reason in ``pair_resolution_detail``
+  (``same_target_not_designed`` / ``targeting_plus_ntc_not_designed`` /
+  ``ntc_pair_not_designed``);
 * no explicit ids (provisional same-target rule): same target ->
   ``pair_targeting``; both NTC -> ``pair_non_targeting``; targeting + NTC ->
   ``pair_targeting_plus_ntc`` (ambiguous, excluded from primary testing, unless
@@ -85,6 +90,28 @@ OBS_PAIR = "pair_assignment"
 OBS_PAIR_STATUS = "pair_assignment_status"
 OBS_PAIR_PROVISIONAL = "pair_assignment_provisional"
 OBS_PAIR_PRIMARY = "pair_assigned_primary"  # bool: cell carries a primary pair label (targeting or NTC pair)
+OBS_PAIR_DETAIL = "pair_resolution_detail"  # why a cell got its status (designed construct / not designed / slot problem)
+OBS_CONSTRUCT_TYPE = "construct_type"  # dual_targeting / targeting_plus_ntc / ntc_pair / dual_target_construct / none
+OBS_TARGET_SYMBOL = "target_symbol"  # HGNC-style symbol of the measured transcript for the assigned target (from the pair reference)
+
+CONSTRUCT_DUAL = "dual_targeting"
+CONSTRUCT_SINGLE_NTC = "targeting_plus_ntc"
+CONSTRUCT_NTC = "ntc_pair"
+CONSTRUCT_TWO_TARGETS = "dual_target_construct"
+CONSTRUCT_NONE = "none"
+
+DETAIL_DESIGNED_DUAL = "designed_dual_targeting_construct"
+DETAIL_DESIGNED_SINGLE_NTC = "designed_targeting_plus_ntc_construct"
+DETAIL_DESIGNED_NTC = "designed_ntc_pair_construct"
+DETAIL_DESIGNED_TWO_TARGETS = "designed_two_target_construct"
+DETAIL_SAME_TARGET_NOT_DESIGNED = "same_target_not_designed"
+DETAIL_TARGET_NTC_NOT_DESIGNED = "targeting_plus_ntc_not_designed"
+DETAIL_NTC_NOT_DESIGNED = "ntc_pair_not_designed"
+DETAIL_TWO_TARGETS_NOT_DESIGNED = "two_different_targets_not_designed"
+DETAIL_PROVISIONAL_SAME = "provisional_same_target_rule"
+DETAIL_PROVISIONAL_NTC = "provisional_ntc_pair_rule"
+DETAIL_PROVISIONAL_TARGET_NTC = "provisional_targeting_plus_ntc"
+DETAIL_PROVISIONAL_TWO = "two_different_targets"
 
 OBS_SG_CLASS = "single_guide_diagnostic_class"
 OBS_SG_TARGET = "single_guide_diagnostic_target"
@@ -96,6 +123,7 @@ OBS_SLOT_COUNT = "guide_{c}_count"
 OBS_SLOT_SECOND = "guide_{c}_second_count"
 OBS_SLOT_NSTRONG = "n_strong_guides_{c}"
 OBS_SLOT_STATUS = "guide_{c}_slot_status"
+OBS_SLOT_RATIO = "guide_{c}_dominance_ratio"  # (top + pseudocount) / (second + pseudocount)
 
 SLOT_RESOLVED = "resolved"
 SLOT_MULTIPLE = "multiple"
@@ -210,13 +238,24 @@ def _top_two(X: sparse.csr_matrix) -> Tuple[np.ndarray, np.ndarray, np.ndarray, 
             np.asarray(second_val, dtype=float), np.asarray(total, dtype=float))
 
 
+def slot_dominance_ratio(top_val, second_val, gcfg: GuideConfig) -> np.ndarray:
+    """Per-slot dominance ratio ``(top + pseudocount) / (second + pseudocount)``."""
+    pc = float(getattr(gcfg, "dominance_pseudocount", 1.0))
+    with np.errstate(divide="ignore", invalid="ignore"):
+        return (np.asarray(top_val, dtype=float) + pc) / (np.asarray(second_val, dtype=float) + pc)
+
+
 def _slot_gate(top_val, second_val, gcfg: GuideConfig):
+    """A scaffold slot is ``resolved`` when its top guide reaches ``min_umi`` and the
+    dominance ratio is at least ``dominance_ratio``; ``multiple`` when the top guide is
+    strong but not dominant. Returns ``(resolved, multiple, ratio)``."""
     min_umi = max(int(gcfg.min_umi), 1)
-    strong = top_val >= min_umi
-    resolved = strong & (top_val > float(gcfg.dominance_ratio) * second_val)
+    strong = np.asarray(top_val) >= min_umi
+    ratio = slot_dominance_ratio(top_val, second_val, gcfg)
+    resolved = strong & (ratio >= float(gcfg.dominance_ratio))
     if gcfg.max_second_umi is not None and gcfg.max_second_umi >= 0:
-        resolved &= second_val <= gcfg.max_second_umi
-    return resolved, strong & ~resolved
+        resolved &= np.asarray(second_val) <= gcfg.max_second_umi
+    return resolved, strong & ~resolved, ratio
 
 
 def resolve_guide_metadata(guides: ad.AnnData, gcfg: GuideConfig, pair_map: Optional[pd.DataFrame]):
@@ -254,6 +293,30 @@ def resolve_guide_metadata(guides: ad.AnnData, gcfg: GuideConfig, pair_map: Opti
         scaf = np.where(missing, "unknown", scaf)
     logger.info("Guide targets from %s; scaffold classes: %s", src, dict(pd.Series(scaf).value_counts()))
     return targets, ntc, scaf, pair_id
+
+
+_EXTRA_REF_COLUMNS = ("design_guide_id", "designed_slot", "feature_role", "construct_types", "construct_position", "target_symbol", "control_status")
+
+
+def _shared_construct_ids(pair_ids_a: np.ndarray, pair_ids_c: np.ndarray, delim: str) -> np.ndarray:
+    """First construct id shared by each (A guide, C guide) pair, or ``""``.
+
+    Pair ids may list several constructs (``ACYP1_1F;ACYP1_S1``); a pair is
+    designed when the two lists intersect. Combinations are cached so the loop
+    runs once per distinct (A, C) feature pair rather than per cell.
+    """
+    out = np.full(len(pair_ids_a), "", dtype=object)
+    cache: Dict[Tuple[str, str], str] = {}
+    for k, (pa, pc) in enumerate(zip(pair_ids_a, pair_ids_c)):
+        key = (pa, pc)
+        hit = cache.get(key)
+        if hit is None:
+            sa = {x.strip() for x in str(pa).split(delim) if x.strip()}
+            sc = {x.strip() for x in str(pc).split(delim) if x.strip()}
+            inter = sorted(sa & sc)
+            hit = cache[key] = inter[0] if inter else ""
+        out[k] = hit
+    return out
 
 
 # ---------------------------------------------------------------------------
@@ -299,9 +362,9 @@ def assign_guide_pairs(expr: ad.AnnData, guides: ad.AnnData, cfg: Config) -> ad.
         cols = np.flatnonzero(guide_scaf == c)
         sub = X[:, cols] if len(cols) else sparse.csr_matrix((n, 0))
         t_idx, t_val, s_val, _ = _top_two(sub)
-        resolved, multiple = _slot_gate(t_val, s_val, gcfg)
+        resolved, multiple, ratio = _slot_gate(t_val, s_val, gcfg)
         n_strong = np.asarray((sub >= min_umi).sum(axis=1)).ravel().astype(np.int32) if len(cols) else np.zeros(n, dtype=np.int32)
-        slot[c] = dict(idx=cols[t_idx] if len(cols) else np.zeros(n, dtype=np.int64), val=t_val, second=s_val,
+        slot[c] = dict(idx=cols[t_idx] if len(cols) else np.zeros(n, dtype=np.int64), val=t_val, second=s_val, ratio=ratio,
                        resolved=resolved, multiple=multiple, none=~(resolved | multiple), n_strong=n_strong)
     unk_cols = np.flatnonzero(~known)
     unk_strong = np.asarray((X[:, unk_cols] >= min_umi).sum(axis=1)).ravel() if len(unk_cols) else np.zeros(n)
@@ -315,6 +378,8 @@ def assign_guide_pairs(expr: ad.AnnData, guides: ad.AnnData, cfg: Config) -> ad.
     pair_call = np.full(n, unl, dtype=object)
     pair_id_call = np.full(n, "", dtype=object)
     provisional = np.zeros(n, dtype=bool)
+    detail = np.full(n, "", dtype=object)
+    construct_type = np.full(n, CONSTRUCT_NONE, dtype=object)
 
     def set_amb(mask, st):
         status[mask] = st
@@ -322,10 +387,12 @@ def assign_guide_pairs(expr: ad.AnnData, guides: ad.AnnData, cfg: Config) -> ad.
         target_call[mask] = amb
         guide_call[mask] = amb
         pair_call[mask] = amb
+        detail[mask] = st
 
     has_counts = total > 0
     no_strong = A["none"] & C["none"]
     status[no_strong & ~has_counts] = STATUS_NO_GUIDE
+    detail[no_strong & ~has_counts] = STATUS_NO_GUIDE
     set_amb(no_strong & has_counts & (unk_strong == 0), STATUS_BELOW_MIN_UMI)
     set_amb(no_strong & has_counts & (unk_strong > 0), STATUS_UNKNOWN_GUIDE)
 
@@ -352,46 +419,60 @@ def assign_guide_pairs(expr: ad.AnnData, guides: ad.AnnData, cfg: Config) -> ad.
         pc = np.full(idx.size, amb, dtype=object)
         pid = pair_label.copy()
         prov = np.zeros(idx.size, dtype=bool)
+        dt = np.full(idx.size, "", dtype=object)
+        ct = np.full(idx.size, CONSTRUCT_NONE, dtype=object)
         same = tA == tC
         ntc_pair = nA & nC
         one_ntc = nA ^ nC
         two_targets = ~same & ~nA & ~nC
         if explicit:
-            pA, pC = guide_pair_id[ai].astype(str), guide_pair_id[ci].astype(str)
-            designed = (pA != "") & (pA == pC)
-            pid[designed] = pA[designed]
-            set_amb_local = ~designed
-            st[set_amb_local] = STATUS_UNRESOLVED
+            shared = _shared_construct_ids(guide_pair_id[ai], guide_pair_id[ci], gcfg.pair_id_delimiter or ";")
+            designed = shared != ""
+            pid[designed] = shared[designed]
+            # designed constructs
             m = designed & ntc_pair
-            st[m], kl[m], tg[m], pc[m] = STATUS_PAIR_NTC, CLASS_NTC, gcfg.ntc_label, gcfg.ntc_label
+            st[m], kl[m], tg[m], pc[m], dt[m], ct[m] = STATUS_PAIR_NTC, CLASS_NTC, gcfg.ntc_label, gcfg.ntc_label, DETAIL_DESIGNED_NTC, CONSTRUCT_NTC
             m = designed & one_ntc
-            st[m], kl[m] = STATUS_PAIR_TARGET_NTC, CLASS_TARGETING
-            tg[m], pc[m] = target_of[m], target_of[m]
+            st[m], dt[m], ct[m], pc[m] = STATUS_PAIR_TARGET_NTC, DETAIL_DESIGNED_SINGLE_NTC, CONSTRUCT_SINGLE_NTC, target_of[m]
+            if gcfg.designed_targeting_plus_ntc_primary:
+                kl[m], tg[m] = CLASS_TARGETING, target_of[m]  # designed single-guide + NTC constructs are primary targeting labels
+            # else: kept as a designed construct but class stays ambiguous -> sensitivity stratum only
             m = designed & same & ~nA
-            st[m], kl[m], tg[m], pc[m] = STATUS_PAIR_TARGETING, CLASS_TARGETING, tA[m], tA[m]
+            st[m], kl[m], tg[m], pc[m], dt[m], ct[m] = STATUS_PAIR_TARGETING, CLASS_TARGETING, tA[m], tA[m], DETAIL_DESIGNED_DUAL, CONSTRUCT_DUAL
             m = designed & two_targets
-            st[m], pc[m] = STATUS_DUAL_TARGET, two_label[m]
+            st[m], pc[m], dt[m], ct[m] = STATUS_DUAL_TARGET, two_label[m], DETAIL_DESIGNED_TWO_TARGETS, CONSTRUCT_TWO_TARGETS
+            # combinations that are not a designed construct: never assigned
+            m = ~designed & two_targets
+            st[m], pc[m], dt[m] = STATUS_DUAL_TARGET, two_label[m], DETAIL_TWO_TARGETS_NOT_DESIGNED
+            m = ~designed & same & ~nA
+            st[m], pc[m], dt[m] = STATUS_UNRESOLVED, tA[m], DETAIL_SAME_TARGET_NOT_DESIGNED
+            m = ~designed & one_ntc
+            st[m], pc[m], dt[m] = STATUS_UNRESOLVED, target_of[m], DETAIL_TARGET_NTC_NOT_DESIGNED
+            m = ~designed & ntc_pair
+            st[m], pc[m], dt[m] = STATUS_UNRESOLVED, gcfg.ntc_label, DETAIL_NTC_NOT_DESIGNED
         else:
             prov[:] = True
             m = ntc_pair
-            st[m], kl[m], tg[m], pc[m] = STATUS_PAIR_NTC, CLASS_NTC, gcfg.ntc_label, gcfg.ntc_label
+            st[m], kl[m], tg[m], pc[m], dt[m], ct[m] = STATUS_PAIR_NTC, CLASS_NTC, gcfg.ntc_label, gcfg.ntc_label, DETAIL_PROVISIONAL_NTC, CONSTRUCT_NTC
             m = same & ~nA
-            st[m], kl[m], tg[m], pc[m] = STATUS_PAIR_TARGETING, CLASS_TARGETING, tA[m], tA[m]
+            st[m], kl[m], tg[m], pc[m], dt[m], ct[m] = STATUS_PAIR_TARGETING, CLASS_TARGETING, tA[m], tA[m], DETAIL_PROVISIONAL_SAME, CONSTRUCT_DUAL
             m = one_ntc
             if gcfg.ntc_partner_policy == "provisional_target":
-                st[m], kl[m] = STATUS_PAIR_TARGET_NTC_PROVISIONAL, CLASS_TARGETING
+                st[m], kl[m], ct[m] = STATUS_PAIR_TARGET_NTC_PROVISIONAL, CLASS_TARGETING, CONSTRUCT_SINGLE_NTC
                 tg[m] = target_of[m]
             else:
                 st[m] = STATUS_PAIR_TARGET_NTC  # ambiguous: excluded from primary testing
-            pc[m] = target_of[m]
+            pc[m], dt[m] = target_of[m], DETAIL_PROVISIONAL_TARGET_NTC
             m = two_targets
-            st[m], pc[m] = STATUS_DUAL_TARGET, two_label[m]
+            st[m], pc[m], dt[m] = STATUS_DUAL_TARGET, two_label[m], DETAIL_PROVISIONAL_TWO
         status[idx], klass[idx], target_call[idx], pair_call[idx], provisional[idx], pair_id_call[idx] = st, kl, tg, pc, prov, pid
+        detail[idx], construct_type[idx] = dt, ct
         assigned_pair = np.isin(kl, [CLASS_TARGETING, CLASS_NTC])
         guide_call[idx[assigned_pair]] = pair_label[assigned_pair]
         guide_call[idx[~assigned_pair]] = amb
 
     assert (status != "").all(), "every cell must receive a pair assignment status"
+    assert (detail != "").all(), "every cell must receive a pair resolution detail"
 
     # ---- obs -------------------------------------------------------------------------
     expr.obs[OBS_TOP] = g_top
@@ -411,6 +492,7 @@ def assign_guide_pairs(expr: ad.AnnData, guides: ad.AnnData, cfg: Config) -> ad.
         expr.obs[OBS_SLOT_TARGET.format(c=c)] = pd.Categorical(stg)
         expr.obs[OBS_SLOT_COUNT.format(c=c)] = s["val"]
         expr.obs[OBS_SLOT_SECOND.format(c=c)] = s["second"]
+        expr.obs[OBS_SLOT_RATIO.format(c=c)] = s["ratio"]
         expr.obs[OBS_SLOT_NSTRONG.format(c=c)] = s["n_strong"]
         expr.obs[OBS_SLOT_STATUS.format(c=c)] = pd.Categorical(
             np.where(s["resolved"], SLOT_RESOLVED, np.where(s["multiple"], SLOT_MULTIPLE, SLOT_NONE)).astype(str),
@@ -420,6 +502,17 @@ def assign_guide_pairs(expr: ad.AnnData, guides: ad.AnnData, cfg: Config) -> ad.
     expr.obs[OBS_PAIR_STATUS] = pd.Categorical(status.astype(str))
     expr.obs[OBS_PAIR_PROVISIONAL] = provisional
     expr.obs[OBS_PAIR_PRIMARY] = np.isin(klass, [CLASS_TARGETING, CLASS_NTC])
+    expr.obs[OBS_PAIR_DETAIL] = pd.Categorical(detail.astype(str))
+    if pair_map is not None and "target_symbol" in pair_map.columns:
+        sym_of_guide = pd.Series(pd.Index(guide_ids), index=pd.Index(guide_ids)).map(pair_map["target_symbol"].astype(str)).fillna("").to_numpy().astype(object)
+        sym = np.full(n, "", dtype=object)
+        tmask = (klass == CLASS_TARGETING) | (status == STATUS_PAIR_TARGET_NTC)  # incl. designed targeting+NTC constructs (sensitivity)
+        if tmask.any():
+            a_i, c_i = A["idx"][tmask], C["idx"][tmask]
+            sym[tmask] = np.where(guide_ntc[a_i], sym_of_guide[c_i], sym_of_guide[a_i])
+        sym[klass == CLASS_NTC] = gcfg.ntc_label
+        expr.obs[OBS_TARGET_SYMBOL] = pd.Categorical(sym.astype(str))
+    expr.obs[OBS_CONSTRUCT_TYPE] = pd.Categorical(construct_type.astype(str), categories=[CONSTRUCT_DUAL, CONSTRUCT_SINGLE_NTC, CONSTRUCT_NTC, CONSTRUCT_TWO_TARGETS, CONSTRUCT_NONE])
 
     if gcfg.single_guide_diagnostic:
         sg_assigned = (g_top >= min_umi) & (g_top > float(gcfg.dominance_ratio) * g_second)
@@ -441,9 +534,14 @@ def assign_guide_pairs(expr: ad.AnnData, guides: ad.AnnData, cfg: Config) -> ad.
         "ntc_partner_policy": gcfg.ntc_partner_policy, "require_complete_pair": bool(gcfg.require_complete_pair),
         "unresolved_pair_policy": gcfg.unresolved_pair_policy, "single_guide_diagnostic": bool(gcfg.single_guide_diagnostic),
         "min_umi": int(gcfg.min_umi), "dominance_ratio": float(gcfg.dominance_ratio), "max_second_umi": int(gcfg.max_second_umi),
+        "pair_id_delimiter": gcfg.pair_id_delimiter, "dominance_pseudocount": float(getattr(gcfg, "dominance_pseudocount", 1.0)),
+        "designed_targeting_plus_ntc_primary": bool(gcfg.designed_targeting_plus_ntc_primary),
+        "slot_rule": f"slot passes when top_umi >= {int(gcfg.min_umi)} and (top_umi + {float(getattr(gcfg, 'dominance_pseudocount', 1.0)):g}) / (second_umi + {float(getattr(gcfg, 'dominance_pseudocount', 1.0)):g}) >= {float(gcfg.dominance_ratio):g}, evaluated independently for scaffold A and scaffold C",
         "rule": ("strongest guide per scaffold class must reach min_umi and exceed dominance_ratio x the class runner-up; "
-                 "valid pair = same designed pair id (explicit reference) or same target (provisional rule); "
-                 "targeting+NTC, dual-target, incomplete and unresolved pairs are excluded from primary testing"),
+                 "explicit reference: valid pair = the two slot features share a designed construct id (designed dual-targeting, designed targeting+NTC and designed NTC-NTC constructs are assigned; "
+                 "two different targets -> dual_target_ambiguous; any other non-designed combination -> unresolved_pair, see pair_resolution_detail); "
+                 "provisional rule (no ids): same target -> pair_targeting, both NTC -> pair_non_targeting, targeting+NTC per ntc_partner_policy; "
+                 "incomplete, scaffold-ambiguous, dual-target and unresolved cells are excluded from primary testing"),
     }
 
     for obj in ({id(aligned): aligned, id(guides): guides}.values()):
@@ -451,6 +549,11 @@ def assign_guide_pairs(expr: ad.AnnData, guides: ad.AnnData, cfg: Config) -> ad.
         obj.var["is_non_targeting"] = guide_ntc
         obj.var["scaffold"] = guide_scaf
         obj.var["pair_id"] = guide_pair_id.astype(str)
+        if pair_map is not None:
+            ids_all = pd.Index(obj.var_names.astype(str))
+            for col in _EXTRA_REF_COLUMNS:
+                if col in pair_map.columns:
+                    obj.var[col] = pd.Series(ids_all, index=ids_all).map(pair_map[col].astype(str)).fillna("").to_numpy().astype(str)
     aligned.obs[OBS_GUIDE] = expr.obs[OBS_GUIDE].to_numpy()
     aligned.obs[OBS_TARGET] = expr.obs[OBS_TARGET].to_numpy()
 
@@ -484,11 +587,37 @@ def pair_assignment_per_lane(expr: ad.AnnData, lane_key: str = "lane_id") -> Opt
     if len(tab) > 1:
         tab.loc["ALL"] = tab.sum(axis=0)
     tab.insert(0, "n_cells", tab.sum(axis=1))
-    tab.insert(1, "n_pair_assigned_primary", tab.get(STATUS_PAIR_TARGETING, 0) + tab.get(STATUS_PAIR_NTC, 0) + tab.get(STATUS_PAIR_TARGET_NTC_PROVISIONAL, 0))
+    if OBS_PAIR_PRIMARY in expr.obs.columns:
+        prim = expr.obs.groupby(expr.obs[lane_key].astype(str), observed=True)[OBS_PAIR_PRIMARY].sum().astype(int)
+        if len(tab) > 1:
+            prim.loc["ALL"] = int(prim.sum())
+        tab.insert(1, "n_pair_assigned_primary", prim.reindex(tab.index).fillna(0).astype(int).to_numpy())
+    else:
+        tab.insert(1, "n_pair_assigned_primary", tab.get(STATUS_PAIR_TARGETING, 0) + tab.get(STATUS_PAIR_NTC, 0) + tab.get(STATUS_PAIR_TARGET_NTC_PROVISIONAL, 0))
+    tab.insert(2, "frac_strict_primary_pair", tab["n_pair_assigned_primary"] / tab["n_cells"])
     tab.insert(2, "frac_complete_pair", (tab.get(STATUS_PAIR_TARGETING, 0) + tab.get(STATUS_PAIR_NTC, 0) + tab.get(STATUS_PAIR_TARGET_NTC, 0)
                                           + tab.get(STATUS_PAIR_TARGET_NTC_PROVISIONAL, 0) + tab.get(STATUS_DUAL_TARGET, 0) + tab.get(STATUS_UNRESOLVED, 0)) / tab["n_cells"])
     tab.insert(3, "frac_incomplete_pair", tab.get(STATUS_INCOMPLETE, 0) / tab["n_cells"])
     return tab.reset_index().rename(columns={lane_key: "lane_id"})
+
+
+def pair_resolution_detail_table(expr: ad.AnnData, lane_key: str = "lane_id") -> Optional[pd.DataFrame]:
+    """Cells per (pair status, resolution detail, construct type, class), per lane and overall."""
+    if OBS_PAIR_DETAIL not in expr.obs.columns:
+        return None
+    keys = [OBS_PAIR_STATUS, OBS_PAIR_DETAIL, OBS_CONSTRUCT_TYPE, OBS_CLASS]
+    df = expr.obs.groupby(keys, observed=True).size().reset_index(name="n_cells_all")
+    if lane_key in expr.obs.columns:
+        per = pd.crosstab([expr.obs[k].astype(str) for k in keys], expr.obs[lane_key].astype(str)).reset_index()
+        per.columns = keys + [f"n_cells_{c}" for c in per.columns[len(keys):]]
+        for k in keys:
+            df[k] = df[k].astype(str)
+        df = df.merge(per, on=keys, how="left")
+    df["pct_of_cells"] = 100.0 * df["n_cells_all"] / max(expr.n_obs, 1)
+    order = {s: i for i, s in enumerate(PAIR_STATUS_ORDER)}
+    df["_o"] = df[OBS_PAIR_STATUS].astype(str).map(lambda s: order.get(s, len(order)))
+    df["enters_primary_testing"] = df[OBS_CLASS].astype(str).isin([CLASS_TARGETING, CLASS_NTC])
+    return df.sort_values(["_o", "n_cells_all"], ascending=[True, False]).drop(columns="_o").reset_index(drop=True)
 
 
 def single_guide_diagnostic_table(expr: ad.AnnData) -> Optional[pd.DataFrame]:

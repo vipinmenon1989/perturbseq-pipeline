@@ -8,11 +8,16 @@ written through the run's :class:`~perturbseq_pipeline.plots.FigureRegistry`
 pseudocount 0.01) and :func:`perturbation.benjamini_hochberg`; the hit rule is
 the pipeline default (``ks_fdr < fdr_alpha`` and ``log2fc < max_log2fc_for_hit``).
 
-Primary labels are the pair assignments: targeting cells = ``pair_targeting``
-(plus ``pair_targeting_plus_ntc_provisional`` when that policy is on), controls =
-``pair_non_targeting`` cells. A clearly labelled sensitivity stratum adds the
-``pair_targeting_plus_ntc`` cells to the targeting group. FDR columns: ``fdr_ks``
-(raw BH FDR) and ``neg_log10_fdr = -log10(max(fdr_ks, 1e-300))``.
+Primary labels are the pair assignments: targeting cells = ``perturbation_class ==
+targeting`` (``pair_targeting`` = designed dual-guide constructs and, in explicit
+mode, ``pair_targeting_plus_ntc`` = designed single-guide + NTC constructs),
+controls = ``pair_non_targeting`` cells (designed NTC-NTC constructs). Clearly
+labelled strata report the dual-guide-only and single-guide-only constructs and a
+sensitivity stratum that adds same-target combinations which are not designed
+constructs (``unresolved_pair`` / ``same_target_not_designed``). In provisional
+(no construct id) mode the sensitivity stratum adds ``pair_targeting_plus_ntc``
+cells instead. FDR columns: ``fdr_ks`` (raw BH FDR) and
+``neg_log10_fdr = -log10(max(fdr_ks, 1e-300))``.
 """
 from __future__ import annotations
 
@@ -41,6 +46,9 @@ QC_LABEL = {"total_counts": "total UMIs", "n_genes_by_counts": "detected genes",
 LOGX = {"total_counts", "n_genes_by_counts", "guide_umi_total"}
 STRATUM_PRIMARY = "primary_pair_targeting"
 STRATUM_SENSITIVITY = "sensitivity_incl_targeting_plus_ntc"
+STRATUM_DUAL_ONLY = "dual_guide_constructs_only"
+STRATUM_SINGLE_ONLY = "single_guide_plus_ntc_constructs_only"
+STRATUM_SENS_SAME_TARGET = "sensitivity_incl_same_target_not_designed"
 CLASS_COLORS = {CLASS_TARGETING: "#2a78d6", CLASS_NTC: "#1baf7a", CLASS_AMBIGUOUS: "#eda100", CLASS_UNASSIGNED: "#9a9a9a", "QC-failed": "#e34948"}
 STATUS_COLORS = {
     dg.STATUS_PAIR_TARGETING: "#2a78d6", dg.STATUS_PAIR_NTC: "#1baf7a", dg.STATUS_PAIR_TARGET_NTC: "#8ab4e8",
@@ -224,6 +232,24 @@ def pair_guide_qc(expr: ad.AnnData, guides: Optional[ad.AnnData], cfg: Config, r
         d["targeting_plus_ntc_pair_cells"] = int(st.isin([dg.STATUS_PAIR_TARGET_NTC, dg.STATUS_PAIR_TARGET_NTC_PROVISIONAL]).sum())
         d["dual_target_ambiguous_cells"] = int((st == dg.STATUS_DUAL_TARGET).sum())
         d["primary_pair_assigned_cells"] = int(obs.loc[m, dg.OBS_PAIR_PRIMARY].astype(bool).sum())
+        d["strict_primary_pair_fraction"] = float(obs.loc[m, dg.OBS_PAIR_PRIMARY].astype(bool).mean()) if m.any() else np.nan
+        d["ambiguous_fraction"] = float((klass[m] == CLASS_AMBIGUOUS).mean()) if m.any() else np.nan
+        d["dual_target_fraction"] = float((st == dg.STATUS_DUAL_TARGET).mean()) if len(st) else np.nan
+        d["unresolved_pair_fraction"] = float((st == dg.STATUS_UNRESOLVED).mean()) if len(st) else np.nan
+        if dg.OBS_PAIR_DETAIL in obs.columns:
+            det_m = obs.loc[m, dg.OBS_PAIR_DETAIL].astype(str)
+            d["targeting_plus_ntc_designed_sensitivity_cells"] = int(((st == dg.STATUS_PAIR_TARGET_NTC).to_numpy() & (det_m == dg.DETAIL_DESIGNED_SINGLE_NTC).to_numpy() & (klass[m] != CLASS_TARGETING)).sum())
+            d["same_target_not_designed_cells"] = int((det_m == dg.DETAIL_SAME_TARGET_NOT_DESIGNED).sum())
+        for c in (cA, cC):
+            rcol = dg.OBS_SLOT_RATIO.format(c=c)
+            if rcol in obs.columns:
+                top = obs.loc[m, dg.OBS_SLOT_COUNT.format(c=c)].to_numpy(float); ratio = obs.loc[m, rcol].to_numpy(float)
+                strong_m = top >= min_umi
+                d[f"slot_{c}_cells_top_ge_min_umi"] = int(strong_m.sum())
+                d[f"slot_{c}_frac_dominant_given_strong"] = float((ratio[strong_m] >= float(cfg.guides.dominance_ratio)).mean()) if strong_m.any() else np.nan
+                d[f"slot_{c}_median_dominance_ratio_given_strong"] = float(np.median(ratio[strong_m])) if strong_m.any() else np.nan
+                d[f"slot_{c}_median_top_umi_given_strong"] = float(np.median(top[strong_m])) if strong_m.any() else np.nan
+                d[f"slot_{c}_median_second_umi_given_strong"] = float(np.median(obs.loc[m, dg.OBS_SLOT_SECOND.format(c=c)].to_numpy(float)[strong_m])) if strong_m.any() else np.nan
         for k in (CLASS_TARGETING, CLASS_NTC, CLASS_AMBIGUOUS, CLASS_UNASSIGNED):
             d[f"class_{k}"] = int((klass[m] == k).sum())
         rows.append(d)
@@ -231,6 +257,70 @@ def pair_guide_qc(expr: ad.AnnData, guides: Optional[ad.AnnData], cfg: Config, r
     per_lane = dg.pair_assignment_per_lane(expr)
     if per_lane is not None:
         tables["pair_assignment_status_per_lane"] = per_lane
+    detail_tab = dg.pair_resolution_detail_table(expr)
+    if detail_tab is not None:
+        tables["pair_resolution_detail_per_lane"] = detail_tab
+    if dg.OBS_CONSTRUCT_TYPE in obs.columns and LANE_KEY in obs.columns:
+        ct_tab = pd.crosstab(obs[LANE_KEY].astype(str), obs[dg.OBS_CONSTRUCT_TYPE].astype(str))
+        if len(ct_tab) > 1:
+            ct_tab.loc["ALL"] = ct_tab.sum()
+        ct_tab.index.name = "lane_id"
+        tables["construct_type_per_lane"] = ct_tab.reset_index()
+    # per-scaffold slot diagnostics: how many strong guides per scaffold class per cell
+    srows = []
+    for g in groups:
+        m = _mask(obs, g)
+        for c in (cA, cC):
+            col = dg.OBS_SLOT_NSTRONG.format(c=c)
+            if col in obs.columns:
+                vc = obs.loc[m, col].astype(int).clip(upper=5).value_counts().sort_index()
+                srows.append({"lane_id": g, "scaffold": c, **{f"cells_with_{int(k)}{'+' if k == 5 else ''}_strong_guides": int(v) for k, v in vc.items()},
+                              "cells_multiple_strong": int((obs.loc[m, col].astype(int) > 1).sum()), "frac_multiple_strong": float((obs.loc[m, col].astype(int) > 1).mean()) if m.any() else np.nan})
+    if srows:
+        tables["strong_guides_per_scaffold_per_lane"] = pd.DataFrame(srows).fillna(0)
+    # feature-level representation (guide count matrix columns) with design annotation
+    if guides is not None:
+        gv = guides.var
+        gids = np.asarray(guides.var_names.astype(str))
+        feat = pd.DataFrame({"guide_id": gids})
+        for c in ("design_guide_id", "scaffold", "feature_role", "designed_slot", "pair_id", "construct_types", "target_gene", "is_non_targeting"):
+            if c in gv.columns:
+                feat[c] = np.asarray(gv[c].astype(str))
+        slotA = obs[dg.OBS_SLOT_ID.format(c=cA)].astype(str).to_numpy() if dg.OBS_SLOT_ID.format(c=cA) in obs.columns else None
+        slotC = obs[dg.OBS_SLOT_ID.format(c=cC)].astype(str).to_numpy() if dg.OBS_SLOT_ID.format(c=cC) in obs.columns else None
+        assigned_gid = obs[OBS_GUIDE].astype(str).to_numpy()
+        for g in groups:
+            m = _mask(obs, g)
+            sub = G[m]
+            feat[f"umis_{g}"] = np.asarray(sub.sum(axis=0)).ravel().astype(int)
+            feat[f"cells_ge{min_umi}umi_{g}"] = np.asarray((sub >= min_umi).sum(axis=0)).ravel().astype(int)
+            if slotA is not None:
+                res_counts = pd.Series(np.concatenate([slotA[m], slotC[m]])).value_counts()
+                feat[f"cells_resolved_slot_{g}"] = feat["guide_id"].map(res_counts).fillna(0).astype(int)
+            pa = pd.Series([x for lab in assigned_gid[m & np.isin(klass, [CLASS_TARGETING, CLASS_NTC])] for x in str(lab).split(dg.PAIR_SEP)]).value_counts()
+            feat[f"cells_in_primary_pair_{g}"] = feat["guide_id"].map(pa).fillna(0).astype(int)
+        tables["guide_feature_representation"] = feat
+        if "feature_role" in feat.columns:
+            rows_od = []
+            for g in groups:
+                tot = feat[f"umis_{g}"].sum()
+                for role, sub in feat.groupby("feature_role"):
+                    rows_od.append({"lane_id": g, "feature_role": role, "n_features": len(sub), "umis": int(sub[f"umis_{g}"].sum()), "frac_of_guide_umis": float(sub[f"umis_{g}"].sum() / max(tot, 1)),
+                                    f"features_with_ge1_cell_at_{min_umi}umi": int((sub[f"cells_ge{min_umi}umi_{g}"] > 0).sum())})
+            tables["off_design_umi_fraction_per_lane"] = pd.DataFrame(rows_od)
+        # per-construct cell counts (designed pairs only)
+        if dg.OBS_PAIR_ID in obs.columns:
+            prim_m = np.isin(klass, [CLASS_TARGETING, CLASS_NTC])
+            if prim_m.any() and LANE_KEY in obs.columns:
+                cc = pd.crosstab(obs.loc[prim_m, dg.OBS_PAIR_ID].astype(str), obs.loc[prim_m, LANE_KEY].astype(str))
+                if cc.shape[1] > 1:
+                    cc["ALL"] = cc.sum(axis=1)
+                cc.index.name = "construct_id"
+                meta = obs.loc[prim_m].drop_duplicates(dg.OBS_PAIR_ID).set_index(obs.loc[prim_m].drop_duplicates(dg.OBS_PAIR_ID)[dg.OBS_PAIR_ID].astype(str))
+                cc.insert(0, "guide_pair", cc.index.map(meta[OBS_GUIDE].astype(str).to_dict()))
+                cc.insert(1, "construct_type", cc.index.map(meta[dg.OBS_CONSTRUCT_TYPE].astype(str).to_dict()) if dg.OBS_CONSTRUCT_TYPE in meta.columns else "")
+                cc.insert(2, "target_gene", cc.index.map(meta[OBS_TARGET].astype(str).to_dict()))
+                tables["construct_cells_per_lane"] = cc.reset_index()
     # target / pair cell counts per lane
     tmask = klass == CLASS_TARGETING
     ct = pd.crosstab(obs.loc[tmask, OBS_TARGET].astype(str), obs.loc[tmask, LANE_KEY].astype(str)) if tmask.any() and LANE_KEY in obs.columns else pd.DataFrame()
@@ -286,6 +376,66 @@ def pair_guide_qc(expr: ad.AnnData, guides: Optional[ad.AnnData], cfg: Config, r
             axes[1].bar(x + i * w, frac.loc[g], width=w, color=_color(g, groups), label=g)
         axes[1].set_xticks(x + 0.4 - w / 2); axes[1].set_xticklabels(order, fontsize=6, rotation=35, ha="right"); axes[1].set_ylabel("fraction of cells"); axes[1].legend(fontsize=6, frameon=False); _style(axes[1])
         registry.save(fig, "pair_assignment_status_counts_and_fractions", SECTION_GUIDES, "Pair-assignment status counts and fractions per lane (primary labels: pair_targeting and pair_non_targeting)")
+    if all(dg.OBS_SLOT_RATIO.format(c=c) in obs.columns for c in (cA, cC)):
+        thr = float(cfg.guides.dominance_ratio)
+        fig, axes = plt.subplots(1, 2, figsize=(11, 3.8), sharey=True)
+        for ax, c in zip(axes, (cA, cC)):
+            top = obs[dg.OBS_SLOT_COUNT.format(c=c)].to_numpy(float); ratio = obs[dg.OBS_SLOT_RATIO.format(c=c)].to_numpy(float)
+            for g in groups:
+                m = _mask(obs, g) & (top >= min_umi)
+                _ecdf(ax, ratio[m], g, _color(g, groups), log_x=True, ls="--" if g == "ALL" else "-")
+            ax.axvline(thr + 1, color="#e34948", ls="--", lw=0.8, label=f"threshold {thr:g}")
+            ax.set_xlabel(f"scaffold-{c} dominance ratio (top+1)/(second+1), +1 log axis"); ax.set_ylabel("ECDF (cells with top >= min_umi)"); ax.set_title(f"Slot {c} dominance ratio", fontsize=9); ax.legend(fontsize=6, frameon=False); _style(ax)
+        registry.save(fig, "slot_dominance_ratio_ecdf", SECTION_GUIDES, f"Per-slot dominance ratio (top UMI + 1) / (second UMI + 1) for cells whose top guide reaches min_umi = {min_umi}; slots pass at >= {thr:g}")
+        fig, axes = plt.subplots(1, 2, figsize=(11, 4.5))
+        rng = np.random.default_rng(cfg.run.seed)
+        sub = rng.choice(len(obs), size=min(len(obs), 40000), replace=False)
+        slot_col = {dg.SLOT_RESOLVED: "#2a78d6", dg.SLOT_MULTIPLE: "#eb6834", dg.SLOT_NONE: "#9a9a9a"}
+        for ax, c in zip(axes, (cA, cC)):
+            top = obs[dg.OBS_SLOT_COUNT.format(c=c)].to_numpy(float)[sub]; sec = obs[dg.OBS_SLOT_SECOND.format(c=c)].to_numpy(float)[sub]
+            sst = obs[dg.OBS_SLOT_STATUS.format(c=c)].astype(str).to_numpy()[sub]
+            ax.scatter(sec + 1, top + 1, s=2, alpha=0.3, linewidths=0, c=[slot_col.get(v, "#999") for v in sst])
+            xs = np.logspace(0, np.log10(max(sec.max() + 2, 10)), 100)
+            ax.plot(xs, thr * xs, color="#e34948", ls="--", lw=0.8, label=f"(top+1) = {thr:g} x (second+1)")
+            ax.axhline(min_umi + 1, color="#52514e", ls=":", lw=0.8, label=f"min_umi = {min_umi}")
+            for k, col in slot_col.items():
+                ax.scatter([], [], c=col, s=12, label=f"slot {k}")
+            ax.set_xscale("log"); ax.set_yscale("log"); ax.set_xlabel(f"second guide UMIs + 1 (scaffold {c})"); ax.set_ylabel(f"top guide UMIs + 1 (scaffold {c})"); ax.legend(fontsize=6, frameon=False); ax.set_title(f"Slot {c}: top vs second guide", fontsize=9); _style(ax)
+        registry.save(fig, "slot_top_vs_second_guide", SECTION_GUIDES, "Top versus second guide UMIs per scaffold slot (colour = slot status; dashed = dominance threshold, dotted = min_umi)")
+    if "strong_guides_per_scaffold_per_lane" in tables:
+        fig, axes = plt.subplots(1, 2, figsize=(11, 3.8), sharey=True)
+        for ax, c in zip(axes, (cA, cC)):
+            col = dg.OBS_SLOT_NSTRONG.format(c=c)
+            for g in groups:
+                m = _mask(obs, g)
+                v = obs.loc[m, col].astype(int).clip(upper=6)
+                vc = v.value_counts(normalize=True).sort_index()
+                ax.plot(vc.index, vc.values, marker="o", ms=3, color=_color(g, groups), ls="--" if g == "ALL" else "-", label=g)
+            ax.set_xlabel(f"guides with >= {min_umi} UMIs in scaffold {c} (6 = 6+)"); ax.set_ylabel("fraction of cells"); ax.set_title(f"Strong guides per cell, scaffold {c}", fontsize=9); ax.legend(fontsize=6, frameon=False); _style(ax)
+        registry.save(fig, "strong_guides_per_scaffold", SECTION_GUIDES, "Number of guides passing min_umi per scaffold class and cell (0 = slot empty, 1 = clean slot, >1 = several strong guides -> dominance rule / ambiguity)")
+    if "off_design_umi_fraction_per_lane" in tables:
+        od = tables["off_design_umi_fraction_per_lane"]
+        piv = od.pivot_table(index="lane_id", columns="feature_role", values="frac_of_guide_umis", aggfunc="first").reindex(groups)
+        fig, ax = plt.subplots(figsize=(1.4 * len(groups) + 4, 3.8))
+        bottom = np.zeros(len(piv))
+        for i, c in enumerate(piv.columns):
+            ax.bar(piv.index, piv[c].fillna(0), bottom=bottom, color=_color(i), label=c); bottom += piv[c].fillna(0).to_numpy()
+        ax.set_ylabel("fraction of guide UMIs"); ax.set_title("Guide UMI mass by feature role (designed slot vs wrong-scaffold vs never-cloned spacer)", fontsize=9); ax.legend(fontsize=6, frameon=False); _style(ax)
+        registry.save(fig, "guide_umi_fraction_by_feature_role", SECTION_GUIDES, "Fraction of guide UMIs per lane on designed construct slots, wrong-scaffold (chimeric) features and never-cloned spacers")
+    if "guide_feature_representation" in tables and "feature_role" in tables["guide_feature_representation"].columns:
+        feat = tables["guide_feature_representation"]
+        pooled = "ALL" if "ALL" in groups else groups[0]
+        des = feat[feat.feature_role == "designed_slot"].sort_values(f"cells_ge{min_umi}umi_{pooled}", ascending=False)
+        fig, axes = plt.subplots(2, 1, figsize=(max(10, 0.03 * len(des)), 7))
+        for ax, col, ttl in zip(axes, (f"cells_ge{min_umi}umi_{pooled}", f"cells_in_primary_pair_{pooled}"), (f"cells with >= {min_umi} UMIs", "cells where the feature is part of the primary pair")):
+            cols = np.where(des["scaffold"] == cA, "#2a78d6", "#eb6834")
+            ax.bar(np.arange(len(des)), des[col], color=cols, width=1.0)
+            ax.set_ylabel(ttl, fontsize=8); ax.set_xlabel(f"designed slot features (n = {len(des)}, sorted; blue = scaffold {cA}, orange = scaffold {cC})", fontsize=8); ax.set_yscale("symlog"); _style(ax)
+            ntc = des["is_non_targeting"].astype(str).str.lower().isin(["true", "1"]).to_numpy() if "is_non_targeting" in des.columns else np.zeros(len(des), bool)
+            if ntc.any():
+                ax.scatter(np.flatnonzero(ntc), des[col].to_numpy()[ntc], s=4, color="#1baf7a", zorder=3, label="NTC feature")
+                ax.legend(fontsize=6, frameon=False)
+        registry.save(fig, "guide_feature_representation", SECTION_GUIDES, "Representation of every designed slot feature: cells detecting it and cells where it forms the primary pair (pooled)")
     if "target_cells_per_lane" in tables:
         t = tables["target_cells_per_lane"].set_index("target_gene")
         lanes_only = [c for c in t.columns if c != "ALL"]
@@ -335,9 +485,12 @@ def clustering_pair_figures(expr: ad.AnnData, cfg: Config, registry: FigureRegis
         return tables
     status = obs[dg.OBS_PAIR_STATUS].astype(str)
     klass = obs[OBS_CLASS].astype(str)
-    coarse = np.where(klass == CLASS_TARGETING, "targeting pair", np.where(klass == CLASS_NTC, "NTC pair",
-                      np.where(status == dg.STATUS_INCOMPLETE, "incomplete pair", np.where(status.str.startswith("ambiguous_scaffold"), "pair-ambiguous",
-                      np.where(status == dg.STATUS_DUAL_TARGET, "dual-target", "unassigned / other")))))
+    ctype = obs[dg.OBS_CONSTRUCT_TYPE].astype(str) if dg.OBS_CONSTRUCT_TYPE in obs.columns else pd.Series("", index=obs.index)
+    coarse = np.where((klass == CLASS_TARGETING) & (ctype == dg.CONSTRUCT_SINGLE_NTC), "targeting: single-guide+NTC construct",
+             np.where(klass == CLASS_TARGETING, "targeting: dual-guide construct", np.where(klass == CLASS_NTC, "NTC pair",
+             np.where((status == dg.STATUS_PAIR_TARGET_NTC) & (ctype == dg.CONSTRUCT_SINGLE_NTC), "targeting+NTC designed construct (sensitivity)",
+             np.where(status == dg.STATUS_INCOMPLETE, "incomplete pair", np.where(status.str.startswith("ambiguous_scaffold"), "scaffold-ambiguous",
+             np.where(status == dg.STATUS_DUAL_TARGET, "dual-target ambiguous", np.where(status == dg.STATUS_UNRESOLVED, "unresolved pair (not designed)", "no guide / below threshold / unknown"))))))))
     coarse = pd.Series(coarse, index=obs.index, name="pair_status_coarse")
     rng = np.random.default_rng(cfg.run.seed)
     panels = []
@@ -418,14 +571,51 @@ def pair_perturbation(expr: ad.AnnData, cfg: Config, registry: FigureRegistry) -
     pair_call = obs[dg.OBS_PAIR].astype(str).to_numpy()
     gid = obs[OBS_GUIDE].astype(str).to_numpy()
     lane = obs[LANE_KEY].astype(str).to_numpy() if LANE_KEY in obs.columns else np.array(["run"] * len(obs))
-    ntc_mask = klass == CLASS_NTC  # pair_non_targeting (or designed NTC pairs)
-    primary_t = (klass == CLASS_TARGETING)  # pair_targeting (+ provisional target+NTC if that policy is on)
-    sens_t = primary_t | (status == dg.STATUS_PAIR_TARGET_NTC)
-    strata = {STRATUM_PRIMARY: (primary_t, tgt), STRATUM_SENSITIVITY: (sens_t, np.where(status == dg.STATUS_PAIR_TARGET_NTC, pair_call, tgt))}
-    targets = sorted(set(tgt[primary_t]) | set(pair_call[status == dg.STATUS_PAIR_TARGET_NTC]))
-    present = {t: t for t in targets if t in expr.var_names}
+    explicit = bool((expr.uns.get("guide_assignment", {}) or {}).get("pair_reference_explicit_ids", False))
+    detail = obs[dg.OBS_PAIR_DETAIL].astype(str).to_numpy() if dg.OBS_PAIR_DETAIL in obs.columns else np.array([""] * len(obs))
+    ctype = obs[dg.OBS_CONSTRUCT_TYPE].astype(str).to_numpy() if dg.OBS_CONSTRUCT_TYPE in obs.columns else np.array([""] * len(obs))
+    construct_id = obs[dg.OBS_PAIR_ID].astype(str).to_numpy() if dg.OBS_PAIR_ID in obs.columns else np.array([""] * len(obs))
+    ntc_mask = klass == CLASS_NTC  # pair_non_targeting = designed NTC pairs
+    primary_t = (klass == CLASS_TARGETING)  # designed targeting constructs (dual-guide + single-guide/NTC in explicit mode)
+    if explicit:
+        same_nd = (status == dg.STATUS_UNRESOLVED) & (detail == dg.DETAIL_SAME_TARGET_NOT_DESIGNED)
+        designed_s1 = (status == dg.STATUS_PAIR_TARGET_NTC) & (detail == dg.DETAIL_DESIGNED_SINGLE_NTC)
+        s1_primary = bool((expr.uns.get("guide_assignment", {}) or {}).get("designed_targeting_plus_ntc_primary", True))
+        lab_s1 = np.where(designed_s1, pair_call, tgt)
+        strata = {STRATUM_PRIMARY: (primary_t, tgt)}
+        if s1_primary:
+            strata[STRATUM_DUAL_ONLY] = (primary_t & (status == dg.STATUS_PAIR_TARGETING), tgt)
+        strata[STRATUM_SINGLE_ONLY] = (designed_s1, lab_s1)
+        if not s1_primary:
+            strata[STRATUM_SENSITIVITY] = (primary_t | designed_s1, lab_s1)
+        strata[STRATUM_SENS_SAME_TARGET] = (primary_t | same_nd, np.where(same_nd, pair_call, tgt))
+        sens_key = STRATUM_SENS_SAME_TARGET
+        targets = sorted(set(tgt[primary_t]) | set(pair_call[same_nd]) | set(pair_call[designed_s1]))
+    else:
+        sens_t = primary_t | (status == dg.STATUS_PAIR_TARGET_NTC)
+        strata = {STRATUM_PRIMARY: (primary_t, tgt), STRATUM_SENSITIVITY: (sens_t, np.where(status == dg.STATUS_PAIR_TARGET_NTC, pair_call, tgt))}
+        sens_key = STRATUM_SENSITIVITY
+        targets = sorted(set(tgt[primary_t]) | set(pair_call[status == dg.STATUS_PAIR_TARGET_NTC]))
+    strata_desc = {STRATUM_PRIMARY: "strict primary pairs: designed targeting constructs with perturbation_class = targeting", STRATUM_DUAL_ONLY: "designed dual-guide constructs only (pair_targeting)",
+                   STRATUM_SINGLE_ONLY: "designed single-guide + NTC constructs only (pair_targeting_plus_ntc)", STRATUM_SENS_SAME_TARGET: "primary + same-target A/C combinations that are NOT designed constructs (sensitivity only)",
+                   STRATUM_SENSITIVITY: "primary + designed targeting+NTC constructs (sensitivity only)"}
+    # measured transcript per target: the reference's target_symbol (HGNC-style, SNP-locus labels -> gene) when it
+    # is in the matrix, otherwise the raw target label; targets whose transcript is absent cannot be tested
+    sym_obs = obs[dg.OBS_TARGET_SYMBOL].astype(str).to_numpy() if dg.OBS_TARGET_SYMBOL in obs.columns else None
+    present: Dict[str, str] = {}
+    s1_any = (status == dg.STATUS_PAIR_TARGET_NTC) & (detail == dg.DETAIL_DESIGNED_SINGLE_NTC) if explicit else np.zeros(len(obs), bool)
+    for t in targets:
+        cands = []
+        if sym_obs is not None:
+            m = ((tgt == t) & primary_t) | ((pair_call == t) & s1_any)
+            if m.any():
+                cands += list(pd.Series(sym_obs[m]).replace("", np.nan).dropna().mode())
+        cands.append(t)
+        gene = next((c for c in cands if c in expr.var_names), None)
+        if gene is not None:
+            present[t] = gene
     absent = sorted(set(targets) - set(present))
-    logger.info("Pair perturbation: %d targets with primary pairs, %d measurable by symbol; absent from matrix: %s", len(set(tgt[primary_t])), len([t for t in present if t in set(tgt[primary_t])]), absent)
+    logger.info("Pair perturbation: %d targets with primary pairs, %d measurable (target_symbol or label in the matrix); absent from matrix: %s", len(set(tgt[primary_t])), len([t for t in present if t in set(tgt[primary_t])]), absent)
     cache: Dict[str, np.ndarray] = {}
     vec = lambda g: cache.setdefault(g, _vec(expr, g))
 
@@ -443,7 +633,7 @@ def pair_perturbation(expr: ad.AnnData, cfg: Config, registry: FigureRegistry) -
             for stratum, (tm, tlab) in strata.items():
                 mp = tm & (tlab == t) & wm
                 m_oth = tm & (tlab != t) & wm
-                base = {"target_gene": t, "lane_id": g, "assignment_stratum": stratum, "n_target_pair_cells": int(mp.sum()),
+                base = {"target_gene": t, "measured_transcript": gene, "lane_id": g, "assignment_stratum": stratum, "stratum_description": strata_desc.get(stratum, ""), "n_target_pair_cells": int(mp.sum()),
                         "n_ntc_pair_cells": int(m_ntc.sum()), "n_other_target_pair_cells": int(m_oth.sum())}
                 for ctrl, mc in (("ntc", m_ntc), ("other", m_oth)):
                     r = test(mp, mc, gene)
@@ -456,7 +646,10 @@ def pair_perturbation(expr: ad.AnnData, cfg: Config, registry: FigureRegistry) -
                     mg = mp & (gid == pr)
                     r = test(mg, m_ntc, gene)
                     a_id, c_id = (pr.split(dg.PAIR_SEP) + [""])[:2]
-                    row = dict(base, guide_pair=pr, guide_A_id=a_id, guide_C_id=c_id, control="ntc", n_target_pair_cells=int(mg.sum()))
+                    cid = pd.Series(construct_id[mg]).mode()
+                    cty = pd.Series(ctype[mg]).mode()
+                    row = dict(base, guide_pair=pr, guide_A_id=a_id, guide_C_id=c_id, construct_id=str(cid.iloc[0]) if len(cid) else "", construct_type=str(cty.iloc[0]) if len(cty) else "",
+                               control="ntc", n_target_pair_cells=int(mg.sum()))
                     row.update(r if r is not None else {"skipped_reason": f"< {min_cells} cells with this pair or < {min_ctrl} NTC-pair cells"})
                     rows_p.append(row)
 
@@ -489,8 +682,12 @@ def pair_perturbation(expr: ad.AnnData, cfg: Config, registry: FigureRegistry) -
     tables["pair_perturbation_primary"] = prim
     # hit counts per lane
     hc = prim.dropna(subset=["log2fc"]).groupby("lane_id").agg(targets_tested=("target_gene", "count"), targets_hit=("is_hit", "sum")).reset_index()
-    sens = bt[(bt.control == "ntc") & (bt.assignment_stratum == STRATUM_SENSITIVITY)].dropna(subset=["log2fc"]).groupby("lane_id")["is_hit"].sum().rename("targets_hit_sensitivity_incl_targeting_plus_ntc")
-    hc = hc.merge(sens.reset_index(), on="lane_id", how="left")
+    for stratum in [k for k in strata if k != STRATUM_PRIMARY]:
+        sub = bt[(bt.control == "ntc") & (bt.assignment_stratum == stratum)].dropna(subset=["log2fc"]).groupby("lane_id").agg(**{f"targets_tested_{stratum}": ("target_gene", "count"), f"targets_hit_{stratum}": ("is_hit", "sum")})
+        hc = hc.merge(sub.reset_index(), on="lane_id", how="left")
+    if len(bp):
+        pl = bp.dropna(subset=["log2fc"]).groupby("lane_id").agg(constructs_tested=("guide_pair", "count"), constructs_hit=("is_hit", "sum")).reset_index()
+        hc = hc.merge(pl, on="lane_id", how="left")
     tables["pair_perturbation_hit_counts_per_lane"] = hc
     # target support matrix (within run: per lane + pooled)
     pooled_key = "ALL" if "ALL" in groups else groups[0]
@@ -508,8 +705,11 @@ def pair_perturbation(expr: ad.AnnData, cfg: Config, registry: FigureRegistry) -
             r["pooled_log2fc"] = sub.loc[pooled_key, "log2fc"]; r["pooled_fdr_ks"] = sub.loc[pooled_key, "fdr_ks"]; r["pooled_neg_log10_fdr"] = sub.loc[pooled_key, "neg_log10_fdr"]
             r["pooled_hit"] = bool(sub.loc[pooled_key, "is_hit"]) if pd.notna(sub.loc[pooled_key, "log2fc"]) else None
             r["pooled_n_target_pair_cells"] = int(sub.loc[pooled_key, "n_target_pair_cells"])
-        s2 = bt[(bt.target_gene == t) & (bt.control == "ntc") & (bt.assignment_stratum == STRATUM_SENSITIVITY) & (bt.lane_id == pooled_key)]
-        r["sensitivity_incl_targeting_plus_ntc_hit"] = bool(s2["is_hit"].iloc[0]) if len(s2) and pd.notna(s2["log2fc"].iloc[0]) else None
+        for stratum in [k for k in strata if k != STRATUM_PRIMARY]:
+            s2 = bt[(bt.target_gene == t) & (bt.control == "ntc") & (bt.assignment_stratum == stratum) & (bt.lane_id == pooled_key)]
+            r[f"{stratum}_hit"] = bool(s2["is_hit"].iloc[0]) if len(s2) and pd.notna(s2["log2fc"].iloc[0]) else None
+            r[f"{stratum}_log2fc"] = float(s2["log2fc"].iloc[0]) if len(s2) and pd.notna(s2["log2fc"].iloc[0]) else np.nan
+            r[f"{stratum}_n_cells"] = int(s2["n_target_pair_cells"].iloc[0]) if len(s2) else 0
         o2 = bt[(bt.target_gene == t) & (bt.control == "other") & (bt.assignment_stratum == STRATUM_PRIMARY) & (bt.lane_id == pooled_key)]
         r["other_control_hit"] = bool(o2["is_hit"].iloc[0]) if len(o2) and pd.notna(o2["log2fc"].iloc[0]) else None
         r["well_level_agreement"] = (f"{n_hit}/{n_tested} lanes" if n_tested else "single lane")
@@ -519,7 +719,10 @@ def pair_perturbation(expr: ad.AnnData, cfg: Config, registry: FigureRegistry) -
 
     # ---- figures ---------------------------------------------------------------------------
     pooled = prim[prim.lane_id == pooled_key].dropna(subset=["log2fc"])
-    sensp = bt[(bt.control == "ntc") & (bt.assignment_stratum == STRATUM_SENSITIVITY) & (bt.lane_id == pooled_key)].dropna(subset=["log2fc"]).set_index("target_gene")
+    alt_key = (STRATUM_DUAL_ONLY if STRATUM_DUAL_ONLY in strata else STRATUM_SENSITIVITY) if explicit else STRATUM_SENSITIVITY
+    alt_label = {STRATUM_DUAL_ONLY: "dual-guide constructs only", STRATUM_SENSITIVITY: "sensitivity: + designed targeting+NTC constructs" if explicit else "sensitivity: + targeting+NTC pairs"}[alt_key]
+    sensp = bt[(bt.control == "ntc") & (bt.assignment_stratum == alt_key) & (bt.lane_id == pooled_key)].dropna(subset=["log2fc"]).set_index("target_gene")
+    single = bt[(bt.control == "ntc") & (bt.assignment_stratum == STRATUM_SINGLE_ONLY) & (bt.lane_id == pooled_key)].dropna(subset=["log2fc"]).set_index("target_gene") if explicit else pd.DataFrame()
     fig, ax = plt.subplots(figsize=(6.5, 5))
     ax.scatter(pooled["log2fc"], pooled["neg_log10_fdr"], c=np.where(pooled["is_hit"], "#2a78d6", "#9a9a9a"), s=28)
     for _, r in pooled.iterrows():
@@ -537,10 +740,12 @@ def pair_perturbation(expr: ad.AnnData, cfg: Config, registry: FigureRegistry) -
     wf = pooled.sort_values("log2fc")
     if len(wf):
         fig, ax = plt.subplots(figsize=(max(6, 0.28 * len(wf)), 4))
-        ax.bar(wf["target_gene"], wf["log2fc"], color=np.where(wf["is_hit"], "#2a78d6", "#9a9a9a"), label="primary (pair_targeting)")
-        ax.scatter(range(len(wf)), sensp["log2fc"].reindex(wf["target_gene"]).values, color="#e34948", s=12, zorder=3, label="sensitivity: + targeting+NTC pairs")
+        ax.bar(wf["target_gene"], wf["log2fc"], color=np.where(wf["is_hit"], "#2a78d6", "#9a9a9a"), label="primary (all designed targeting constructs)")
+        ax.scatter(range(len(wf)), sensp["log2fc"].reindex(wf["target_gene"]).values, color="#e34948", s=12, zorder=3, label=alt_label)
+        if len(single):
+            ax.scatter(range(len(wf)), single["log2fc"].reindex(wf["target_gene"]).values, color="#1baf7a", s=12, marker="^", zorder=3, label="single-guide + NTC constructs only")
         ax.tick_params(axis="x", rotation=90, labelsize=7); ax.set_ylabel("log2FC vs NTC pairs"); ax.legend(fontsize=7, frameon=False); _style(ax)
-        registry.save(fig, "pair_waterfall_target_log2fc", SECTION_PERTURBATION, "Target-transcript log2FC per target (bars = primary pair labels; red dots = sensitivity stratum)")
+        registry.save(fig, "pair_waterfall_target_log2fc", SECTION_PERTURBATION, f"Target-transcript log2FC per target (bars = primary pair labels; red dots = {alt_label}" + ("; green triangles = single-guide+NTC constructs only)" if len(single) else ")"))
     for col, cmap in (("log2fc", "RdBu_r"), ("neg_log10_fdr", "Blues")):
         piv = prim.pivot_table(index="target_gene", columns="lane_id", values=col, aggfunc="first").reindex(columns=groups)
         piv = piv.loc[wf["target_gene"]] if len(wf) else piv
@@ -555,38 +760,44 @@ def pair_perturbation(expr: ad.AnnData, cfg: Config, registry: FigureRegistry) -
         x = np.arange(len(hc)); ax.bar(x - 0.2, hc["targets_tested"], 0.4, color="#d0d0d0", label="tested"); ax.bar(x + 0.2, hc["targets_hit"], 0.4, color="#2a78d6", label="depletion association")
         ax.set_xticks(x); ax.set_xticklabels(hc["lane_id"]); ax.set_ylabel("targets"); ax.legend(fontsize=7, frameon=False); _style(ax)
         registry.save(fig, "pair_hit_counts_per_lane", SECTION_PERTURBATION, "Targets tested and passing the hit criteria per lane (primary pair labels)")
+        if "constructs_tested" in hc.columns:
+            fig, ax = plt.subplots(figsize=(6, 4))
+            x = np.arange(len(hc)); ax.bar(x - 0.2, hc["constructs_tested"].fillna(0), 0.4, color="#d0d0d0", label="constructs tested"); ax.bar(x + 0.2, hc["constructs_hit"].fillna(0), 0.4, color="#eb6834", label="constructs with depletion association")
+            ax.set_xticks(x); ax.set_xticklabels(hc["lane_id"]); ax.set_ylabel("guide pairs / constructs"); ax.legend(fontsize=7, frameon=False); _style(ax)
+            registry.save(fig, "pair_level_hit_counts_per_lane", SECTION_PERTURBATION, "Guide pairs (constructs) tested and passing the hit criteria per lane")
     # ECDFs: one per tested target (targeting pairs vs NTC pairs, per lane + pooled), plus an overview
     tested = pooled.sort_values("fdr_ks")
     overview = tested.head(12)
     fig, axes = plt.subplots(3, 4, figsize=(15, 9)); axes = axes.ravel()
     for ax, (_, r) in zip(axes, overview.iterrows()):
-        v = vec(r["target_gene"]); mp = primary_t & (tgt == r["target_gene"])
+        v = vec(present[r["target_gene"]]); mp = primary_t & (tgt == r["target_gene"])
         _ecdf(ax, v[mp], "targeting pairs", "#2a78d6"); _ecdf(ax, v[ntc_mask], "NTC pairs", "#9a9a9a")
         ax.set_title(f"{r['target_gene']}: log2FC {r['log2fc']:.2f}, FDR {r['fdr_ks']:.1e}", fontsize=8); ax.set_xlabel("lognorm expression"); ax.legend(fontsize=6, frameon=False); _style(ax)
     for ax in axes[len(overview):]:
         ax.axis("off")
     registry.save(fig, "pair_ecdf_overview_top_targets", SECTION_PERTURBATION, "ECDF overview: target-transcript expression in targeting pairs versus NTC pairs (12 most significant targets)")
     for _, r in tested.iterrows():
-        t = r["target_gene"]; v = vec(t)
+        t = r["target_gene"]; v = vec(present[t])
         fig, axes = plt.subplots(1, 2, figsize=(11, 3.8))
         for g in groups:
             wm = _mask(obs, g)
             _ecdf(axes[0], v[primary_t & (tgt == t) & wm], f"{g} targeting pairs", _color(g, groups), ls="--" if g == "ALL" else "-")
             _ecdf(axes[1], v[ntc_mask & wm], f"{g} NTC pairs", _color(g, groups), ls="--" if g == "ALL" else "-")
         for ax, ttl in zip(axes, ("targeting pairs", "NTC pairs")):
-            ax.set_xlabel(f"{t} lognorm expression"); ax.set_ylabel("ECDF"); ax.set_title(ttl, fontsize=9); ax.legend(fontsize=6, frameon=False); _style(ax)
-        fig.suptitle(f"{t}: pooled log2FC {r['log2fc']:.2f}, KS FDR {r['fdr_ks']:.2e}, {int(r['n_target_pair_cells'])} targeting-pair cells", fontsize=9)
+            ax.set_xlabel(f"{present[t]} lognorm expression"); ax.set_ylabel("ECDF"); ax.set_title(ttl, fontsize=9); ax.legend(fontsize=6, frameon=False); _style(ax)
+        fig.suptitle(f"{t} (transcript {present[t]}): pooled log2FC {r['log2fc']:.2f}, KS FDR {r['fdr_ks']:.2e}, {int(r['n_target_pair_cells'])} targeting-pair cells", fontsize=9)
         registry.save(fig, f"ecdf_{t}", SECTION_ECDF, f"ECDF of {t} expression per lane: targeting pairs vs NTC pairs", in_report=False)
     # pair-level expression distributions for the top targets
     if len(bpp):
         top = tested.head(6)
         fig, axes = plt.subplots(2, 3, figsize=(15, 7)); axes = axes.ravel()
         for ax, (_, r) in zip(axes, top.iterrows()):
-            t = r["target_gene"]; v = vec(t)
+            t = r["target_gene"]; v = vec(present[t])
             pairs = bpp[bpp.target_gene == t].sort_values("log2fc")
             _ecdf(ax, v[ntc_mask], "NTC pairs", "#9a9a9a")
             for i, (_, pr) in enumerate(pairs.iterrows()):
-                _ecdf(ax, v[primary_t & (gid == pr["guide_pair"])], f"{pr['guide_pair']} ({pr['log2fc']:.2f})", _color(i))
+                lab = f"{pr.get('construct_id', '') or pr['guide_pair']} [{pr.get('construct_type', '')}] ({pr['log2fc']:.2f})"
+                _ecdf(ax, v[primary_t & (gid == pr["guide_pair"])], lab, _color(i))
             ax.set_title(t, fontsize=9); ax.set_xlabel("lognorm expression"); ax.legend(fontsize=5, frameon=False); _style(ax)
         for ax in axes[len(top):]:
             ax.axis("off")

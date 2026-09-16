@@ -1,0 +1,129 @@
+# Hanrui Fang pair-guide Perturb-seq, ITERATION 2 (2026-09-15): complete QC / clustering / ECDF / perturbation
+# workflow driven by the newly supplied experimental documents
+#   data/260720_HANRUI_FANG_2_HUMAN_10X/web_summaries/20250822_OligoPool_TwistAddG.xlsx  (construct / oligo map)
+#   data/260720_HANRUI_FANG_2_HUMAN_10X/web_summaries/Scaffold_seq.docx                   (scaffold sequences)
+# Pair assignment (guides.assignment_mode: pair) is the PRIMARY label set and runs in EXPLICIT mode: the pair
+# reference (audit/pair_guide_reference.csv, built by jobs/hanrui_pair_full_2/01_audit_and_reference.slurm)
+# carries the designed construct id(s) per scaffold-specific feature; a cell is a designed pair only when its
+# strongest scaffold-A and strongest scaffold-C features share a construct id. The single-guide rule is a
+# diagnostic only. No Harmony, no PS-score / lochNESS / co-function / energy distance.
+# Per-sample runs:  perturbseq-pipeline run -c <this> --lane HF011A                 -> results/Hanrui_Fang_pair_guide_full_2/samples/HF011A
+# Combined run:     perturbseq-pipeline run -c <this> --combined-subdir combined     -> results/Hanrui_Fang_pair_guide_full_2/combined
+run:
+  name: Hanrui_Fang_pair_guide_full_2
+  outdir: /local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/perturbseq-pipeline/results/Hanrui_Fang_pair_guide_full_2
+  seed: 0
+  stop_after: null
+input:
+  mode: mtx
+  mtx_dirs:                         # Cell Ranger 9.0.1 filtered matrices, staged read-only from <well>/analysis/*/<well>_cellranger_count_outs.tar
+    HF011A: /local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/perturbseq-pipeline/results/outputs/hanrui_fang_inputs/cellranger/HF011A/filtered_feature_bc_matrix
+    HF011B: /local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/perturbseq-pipeline/results/outputs/hanrui_fang_inputs/cellranger/HF011B/filtered_feature_bc_matrix
+    HF012A: /local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/perturbseq-pipeline/results/outputs/hanrui_fang_inputs/cellranger/HF012A/filtered_feature_bc_matrix
+    HF012B: /local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/perturbseq-pipeline/results/outputs/hanrui_fang_inputs/cellranger/HF012B/filtered_feature_bc_matrix
+  guide_mtx_dirs:                   # scaffold-specific guide UMI matrices (jobs/hanrui_pair_full_2/02_count_guides.slurm): features = <design_id>:<A|C>
+    HF011A: /local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/perturbseq-pipeline/results/Hanrui_Fang_pair_guide_full_2/inputs/guide_counts/HF011A
+    HF011B: /local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/perturbseq-pipeline/results/Hanrui_Fang_pair_guide_full_2/inputs/guide_counts/HF011B
+    HF012A: /local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/perturbseq-pipeline/results/Hanrui_Fang_pair_guide_full_2/inputs/guide_counts/HF012A
+    HF012B: /local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/perturbseq-pipeline/results/Hanrui_Fang_pair_guide_full_2/inputs/guide_counts/HF012B
+  h5ad: null
+  guide_h5ad: null
+  guide_obs_column: null
+  feature_type_column: feature_types
+  gex_feature_type: Gene Expression
+  guide_feature_types: [CRISPR Guide Capture]
+  var_names: gene_symbols
+  cache_mtx: false
+  cell_id_format: prefix            # <well>_<barcode>: unique, sample-prefixed cell ids (identical in per-sample and combined runs)
+  counts_layer: null
+  normalized_layer: null
+  guide_table: null
+metadata:
+  file: /local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/perturbseq-pipeline/config/Hanrui_Fang_pair_guide_full_2_sample_manifest.csv   # well labels only; condition/replicate meaning is NOT documented (audit F15/F16)
+  key_column: lane_id
+  require_for_multilane: true
+qc:
+  min_genes_per_cell: 200
+  min_cells_per_gene: 3
+  min_genes_final: 1000
+  max_pct_mt: 20.0
+  max_pct_hb: null
+  min_counts_per_cell: null
+  mito_prefix: MT-
+  ribo_prefix: [RPS, RPL]
+  hb_pattern: ^HB[^(P)]
+guides:
+  assignment_mode: dual_guide_pair  # pair-guide assignment is the primary analysis (alias of 'pair')
+  pair_assignment_primary: true
+  pair_reference: /local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/perturbseq-pipeline/results/Hanrui_Fang_pair_guide_full_2/audit/pair_guide_reference.csv
+  scaffold_column: scaffold         # A = document Scaffold 2 (construct position 2), C = document Scaffold 1 (construct position 1)
+  sequence_column: guide_sequence
+  pair_id_column: pair_id           # construct id(s) from 20250822_OligoPool_TwistAddG.xlsx, ';'-separated when a slot feature belongs to several constructs
+  pair_id_delimiter: ";"
+  scaffold_classes: [A, C]
+  require_complete_pair: true
+  unresolved_pair_policy: exclude   # non-designed combinations stay ambiguous and out of primary testing
+  ntc_partner_policy: ambiguous     # irrelevant in explicit mode (designed _S1 targeting+NTC constructs are assigned by construct id); kept conservative
+  single_guide_diagnostic: true     # diagnostic columns only
+  min_umi: 3                        # default kept: no document justifies another threshold
+  dominance_ratio: 2.0
+  max_second_umi: -1
+  detection_threshold: 3
+  target_feature_column: null       # targets come from the pair reference (target_gene_name)
+  target_split_delims: []
+  ntc_label: ntc
+cluster:
+  target_sum: null
+  n_top_genes: 3000
+  n_pcs: 50
+  n_neighbors: 15
+  leiden_resolution: 1.0
+  umap_min_dist: 0.5
+  batch_key: null                   # no Harmony / batch correction
+  regress_out: []
+  assigned_only: false              # expression-QC-pass cells are clustered; pair status is an annotation
+perturbation:
+  controls: [ntc, other]
+  primary_control: ntc              # designed NTC-NTC constructs (pair_non_targeting)
+  min_cells_per_target: 10
+  min_control_cells: 10
+  fdr_alpha: 0.05
+  max_log2fc_for_hit: 0.0
+enrichment:
+  enabled: true
+  primary_control: ntc
+  stratify_by: null
+  guide_concordance: true
+modules:
+  enabled: false                    # co-functional modules / gene programs off
+ps_score:
+  enabled: false
+lochness:
+  enabled: false
+distance:
+  enabled: false                    # energy distance / MMD off
+distance_space:
+  enabled: false
+meta_analysis:
+  enabled: false
+visualization:
+  perturbation_atlas: false
+  ps_distance_map: false
+  perturbation_space: false
+  module_concordance: false
+compute:
+  n_jobs: 32
+report:
+  title: Hanrui Fang pair-guide Perturb-seq analysis (iteration 2, construct map)
+output:
+  h5ad_name: Hanrui_Fang_pair_guide_2_processed.h5ad
+  report_name: report.html
+  report_markdown_name: report.md
+  write_unfiltered_h5ad: true
+  unfiltered_h5ad_name: Hanrui_Fang_pair_guide_2_all_cells.h5ad
+  merge_guides_into_h5ad: true
+  guide_obsm_key: guide_counts
+  write_guide_h5ad: false
+  write_guide_table: true
+  guide_table_min_umi: 3
+  large_file_dir: null

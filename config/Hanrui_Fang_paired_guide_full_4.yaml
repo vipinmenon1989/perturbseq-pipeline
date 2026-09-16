@@ -1,0 +1,236 @@
+# Hanrui Fang pair-guide Perturb-seq, ITERATION 4 (2026-09-16): iteration-3 pair-guide workflow + ALL optional perturbation modules (enrichment, co-functional modules / programs, PS score, lochNESS, energy distance / MMD, perturbation distance space, meta table, atlas figures): complete QC / clustering / ECDF / perturbation
+# workflow driven by the newly supplied experimental documents
+#   data/260720_HANRUI_FANG_2_HUMAN_10X/web_summaries/20250822_OligoPool_TwistAddG.xlsx  (construct / oligo map)
+#   data/260720_HANRUI_FANG_2_HUMAN_10X/web_summaries/Scaffold_seq.docx                   (scaffold sequences)
+# Pair assignment (guides.assignment_mode: pair) is the PRIMARY label set and runs in EXPLICIT mode: the pair
+# reference (audit/guide_reference_used.csv, built by jobs/hanrui_paired_full_4/01_prepare_inputs.slurm (copied, md5-verified, from iteration 3))
+# carries the designed construct id(s) per scaffold-specific feature; a cell is a designed pair only when its
+# strongest scaffold-A and strongest scaffold-C features share a construct id AND the construct is targeting-targeting
+# or NTC-NTC (designed targeting+NTC constructs = sensitivity stratum). The single-guide rule is a diagnostic only. No Harmony. PS-score, lochNESS, co-functional modules, energy distance and distance space are ENABLED (default.yaml / diabetes.yaml parameters; primary labels = strict pairs).
+# Per-sample runs:  perturbseq-pipeline run -c <this> --lane HF011A                 -> results/Hanrui_Fang_paired_guide_full_4/samples/HF011A
+# Combined run:     perturbseq-pipeline run -c <this> --combined-subdir combined     -> results/Hanrui_Fang_paired_guide_full_4/combined
+run:
+  name: Hanrui_Fang_paired_guide_full_4
+  outdir: /local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/perturbseq-pipeline/results/Hanrui_Fang_paired_guide_full_4
+  seed: 0
+  stop_after: null
+input:
+  mode: mtx
+  mtx_dirs:                         # Cell Ranger 9.0.1 filtered matrices, staged read-only from <well>/analysis/*/<well>_cellranger_count_outs.tar
+    HF011A: /local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/perturbseq-pipeline/results/outputs/hanrui_fang_inputs/cellranger/HF011A/filtered_feature_bc_matrix
+    HF011B: /local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/perturbseq-pipeline/results/outputs/hanrui_fang_inputs/cellranger/HF011B/filtered_feature_bc_matrix
+    HF012A: /local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/perturbseq-pipeline/results/outputs/hanrui_fang_inputs/cellranger/HF012A/filtered_feature_bc_matrix
+    HF012B: /local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/perturbseq-pipeline/results/outputs/hanrui_fang_inputs/cellranger/HF012B/filtered_feature_bc_matrix
+  guide_mtx_dirs:                   # scaffold-specific guide UMI matrices (jobs/hanrui_pair_full_2/02_count_guides.slurm, verified copy in full_3/inputs): features = <design_id>:<A|C>
+    HF011A: /local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/perturbseq-pipeline/results/Hanrui_Fang_paired_guide_full_4/inputs/guide_counts/HF011A
+    HF011B: /local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/perturbseq-pipeline/results/Hanrui_Fang_paired_guide_full_4/inputs/guide_counts/HF011B
+    HF012A: /local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/perturbseq-pipeline/results/Hanrui_Fang_paired_guide_full_4/inputs/guide_counts/HF012A
+    HF012B: /local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/perturbseq-pipeline/results/Hanrui_Fang_paired_guide_full_4/inputs/guide_counts/HF012B
+  h5ad: null
+  guide_h5ad: null
+  guide_obs_column: null
+  feature_type_column: feature_types
+  gex_feature_type: Gene Expression
+  guide_feature_types: [CRISPR Guide Capture]
+  var_names: gene_symbols
+  cache_mtx: false
+  cell_id_format: prefix            # <well>_<barcode>: unique, sample-prefixed cell ids (identical in per-sample and combined runs)
+  counts_layer: null
+  normalized_layer: null
+  guide_table: null
+metadata:
+  file: /local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/perturbseq-pipeline/config/Hanrui_Fang_paired_guide_full_4_sample_manifest.csv   # well labels only; condition/replicate meaning is NOT documented (audit F15/F16)
+  key_column: lane_id
+  require_for_multilane: true
+qc:
+  min_genes_per_cell: 200
+  min_cells_per_gene: 3
+  min_genes_final: 1000
+  max_pct_mt: 20.0
+  max_pct_hb: null
+  min_counts_per_cell: null
+  mito_prefix: MT-
+  ribo_prefix: [RPS, RPL]
+  hb_pattern: ^HB[^(P)]
+guides:
+  assignment_mode: dual_guide_pair  # pair-guide assignment is the primary analysis (alias of 'pair')
+  pair_assignment_primary: true
+  pair_reference: /local/projects-t3/lilab/vmenon/PertTF-Virtual-Challeng-Weilab/perturbseq-pipeline/results/Hanrui_Fang_paired_guide_full_4/audit/guide_reference_used.csv
+  scaffold_column: scaffold         # A = document Scaffold 2 (construct position 2), C = document Scaffold 1 (construct position 1)
+  sequence_column: guide_sequence
+  pair_id_column: pair_id           # construct id(s) from 20250822_OligoPool_TwistAddG.xlsx, ';'-separated when a slot feature belongs to several constructs
+  pair_id_delimiter: ";"
+  scaffold_classes: [A, C]
+  require_complete_pair: true
+  unresolved_pair_policy: exclude   # non-designed combinations stay ambiguous and out of primary testing
+  ntc_partner_policy: ambiguous     # irrelevant in explicit mode (designed _S1 targeting+NTC constructs are assigned by construct id); kept conservative
+  single_guide_diagnostic: true     # diagnostic columns only
+  min_umi: 3                        # default kept: no document justifies another threshold
+  dominance_ratio: 2.0              # slot passes when (top_umi + 1) / (second_umi + 1) >= 2.0 (per scaffold slot; ratio stored in obs guide_<A|C>_dominance_ratio)
+  dominance_pseudocount: 1.0
+  max_second_umi: -1
+  designed_targeting_plus_ntc_primary: false   # ITERATION 3: designed targeting+NTC (_S1) constructs are a SENSITIVITY stratum, not strict primary pairs
+  detection_threshold: 3
+  target_feature_column: null       # targets come from the pair reference (target_gene_name)
+  target_split_delims: []
+  ntc_label: ntc
+cluster:
+  target_sum: null
+  n_top_genes: 3000
+  n_pcs: 50
+  n_neighbors: 15
+  leiden_resolution: 1.0
+  umap_min_dist: 0.5
+  batch_key: null                   # no Harmony / batch correction
+  regress_out: []
+  assigned_only: false              # expression-QC-pass cells are clustered; pair status is an annotation
+perturbation:
+  controls: [ntc, other]
+  primary_control: ntc              # designed NTC-NTC constructs (pair_non_targeting)
+  min_cells_per_target: 10
+  min_control_cells: 10
+  min_pct_expressing_control: 1.0
+  fdr_alpha: 0.05
+  max_log2fc_for_hit: 0.0
+  top_n_report: 6                   # top-six policy: per-target figures embedded for the 6 best targets (all targets in tables/)
+  umap_background_fraction: 0.1
+enrichment:
+  enabled: true
+  cluster_key: leiden
+  controls: [ntc, other]
+  primary_control: ntc              # strict NTC pairs are the reference (default.yaml uses 'other'; Hanrui has a designed NTC control)
+  fdr_alpha: 0.05
+  min_cells_per_target: 10
+  min_cells_per_cluster: 20
+  min_reference_cells: 10
+  odds_pseudocount: 0.5
+  stratify_by: null                 # no lane stratification: per-sample runs are single-well; the combined run reports pooled wells (no batch model)
+  guide_concordance: true           # construct-level concordance
+  min_cells_per_guide: 5
+  permutations: 1000
+  top_n_report: 6
+modules:
+  enabled: true                     # co-functional modules / gene programs (default.yaml parameters)
+  cluster_key: leiden
+  gene_selection: cluster_markers
+  n_marker_genes_per_cluster: 100
+  marker_method: wilcoxon
+  min_cells_per_perturbation: 20
+  control: ntc
+  program_correlation: pearson
+  module_correlation: spearman
+  linkage_method: average
+  n_programs: 4
+  n_modules: 9
+  cluster_distance_threshold: 0.7
+  score_programs: true
+  hub_lfc_threshold: 0.5
+  de_fdr_alpha: 0.05
+  draw_networks: true
+  min_perturbations: 5
+  min_genes: 10
+  top_n_report: 6
+  program_enrichment:
+    enabled: true
+    method: ora
+    species: human
+    sources: [hallmark, reactome, go_bp]   # built-in MSigDB Hallmark / Reactome / GO-BP collections (gene_sets.py)
+    custom_gmt_files: {}
+    fdr_alpha: 0.05
+    min_overlap: 2
+    min_genes: 5
+    max_genes: 1500
+    top_terms_per_program: 5
+ps_score:
+  enabled: true                     # pertps perturbation scores; labels = pair-derived target_gene of strict pairs, control = strict NTC pairs
+  require: true
+  top_n_biomarkers: 100
+  scale_factor: 3.0
+  ps_threshold: 0.5
+  expression_cut: mean
+  expression_cut_quantile: 0.75
+  min_cells_per_target: 10
+  min_control_cells: 10
+  top_n_report: 6
+  compute_lda_umap: true
+  lda_n_pcs: 40
+  lda_max_genes: 5000
+  lda_highlight_threshold: 0.8
+  lda_large_max_cells: 200000
+  lda_large_stratified: true
+lochness:
+  enabled: true                     # pair-derived target_gene labels; targeting cells only; kNN in PCA space
+  genotype_key: target_gene
+  n_neighbors: 300
+  n_pcs: 20
+  use_rep: null
+  recompute_neighbors: true
+  min_cells_per_target: 10
+  enrichment_cut: 0.5
+  noise_delta: 0.0
+  top_n_report: 6
+  target_chunk_size: 64             # 43-45 testable targets -> one chunk
+  store_all_target_scores: true     # lochness_<target> per-cell columns for every target (sanitised on write, mapping saved)
+  max_targets_in_obs: 500
+distance:
+  enabled: true                     # energy distance (primary) + MMD (secondary), permutation test, BH FDR, PCA space
+  representation: X_pca
+  primary_metric: edistance
+  secondary_metric: mmd
+  min_cells: 30
+  max_cells_per_target: 2000
+  max_control_cells: 5000
+  n_permutations: 1000
+  random_seed: 123
+  fdr_threshold: 0.05
+  stratify_by: null
+distance_space:
+  enabled: true                     # perturbation-space distances (PCA space), PCoA, hierarchical phenotype modules
+  metric: edistance
+  representation: X_pca
+  n_components: 10
+  nearest_neighbors: 10
+  clustering: true
+  n_modules: null
+  cluster_distance_threshold: null
+  linkage_method: average
+  min_cells: 30
+  max_cells_per_target: 2000
+  random_seed: 123
+meta_analysis:
+  enabled: true                     # master perturbation meta table
+visualization:
+  perturbation_atlas: true
+  ps_distance_map: true
+  perturbation_space: true
+  module_concordance: true
+  atlas_top_n: 50
+compute:                            # diabetes-analysis parallel settings: no oversubscription of the 128-CPU node
+  backend: auto                     # GPU only for >= gpu_min_cells cells (161k cells -> CPU path); documented in the run log
+  n_jobs: 32
+  gpu_device: 0
+  gpu_min_cells: 200000
+  gpu_min_dense_elements: 50000000
+  gpu_memory_fraction: 0.8
+  cpu_parallel_backend: loky
+  blas_threads_per_worker: 1
+  perturbation_n_jobs: 32
+  enrichment_n_jobs: 32
+  distance_n_jobs: 32
+  modules_n_jobs: 16
+  lochness_n_jobs: 1
+  log_backend_decisions: true
+report:
+  title: Hanrui Fang pair-guide Perturb-seq analysis (iteration 4, strict construct pairs + all perturbation modules)
+output:
+  h5ad_name: Hanrui_Fang_paired_guide_4_processed.h5ad
+  report_name: report.html
+  report_markdown_name: report.md
+  write_unfiltered_h5ad: true
+  unfiltered_h5ad_name: Hanrui_Fang_paired_guide_4_all_cells.h5ad
+  merge_guides_into_h5ad: true
+  guide_obsm_key: guide_counts
+  write_guide_h5ad: false
+  write_guide_table: true
+  guide_table_min_umi: 3
+  large_file_dir: null

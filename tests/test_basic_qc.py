@@ -652,3 +652,45 @@ def test_scrublet_threshold_plausibility_assessment():
     assert few["threshold_suspect"] and "0.5%" in few["threshold_suspect_reason"]
     manual = assess_threshold(scores, 0.9, 0, "manual")
     assert not manual["threshold_suspect"]
+
+
+def test_guide_counter_scaffold_specific_features(dataset, tmp_path):
+    """Features = designed spacer x scaffold class; UMIs land in the (spacer, true scaffold) column only."""
+    from perturbseq_pipeline.guide_counting import FEATURE_SEP, expand_design_by_scaffold
+
+    info = dataset["wells"]["W1"]
+    cfg = Config.from_dict(basic_qc_config(dataset, tmp_path))
+    cfg.guides.fastq.scaffold_specific_features = True
+    design = load_guide_design(cfg)
+    bare = [b.split("-")[0] for b in info["barcodes"]]
+    job = GuideCountJob("W1", [str(f) for f in info["fastqs"]], bare)
+    res = count_guides([job], design, cfg, n_workers=2)["W1"]
+    names = list(cfg.guides.fastq.scaffolds)
+    assert res.counts.shape == (info["n_cells"], 2 * len(design))
+    assert res.feature_design is not None and len(res.feature_design) == 2 * len(design)
+    fd = res.feature_design
+    assert list(fd["guide_id"]) == [f"{g}{FEATURE_SEP}{c}" for g in design["guide_id"] for c in names]
+    assert list(fd["guide_id"]) == res.guide_ids
+    col = {(s, c): i for i, (s, c) in enumerate(zip(fd["protospacer"], fd["scaffold"]))}
+    truth_scaf = dataset["design"].set_index("seq")["_scaffold_truth"]
+    dense = res.counts.toarray()
+    for i, bc in enumerate(bare):
+        expected = np.zeros(dense.shape[1], dtype=int)
+        for spacer, n in info["truth_umis"][bc].items():
+            expected[col[(spacer, truth_scaf[spacer])]] = n
+        assert dense[i].tolist() == expected.tolist(), f"cell {bc}"
+    # collapsing the two scaffold columns reproduces the scaffold-agnostic count matrix
+    res0 = count_guides([job], design, Config.from_dict(basic_qc_config(dataset, tmp_path)), n_workers=2)["W1"]
+    collapsed = dense.reshape(dense.shape[0], len(design), len(names)).sum(axis=2)
+    assert (collapsed == res0.counts.toarray()).all()
+    assert res.stats["features"] == 2 * len(design) and res.stats["scaffold_specific_features"] is True
+    paths = write_guide_counts(res, design, tmp_path / "gc_split")
+    mat, bcs, gids = read_guide_counts(tmp_path / "gc_split", "W1")
+    assert mat.shape == res.counts.shape and gids == res.guide_ids
+    summary = pd.read_csv(paths["guide_summary"], sep="\t")
+    assert len(summary) == 2 * len(design) and {"design_guide_id", "scaffold", "designed_slot"} <= set(summary.columns)
+    # expansion helper keeps the design's own scaffold declaration when it has one
+    d = design.copy()
+    d["scaffold"] = ["A"] + ["unknown"] * (len(d) - 1)
+    ex = expand_design_by_scaffold(d, names)
+    assert ex["designed_slot"].tolist()[:2] == [True, False]

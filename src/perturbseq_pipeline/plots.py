@@ -310,6 +310,7 @@ class FigureRegistry:
                     "name": record.name,
                     "title": record.title,
                     "in_report": record.in_report,
+                    "caption": record.caption,
                     "path": str(
                         record.path
                     ),

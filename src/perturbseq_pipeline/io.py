@@ -16,6 +16,7 @@ both converge on the same pair of objects:
 from __future__ import annotations
 
 import logging
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -911,6 +912,60 @@ def guides_from_obsm(adata: ad.AnnData, cfg: Config) -> Optional[ad.AnnData]:
     return guides
 
 
+_H5_UNSAFE = re.compile(r"[^A-Za-z0-9_.:+\-]")
+
+
+def sanitize_h5ad_name(name: str) -> str:
+    """Replace characters that are illegal / fragile in HDF5 dataset or group names."""
+    return _H5_UNSAFE.sub("_", str(name))
+
+
+def sanitize_h5ad_names(adata: ad.AnnData) -> List[Dict[str, str]]:
+    """Rename obs / var columns, obsm / obsp / uns keys in place to HDF5-safe names.
+
+    Returns the list of ``{location, original, sanitized}`` records (empty when nothing
+    changed). Names that would collide after sanitising get a numeric suffix.
+    """
+    records: List[Dict[str, str]] = []
+
+    def _rename(names: List[str], location: str) -> Dict[str, str]:
+        out: Dict[str, str] = {}
+        taken = set(names)
+        for n in names:
+            s = sanitize_h5ad_name(n)
+            if s == n:
+                continue
+            base, k = s, 1
+            while s in taken or s in out.values():
+                k += 1
+                s = f"{base}_{k}"
+            out[n] = s
+            records.append({"location": location, "original": n, "sanitized": s})
+        return out
+
+    for attr in ("obs", "var"):
+        df = getattr(adata, attr)
+        ren = _rename([str(c) for c in df.columns], attr)
+        if ren:
+            df.rename(columns=ren, inplace=True)
+    for attr in ("obsm", "varm", "obsp", "varp", "layers"):
+        store = getattr(adata, attr, None)
+        if store is None:
+            continue
+        ren = _rename(list(store.keys()), attr)
+        for old_k, new_k in ren.items():
+            store[new_k] = store[old_k]
+            del store[old_k]
+    ren = _rename([k for k in adata.uns.keys() if k != "column_name_mapping"], "uns")
+    for old_k, new_k in ren.items():
+        adata.uns[new_k] = adata.uns.pop(old_k)
+    if records:
+        prev = adata.uns.get("column_name_mapping")
+        merged = (list(prev) if isinstance(prev, list) else []) + records
+        adata.uns["column_name_mapping"] = {"location": [r["location"] for r in merged], "original": [r["original"] for r in merged], "sanitized": [r["sanitized"] for r in merged]}
+    return records
+
+
 def write_h5ad(adata: ad.AnnData, path: Path, compression: str = "gzip") -> Path:
     """Write an ``.h5ad``, making the parent directory and sanitizing obs.
 
@@ -932,6 +987,18 @@ def write_h5ad(adata: ad.AnnData, path: Path, compression: str = "gzip") -> Path
     for col in adata.var.columns:
         if adata.var[col].dtype == object:
             adata.var[col] = adata.var[col].astype(str)
+
+    # HDF5-safe names: obs / var column names and uns keys derived from biological
+    # target labels (e.g. ``lochness_LIPA (rs1412444)``, ``ps_score_FHL3 (rs114296424)``)
+    # may carry characters that are illegal or fragile as HDF5 dataset / group names
+    # ('/' is illegal; spaces, parentheses and other punctuation are replaced as well).
+    # Internal names are sanitised, the original biological labels are kept in the
+    # tables and reports, and the mapping is stored in ``uns['column_name_mapping']``
+    # and next to the file as ``<stem>_column_name_mapping.csv``.
+    mapping = sanitize_h5ad_names(adata)
+    if mapping:
+        pd.DataFrame(mapping).to_csv(path.with_name(path.stem + "_column_name_mapping.csv"), index=False)
+        logger.info("Sanitised %d HDF5-unsafe name(s); mapping written to %s", len(mapping), path.with_name(path.stem + "_column_name_mapping.csv"))
 
     # anndata >= 0.11 may represent dataframe indices/columns with the pandas
     # nullable StringDtype. Writing those requires explicit opt-in.
