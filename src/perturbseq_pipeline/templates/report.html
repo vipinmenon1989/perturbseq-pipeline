@@ -137,8 +137,30 @@
   dominance rule are <i>ambiguous</i>; cells with no guide counts are
   <i>unassigned</i>. Both are kept in the object and shown here.
 </p>
+{% if cfg.guides.assignment_mode in ('pair', 'dual_guide_pair') %}
+<p class="lede">
+  <b>Pair-guide assignment is the primary label set for this run.</b> For each scaffold class
+  (<code>{{ cfg.guides.scaffold_classes|join(' / ') }}</code>) the strongest guide must reach
+  <code>{{ cfg.guides.min_umi }}</code> UMIs and exceed the runner-up <i>of the same scaffold</i> by
+  <code>{{ cfg.guides.dominance_ratio }}</code>x. Two resolved guides naming the same target form a
+  <code>pair_targeting</code> cell; two NTC guides a <code>pair_non_targeting</code> cell (the primary control).
+  Targeting+NTC, dual-target, incomplete, scaffold-ambiguous, unknown-guide and unresolved cells are kept in the
+  object as <i>ambiguous</i> and excluded from primary testing. The single-guide rule is shown at the end of this
+  section for diagnosis only. Pair reference: <code>{{ cfg.guides.pair_map_file or cfg.guides.pair_reference }}</code>.
+</p>
+<h4>Expression QC accounting per lane</h4>
+{{ tables.cell_counts_before_after }}
+<h4>Pair-assignment status per lane</h4>
+{{ tables.pair_assignment_per_lane }}
+<h4>Pair-guide QC per lane</h4>
+{{ tables.pair_guide_qc_per_lane }}
+{% endif %}
 {{ tables.guide_qc }}
 {% for f in figures.guides %}{{ render_figure(f) }}{% endfor %}
+{% if cfg.guides.single_guide_diagnostic %}
+<h4>Diagnostic only: single-guide rule versus pair status</h4>
+{{ tables.single_guide_diagnostic_vs_pair }}
+{% endif %}
 
 <!-- ===================== 2. Clustering ===================== -->
 <h2 id="clustering">2. Clustering analysis</h2>
@@ -182,6 +204,13 @@
   <div class="card"><div class="v">{{ v }}</div><div class="k">{{ k }}</div></div>
   {% endfor %}
 </div>
+{% if cfg.guides.assignment_mode in ('pair', 'dual_guide_pair') %}
+<h4>Pair-level perturbation: targets tested and hits per lane (primary pair labels)</h4>
+<p class="lede">Hit rule: KS FDR &lt; {{ cfg.perturbation.fdr_alpha }} and log2FC &lt; {{ cfg.perturbation.max_log2fc_for_hit }}
+(target transcript, targeting pairs versus NTC pairs; raw <code>fdr_ks</code> and <code>neg_log10_fdr = -log10(max(FDR, 1e-300))</code>
+in <code>tables/pair_perturbation_by_target.csv</code>; per-target ECDFs in <code>figures/perturbation/ecdf/</code>).</p>
+{{ tables.pair_perturbation_hit_counts_per_lane }}
+{% endif %}
 {% for f in figures.perturbation %}{{ render_figure(f) }}{% endfor %}
 
 <h3>3.2 Ranked target table</h3>

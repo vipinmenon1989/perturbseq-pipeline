@@ -28,6 +28,11 @@ dependencies = [
     "joblib>=1.3",
     "threadpoolctl>=3.0",
     "psutil>=5.9",
+    # Basic QC stage: native 10x .h5 loading, xlsx guide-design workbooks,
+    # and Scrublet's automatic threshold (scanpy's implementation needs skimage).
+    "h5py>=3.8",
+    "openpyxl>=3.1",
+    "scikit-image>=0.20",
 ]
 
 [project.optional-dependencies]

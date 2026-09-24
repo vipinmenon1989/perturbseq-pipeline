@@ -124,9 +124,24 @@ class PipelineResult:
     #: STANDARD / LARGE, useful for provenance.
     execution_mode: str = "standard"
 
+    #: :class:`perturbseq_pipeline.basic_qc.BasicQCResult` when the run
+    #: stopped after the basic QC stage.
+    basic_qc: object = None
+
     def summary(
         self,
     ) -> str:
+
+        if self.basic_qc is not None:
+            b = self.basic_qc
+            return (
+                f"BASIC QC | {b.n_cells_all:,} cells loaded, "
+                f"{b.n_cells_pass:,} pass expression QC x {b.n_genes:,} genes | "
+                f"predicted doublets retained {b.n_predicted_doublets_all:,} (all) / "
+                f"{b.n_predicted_doublets_pass:,} (QC object) | "
+                f"guide multiplets retained {b.n_guide_multiplets_all:,} / "
+                f"{b.n_guide_multiplets_pass:,} | report: {self.report}"
+            )
 
         return (
             f"{self.n_cells:,} cells x "
@@ -712,8 +727,14 @@ def _aligned_guides(
 def run_pipeline(
     cfg: Config,
     verbose: bool = False,
+    config_path: Optional[str] = None,
 ) -> PipelineResult:
-    """Run the full perturb-seq workflow."""
+    """Run the full perturb-seq workflow.
+
+    When ``run.stop_after == "qc"`` only the basic QC stage runs
+    (:mod:`perturbseq_pipeline.basic_qc`) and the function returns after the
+    QC-level objects, tables, figures and report have been written.
+    """
 
     start = (
         time.time()
@@ -822,6 +843,41 @@ def run_pipeline(
     ] = {}
 
     # =====================================================================
+    # Basic QC stage (stop_after: qc) — annotate, do not remove; then stop
+    # =====================================================================
+
+    if cfg.run.stop_after == "qc":
+        from . import basic_qc as basic_qc_mod
+
+        logger.info("=== Basic QC stage (run.stop_after = qc) ===")
+        qc_result = basic_qc_mod.run_basic_qc(
+            cfg, outdir, registry, config_path=config_path
+        )
+        profiler.save_csv(tabledir / "compute_profile.csv")
+        result = PipelineResult(
+            outdir=outdir,
+            report=qc_result.report,
+            h5ad=qc_result.pass_h5ad,
+            guide_h5ad=None,
+            unfiltered_h5ad=qc_result.allcells_h5ad,
+            tables=dict(qc_result.tables),
+            figures_dir=registry.figdir,
+            n_cells=qc_result.n_cells_pass,
+            n_genes=qc_result.n_genes,
+            runtime_seconds=time.time() - start,
+            execution_mode="basic_qc",
+        )
+        result.basic_qc = qc_result
+        logger.info(
+            "Basic QC complete: %d cells (all) / %d cells (expression-QC pass); "
+            "predicted doublets retained: %d / %d; guide multiplets retained: %d / %d",
+            qc_result.n_cells_all, qc_result.n_cells_pass,
+            qc_result.n_predicted_doublets_all, qc_result.n_predicted_doublets_pass,
+            qc_result.n_guide_multiplets_all, qc_result.n_guide_multiplets_pass,
+        )
+        return result
+
+    # =====================================================================
     # Stage 1: load
     # =====================================================================
 
@@ -877,6 +933,39 @@ def run_pipeline(
         "=== Stage 2/14: quality control ==="
     )
 
+    unfiltered_h5ad_path: Optional[Path] = None
+    qc_before = None  # pre-filter QC metrics of every loaded cell (pair-guide accounting)
+    pair_mode = cfg.guides.assignment_mode in ("dual_guide_pair", "pair")
+
+    # All-cells checkpoint: every loaded cell with QC metrics, written BEFORE
+    # any filtering so QC-failed cells are never lost. Previously this file
+    # was only written in the assigned_only branch (after QC), which made
+    # output.write_unfiltered_h5ad a silent no-op for default runs.
+    if (
+        cfg.output.write_unfiltered_h5ad
+        and not cfg.cluster.assigned_only
+    ):
+        all_cells = expr.copy()
+        qc_mod.compute_qc_metrics(all_cells, cfg)
+        qc_before = all_cells.obs[[c for c in all_cells.obs.columns if c in ("lane_id", "total_counts", "n_genes_by_counts", "pct_counts_mt", "pct_counts_ribo", "pct_counts_hb")]].copy()
+        all_cells.uns["qc_stage"] = (
+            "all loaded cells before any QC filtering (basic QC metrics only)"
+        )
+        unfiltered_h5ad_path = _write_unfiltered_object(
+            all_cells, guides, cfg, outdir, io_mod
+        )
+        logger.info(
+            "Wrote all-cells checkpoint (%d cells, pre-QC) to %s",
+            all_cells.n_obs, unfiltered_h5ad_path,
+        )
+        del all_cells
+        _collect("all-cells checkpoint", cfg=cfg, large_mode=large_mode)
+
+    if pair_mode and qc_before is None:
+        _tmp = expr.copy()
+        qc_mod.compute_qc_metrics(_tmp, cfg)
+        qc_before = _tmp.obs[[c for c in _tmp.obs.columns if c in ("lane_id", "total_counts", "n_genes_by_counts", "pct_counts_mt", "pct_counts_ribo", "pct_counts_hb")]].copy()
+        del _tmp
     expr = qc_mod.prefilter(
         expr,
         cfg,
@@ -1031,6 +1120,27 @@ def run_pipeline(
             table_paths,
         )
 
+    if pair_mode:
+        from . import dual_guides as dual_mod
+        from . import pair_guide_report as pair_mod
+
+        pair_summary = dual_mod.pair_assignment_summary(expr)
+        tables["pair_assignment_summary"] = pair_summary
+        _write_table("pair_assignment_summary", pair_summary, tabledir, table_paths)
+        pair_per_lane = dual_mod.pair_assignment_per_lane(expr)
+        if pair_per_lane is not None:
+            tables["pair_assignment_per_lane"] = pair_per_lane
+            _write_table("pair_assignment_per_lane", pair_per_lane, tabledir, table_paths)
+        for name, df in pair_mod.qc_before_after(expr, qc_before, cfg, registry).items():
+            tables[name] = df
+            _write_table(name, df, tabledir, table_paths)
+        for name, df in pair_mod.pair_guide_qc(expr, guides, cfg, registry).items():
+            tables[name] = df
+            _write_table(name, df, tabledir, table_paths)
+        for name, df in pair_mod.single_guide_diagnostic(expr, registry).items():
+            tables[name] = df
+            _write_table(name, df, tabledir, table_paths)
+
     warnings.extend(
         qc_mod.check_guide_qc(
             expr,
@@ -1064,9 +1174,6 @@ def run_pipeline(
         cfg,
     )
 
-    unfiltered_h5ad_path: Optional[
-        Path
-    ] = None
 
     singlets = (
         _assigned_singlet_mask(
@@ -1213,6 +1320,12 @@ def run_pipeline(
         registry,
         cfg,
     )
+    if pair_mode:
+        from . import pair_guide_report as pair_mod
+
+        for name, df in pair_mod.clustering_pair_figures(expr, cfg, registry).items():
+            tables[name] = df
+            _write_table(name, df, tabledir, table_paths)
 
     _collect(
         "clustering",
@@ -1304,6 +1417,14 @@ def run_pipeline(
         cfg=cfg,
         large_mode=large_mode,
     )
+    if pair_mode:
+        from . import pair_guide_report as pair_mod
+
+        for name, df in pair_mod.pair_perturbation(expr, cfg, registry).items():
+            tables[name] = df
+            _write_table(name, df, tabledir, table_paths)
+        _collect("pair perturbation", cfg=cfg, large_mode=large_mode)
+
 
     # =====================================================================
     # Stage 6: enrichment
@@ -2421,6 +2542,10 @@ def run_pipeline(
             / cfg.output.report_name,
         )
     )
+    if getattr(cfg.output, "report_markdown_name", None):
+        from .report_markdown import write_markdown_report
+
+        write_markdown_report(report_inputs, outdir / cfg.output.report_markdown_name)
 
     # Save compute performance profile table before archiving
     profile_df = profiler.to_dataframe()
@@ -2541,6 +2666,37 @@ def _build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="debug-level logging",
     )
+    run.add_argument(
+        "--lane",
+        default=None,
+        help="restrict input.mtx_dirs / input.guide_mtx_dirs to one lane key and write to <outdir>/samples/<lane> (unless -o is given)",
+    )
+    run.add_argument(
+        "--combined-subdir",
+        default=None,
+        help="write a multi-lane run to <outdir>/<subdir> (e.g. 'combined') unless -o is given",
+    )
+    pr = sub.add_parser(
+        "pair-report",
+        help="build the root pair-guide report over several completed runs",
+    )
+    pr.add_argument("-c", "--config", required=True, help="the shared run config")
+    pr.add_argument("--run", action="append", required=True, metavar="LABEL=DIR", help="completed run directory (repeatable; label 'combined' marks the pooled run)")
+    pr.add_argument("--audit-dir", default=None, help="directory with the audit / pair-reference tables")
+    pr.add_argument("-o", "--outdir", required=True, help="root output directory (report.html, run_manifest.json, README.md)")
+    pr.add_argument("--job-ids", default="", help="comma-separated SLURM job ids to record")
+    pr.add_argument("--previous-run", default=None, help="root directory of a previous run to compare against (supplemental section; read-only)")
+    pr.add_argument("--base-commit", default=None, help="git commit at task start; code changes are reported relative to it")
+    pr.add_argument("--slurm-dir", default=None, help="directory with the SBATCH scripts and job ledger (default <outdir>/slurm)")
+
+    rb = sub.add_parser(
+        "rebuild-report",
+        help="rebuild the full HTML reports (per-run + root index) of a finished pair-guide run from its on-disk outputs",
+    )
+    rb.add_argument("--root", required=True, help="root result directory (report.html, run_manifest.json, tables/)")
+    rb.add_argument("--run", action="append", required=True, metavar="LABEL=DIR", help="completed run directory (repeatable; label 'combined' marks the pooled run)")
+    rb.add_argument("--previous-run", default=None, help="previous root directory named in the supplemental comparison section")
+    rb.add_argument("--title", default=None, help="report title override")
 
     init = sub.add_parser(
         "init-config",
@@ -2596,10 +2752,41 @@ def main(
 
         return 0
 
+    if args.command == "rebuild-report":
+        from .report_rebuild import rebuild_all
+
+        runs = dict(item.split("=", 1) for item in args.run)
+        summary = rebuild_all(Path(args.root), runs, previous_run=Path(args.previous_run) if args.previous_run else None, title=args.title)
+        for k, v in summary.items():
+            print(f"{k}: {v['report']} ({v['size_mb']} MB, {v['n_figures_embedded']} figures embedded, {len(v['missing_figures'])} missing)")
+        return 0
+
     cfg = Config.from_yaml(
         args.config
     )
+    if args.command == "pair-report":
+        from .multi_run_report import build_root_report
 
+        runs = dict(item.split("=", 1) for item in args.run)
+        build_root_report(cfg, runs, Path(args.outdir), audit_dir=Path(args.audit_dir) if args.audit_dir else None,
+                          config_path=args.config, job_ids=[j for j in args.job_ids.split(",") if j],
+                          previous_run=Path(args.previous_run) if args.previous_run else None, base_commit=args.base_commit,
+                          slurm_dir=Path(args.slurm_dir) if args.slurm_dir else None)
+        print(f"Wrote root pair-guide report to {Path(args.outdir) / 'report.html'}")
+        return 0
+    if getattr(args, "lane", None):
+        lane = args.lane
+        for attr in ("mtx_dirs", "guide_mtx_dirs"):
+            d = getattr(cfg.input, attr) or {}
+            if isinstance(d, dict):
+                if lane not in d:
+                    raise SystemExit(f"--lane {lane!r} is not a key of input.{attr}: {list(d)}")
+                setattr(cfg.input, attr, {lane: d[lane]})
+        if not args.outdir:
+            cfg.run.outdir = str(Path(cfg.run.outdir) / "samples" / lane)
+        cfg.run.name = f"{cfg.run.name}_{lane}"
+    elif getattr(args, "combined_subdir", None) and not args.outdir:
+        cfg.run.outdir = str(Path(cfg.run.outdir) / args.combined_subdir)
     if args.outdir:
 
         cfg.run.outdir = (
@@ -2617,6 +2804,7 @@ def main(
         result = run_pipeline(
             cfg,
             verbose=args.verbose,
+            config_path=args.config,
         )
 
     except Exception as exc:

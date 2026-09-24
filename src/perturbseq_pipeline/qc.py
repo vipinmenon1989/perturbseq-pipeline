@@ -49,7 +49,7 @@ from __future__ import annotations
 
 import gc
 import logging
-from typing import List, Tuple
+from typing import Dict, List, Tuple
 
 import anndata as ad
 import numpy as np
@@ -1348,3 +1348,205 @@ def check_guide_qc(
             )
 
     return warnings
+
+# ===========================================================================
+# Basic QC stage: sample-aware expression thresholds and flags (no removal)
+# ===========================================================================
+
+#: Independent expression-QC flags written by :func:`flag_expression_qc`.
+QC_FLAG_COLUMNS = [
+    "qc_low_counts",
+    "qc_high_counts",
+    "qc_low_genes",
+    "qc_high_genes",
+    "qc_high_mt",
+    "qc_high_hb",
+]
+
+#: Composite expression-quality verdict. Depends ONLY on the flags above —
+#: never on doublet or guide annotations.
+GEX_QC_PASS = "gex_qc_pass"
+
+
+def annotate_gene_classes_case_insensitive(expr: ad.AnnData, cfg: Config) -> ad.AnnData:
+    """Like :func:`annotate_gene_classes` but never rewrites ``var_names``.
+
+    Matching is case-insensitive so mouse ``mt-`` and human ``MT-`` both work
+    with the default prefix while the stored gene symbols stay untouched.
+    """
+    q = cfg.qc
+    names = pd.Series(expr.var_names.astype(str), index=expr.var_names).str.upper()
+    expr.var["mt"] = names.str.startswith(q.mito_prefix.upper()).to_numpy()
+    expr.var["ribo"] = names.str.startswith(
+        tuple(p.upper() for p in q.ribo_prefix)
+    ).to_numpy()
+    expr.var["hb"] = names.str.contains(q.hb_pattern.upper(), regex=True).fillna(False).to_numpy()
+    logger.info(
+        "Gene classes: %d mitochondrial, %d ribosomal, %d hemoglobin",
+        int(expr.var["mt"].sum()), int(expr.var["ribo"].sum()), int(expr.var["hb"].sum()),
+    )
+    if expr.var["mt"].sum() == 0:
+        logger.warning(
+            "No mitochondrial genes matched prefix %r — check qc.mito_prefix", q.mito_prefix
+        )
+    return expr
+
+
+def compute_basic_qc_metrics(expr: ad.AnnData, cfg: Config) -> ad.AnnData:
+    """Scanpy QC metrics for one sample without touching ``X``.
+
+    Adds ``total_counts``, ``n_genes_by_counts``, ``pct_counts_mt``,
+    ``pct_counts_ribo``, ``pct_counts_hb``, ``pct_counts_in_top_20_genes``
+    and their log1p companions to ``obs``; gene-level metrics to ``var``.
+    """
+    annotate_gene_classes_case_insensitive(expr, cfg)
+    sc.pp.calculate_qc_metrics(
+        expr,
+        qc_vars=["mt", "ribo", "hb"],
+        inplace=True,
+        log1p=True,
+        percent_top=[20],
+    )
+    return expr
+
+
+def _mad_bounds(values: np.ndarray, n_mads: float, log_transform: bool) -> Tuple[float, float, float, float]:
+    """Return ``(lower, upper, median, mad)`` on the original scale."""
+    x = np.asarray(values, dtype=float)
+    x = x[np.isfinite(x)]
+    if x.size == 0:
+        return (float("nan"),) * 4
+    if log_transform:
+        x = np.log1p(x)
+    med = float(np.median(x))
+    mad = float(np.median(np.abs(x - med))) * 1.4826
+    lo, hi = med - n_mads * mad, med + n_mads * mad
+    if log_transform:
+        lo, hi, med_out = np.expm1(lo), np.expm1(hi), np.expm1(med)
+    else:
+        med_out = med
+    return float(lo), float(hi), float(med_out), float(mad)
+
+
+def resolve_sample_thresholds(
+    obs: pd.DataFrame,
+    cfg: Config,
+    sample_id: str,
+    condition: object = None,
+) -> Dict[str, object]:
+    """Resolve expression-QC thresholds for one sample.
+
+    Returns a flat, JSON-friendly dict (``min_genes``, ``max_genes``,
+    ``min_counts``, ``max_counts``, ``max_pct_mt``, ``max_pct_hb`` plus the
+    medians/MADs and the rule used). ``None`` means "not applied".
+    """
+    thr = cfg.qc.thresholds
+    out: Dict[str, object] = {
+        "sample_id": sample_id,
+        "method": thr.method,
+        "n_mads": thr.n_mads if thr.method == "mad" else None,
+        "log_transform": thr.log_transform if thr.method == "mad" else None,
+        "n_cells": int(obs.shape[0]),
+        "min_genes": thr.min_genes_floor,
+        "max_genes": thr.max_genes_ceiling,
+        "min_counts": thr.min_counts_floor,
+        "max_counts": thr.max_counts_ceiling,
+        "max_pct_mt": thr.max_pct_mt,
+        "max_pct_hb": thr.max_pct_hb,
+    }
+    metric_keys = {"n_genes_by_counts": ("genes", "min_genes", "max_genes"),
+                   "total_counts": ("counts", "min_counts", "max_counts")}
+    for metric, (short, lo_key, hi_key) in metric_keys.items():
+        if metric not in obs.columns:
+            continue
+        lo, hi, med, mad = _mad_bounds(obs[metric].to_numpy(), thr.n_mads, thr.log_transform)
+        out[f"median_{short}"] = med
+        out[f"mad_{short}"] = mad
+        out[f"mad_lower_{short}"] = lo
+        out[f"mad_upper_{short}"] = hi
+        if thr.method == "mad" and metric in thr.mad_metrics:
+            if thr.flag_low:
+                floor = out[lo_key]
+                out[lo_key] = float(max(lo, floor)) if floor is not None else float(lo)
+            if thr.flag_high:
+                ceiling = out[hi_key]
+                out[hi_key] = float(min(hi, ceiling)) if ceiling is not None else float(hi)
+    # Mitochondrial cap: absolute, optionally condition-specific, optionally MAD-tightened.
+    mt_cap = thr.max_pct_mt
+    if condition is not None and str(condition) in thr.max_pct_mt_by_condition:
+        mt_cap = thr.max_pct_mt_by_condition[str(condition)]
+        out["max_pct_mt_source"] = f"condition:{condition}"
+    else:
+        out["max_pct_mt_source"] = "global"
+    if "pct_counts_mt" in obs.columns:
+        lo, hi, med, mad = _mad_bounds(obs["pct_counts_mt"].to_numpy(), thr.n_mads, False)
+        out["median_pct_mt"] = med
+        out["mad_upper_pct_mt"] = hi
+        if thr.max_pct_mt_mad and mt_cap is not None:
+            mt_cap = float(min(hi, mt_cap))
+            out["max_pct_mt_source"] += "+mad"
+        elif thr.max_pct_mt_mad:
+            mt_cap = float(hi)
+            out["max_pct_mt_source"] = "mad"
+    out["max_pct_mt"] = mt_cap
+    # Explicit per-sample overrides win.
+    for key, val in thr.per_sample.get(sample_id, {}).items():
+        out[key] = val
+        out[f"{key}_source"] = "per_sample_override"
+    return out
+
+
+def flag_expression_qc(expr: ad.AnnData, thresholds: Dict[str, object]) -> ad.AnnData:
+    """Write independent QC flags and ``gex_qc_pass`` to ``obs``. No subsetting.
+
+    A flag is False everywhere when its threshold is ``None``.
+    """
+    n_before = expr.n_obs
+    obs = expr.obs
+    counts = obs["total_counts"].to_numpy(dtype=float)
+    genes = obs["n_genes_by_counts"].to_numpy(dtype=float)
+
+    def _flag(values, thr, op):
+        if thr is None or (isinstance(thr, float) and np.isnan(thr)):
+            return np.zeros(values.shape[0], dtype=bool)
+        return op(values, float(thr))
+
+    obs["qc_low_counts"] = _flag(counts, thresholds.get("min_counts"), np.less)
+    obs["qc_high_counts"] = _flag(counts, thresholds.get("max_counts"), np.greater)
+    obs["qc_low_genes"] = _flag(genes, thresholds.get("min_genes"), np.less)
+    obs["qc_high_genes"] = _flag(genes, thresholds.get("max_genes"), np.greater)
+    mt = obs["pct_counts_mt"].to_numpy(dtype=float) if "pct_counts_mt" in obs else np.zeros(n_before)
+    obs["qc_high_mt"] = _flag(mt, thresholds.get("max_pct_mt"), np.greater)
+    hb = obs["pct_counts_hb"].to_numpy(dtype=float) if "pct_counts_hb" in obs else np.zeros(n_before)
+    obs["qc_high_hb"] = _flag(hb, thresholds.get("max_pct_hb"), np.greater)
+    any_fail = np.zeros(n_before, dtype=bool)
+    for col in QC_FLAG_COLUMNS:
+        any_fail |= obs[col].to_numpy(dtype=bool)
+    obs[GEX_QC_PASS] = ~any_fail
+    assert expr.n_obs == n_before
+    logger.info(
+        "%s: expression QC flags — low_counts %d, high_counts %d, low_genes %d, "
+        "high_genes %d, high_mt %d, high_hb %d -> gex_qc_pass %d/%d (no cells removed)",
+        thresholds.get("sample_id", "?"),
+        int(obs["qc_low_counts"].sum()), int(obs["qc_high_counts"].sum()),
+        int(obs["qc_low_genes"].sum()), int(obs["qc_high_genes"].sum()),
+        int(obs["qc_high_mt"].sum()), int(obs["qc_high_hb"].sum()),
+        int(obs[GEX_QC_PASS].sum()), n_before,
+    )
+    return expr
+
+
+def expression_qc_step_table(expr: ad.AnnData, sample_id: str) -> pd.DataFrame:
+    """Per-flag summary rows (cells flagged) for one sample — nothing removed."""
+    n = expr.n_obs
+    rows = []
+    for col in QC_FLAG_COLUMNS + [GEX_QC_PASS]:
+        k = int(expr.obs[col].sum()) if col in expr.obs else 0
+        rows.append({
+            "sample_id": sample_id,
+            "flag": col,
+            "n_cells": n,
+            "n_flagged" if col != GEX_QC_PASS else "n_pass": k,
+            "fraction": (k / n) if n else float("nan"),
+        })
+    return pd.DataFrame(rows)
