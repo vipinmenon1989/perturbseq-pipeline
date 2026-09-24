@@ -1,0 +1,43 @@
+# Single-guide run from 10x MTX directories (the CellRanger layout: gene
+# expression and guide features in one matrix). Paths are placeholders.
+# Every key not listed here keeps its config/default.yaml value, so only the
+# core stages (QC, guide assignment, clustering, perturbation strength,
+# cluster enrichment) run; see all_modules.yaml for the optional stages.
+#
+#   perturbseq-pipeline run --config config/examples/mtx.yaml
+
+run:
+  name: my_screen_mtx
+  outdir: results/my_screen_mtx
+  seed: 0
+
+input:
+  mode: mtx
+  mtx_dirs:                     # lane_id -> filtered_feature_bc_matrix directory
+    L1: data/my_screen/L1/filtered_feature_bc_matrix
+    L2: data/my_screen/L2/filtered_feature_bc_matrix
+  # For separately quantified guides add guide_mtx_dirs with the same keys:
+  # guide_mtx_dirs:
+  #   L1: data/my_screen/L1/guide_counts
+  #   L2: data/my_screen/L2/guide_counts
+
+metadata:
+  file: data/my_screen/sample_metadata.csv   # one row per lane, lane_id column
+
+qc:
+  min_genes_per_cell: 200
+  min_genes_final: 1000
+  max_pct_mt: 20.0
+
+guides:
+  assignment_mode: single_guide
+  min_umi: 3
+  dominance_ratio: 2.0
+  max_second_umi: -1            # e.g. 8 to gate droplet multiplets
+  target_split_delims: ["_", "-", "."]
+
+cluster:
+  batch_key: lane_id            # Harmony across lanes (needs the harmony extra); null for one lane
+
+enrichment:
+  enabled: true

@@ -151,9 +151,11 @@ concordance figures.
 
 Stages 5 to 11 are enabled per section (`enrichment.enabled`,
 `modules.enabled`, `ps_score.enabled`, `lochness.enabled`,
-`distance.enabled`, `distance_space.enabled`, `meta_analysis.enabled`). A
-disabled stage writes nothing and appears as `disabled` in the report's module
-status table.
+`distance.enabled`, `distance_space.enabled`, `meta_analysis.enabled`). The
+defaults keep a run light: cluster enrichment and the master table are on,
+the other five are off until the config enables them (the demo config turns
+on PS score, lochNESS and modules). A disabled stage writes nothing and
+appears as `disabled` in the report's module status table.
 
 ---
 
@@ -210,8 +212,10 @@ perturbseq-pipeline init-config my_run.yaml
 
 | Example | Shows |
 |---|---|
-| `config/demo.yaml` | one 10x lane, single-guide, every stage on |
-| `config/examples/h5ad_input.yaml` | `.h5ad` input with the optional stages chosen explicitly |
+| `config/demo.yaml` | one 10x lane, single-guide, the demo's stages on |
+| `config/examples/mtx.yaml` | 10x MTX lanes with the default (core) stages only |
+| `config/examples/h5ad.yaml` | `.h5ad` input with the optional stages chosen explicitly |
+| `config/examples/all_modules.yaml` | every optional stage switched on |
 | `config/examples/paired_guide.yaml` | separate GEX and guide matrices, paired-guide assignment, per-lane runs |
 | `config/examples/large_hpc.yaml` | scaling, compute and storage settings for a multi-million-cell screen |
 | `config/examples/basic_qc_samples.yaml` | several 10x wells, guide FASTQ counting, QC-only checkpoint |

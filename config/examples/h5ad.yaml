@@ -1,7 +1,7 @@
 # Single-guide run from an existing .h5ad, with the optional stages chosen
 # explicitly. Every key not listed here keeps its config/default.yaml value.
 #
-#   perturbseq-pipeline run --config config/examples/h5ad_input.yaml
+#   perturbseq-pipeline run --config config/examples/h5ad.yaml
 
 run:
   name: my_screen_h5ad
