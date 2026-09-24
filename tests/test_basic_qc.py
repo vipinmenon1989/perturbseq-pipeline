@@ -190,16 +190,16 @@ def test_qc_metrics_thresholds_and_flags_are_deterministic_and_do_not_subset():
 def test_fixed_method_condition_caps_and_overrides():
     cfg = _base_cfg(qc={"thresholds": {
         "method": "fixed", "min_genes_floor": 100, "min_counts_floor": 1000, "max_counts_ceiling": 50000,
-        "max_pct_mt": 20.0, "max_pct_mt_by_condition": {"HF012": 15.0},
+        "max_pct_mt": 20.0, "max_pct_mt_by_condition": {"COND2": 15.0},
         "per_sample": {"S2": {"min_genes": 250}},
     }})
     adata = _toy_expr()
     qc_mod.compute_basic_qc_metrics(adata, cfg)
-    t = qc_mod.resolve_sample_thresholds(adata.obs, cfg, "S1", "HF011")
+    t = qc_mod.resolve_sample_thresholds(adata.obs, cfg, "S1", "COND1")
     assert (t["min_genes"], t["min_counts"], t["max_counts"], t["max_pct_mt"]) == (100, 1000, 50000, 20.0)
     assert t["max_genes"] is None
-    t = qc_mod.resolve_sample_thresholds(adata.obs, cfg, "S2", "HF012")
-    assert t["max_pct_mt"] == 15.0 and t["max_pct_mt_source"] == "condition:HF012"
+    t = qc_mod.resolve_sample_thresholds(adata.obs, cfg, "S2", "COND2")
+    assert t["max_pct_mt"] == 15.0 and t["max_pct_mt_source"] == "condition:COND2"
     assert t["min_genes"] == 250 and t["min_genes_source"] == "per_sample_override"
     qc_mod.flag_expression_qc(adata, {"min_genes": None, "min_counts": None, "max_pct_mt": None})
     assert adata.obs["gex_qc_pass"].all()
