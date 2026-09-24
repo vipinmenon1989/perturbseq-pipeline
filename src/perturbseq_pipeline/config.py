@@ -242,6 +242,15 @@ class GuideConfig:
     max_second_umi: int = -1
     #: Guide counts above this are considered "detected" for MOI statistics.
     detection_threshold: int = 3
+    #: Optional ``guides.var`` column holding the authoritative biological
+    #: target of each guide, for libraries whose guide IDs do not encode it
+    #: (10x Flex CRISPRi: guide ``TSS100020_17082653_23-ENST00000606659``,
+    #: ``var["target_gene_name"] == "CNOT7"``). When set it takes precedence
+    #: over :attr:`target_regex` and :attr:`target_split_delims`.
+    target_feature_column: Optional[str] = None
+    #: Metadata values in that column which are not biological targets; guides
+    #: carrying them are treated as unassigned (10x Flex uses ``Ignore``).
+    ignored_target_values: List[str] = field(default_factory=lambda: ["Ignore"])
     #: Regex whose first group is the target gene. When null, the guide ID is
     #: split on :attr:`target_split_delims` and the first field is taken
     #: (``AFF4_P1P2_1`` and ``AFF4-P1P2.2`` both give ``AFF4``).
@@ -708,6 +717,15 @@ class Config:
             raise ValueError("guides.dominance_ratio must be >= 1")
         if self.guides.min_umi < 0:
             raise ValueError("guides.min_umi must be >= 0")
+        if (
+            self.guides.target_feature_column is not None
+            and not str(self.guides.target_feature_column).strip()
+        ):
+            raise ValueError(
+                "guides.target_feature_column must be a non-empty column name or null"
+            )
+        if any(not str(v).strip() for v in self.guides.ignored_target_values):
+            raise ValueError("guides.ignored_target_values may not contain empty values")
 
         fq = self.guides.fastq
         for key in ("barcode_length", "umi_length", "protospacer_length"):

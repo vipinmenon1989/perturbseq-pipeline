@@ -48,6 +48,11 @@ guides:
   dominance_ratio: 2.0
   max_second_umi: -1
   detection_threshold: 3
+  # guides.var column with the biological target when guide IDs do not encode it
+  # (e.g. 10x Flex target_gene_name); null = parse the guide ID.
+  target_feature_column: null
+  ignored_target_values:
+  - Ignore
   target_regex: null
   target_split_delims:
   - _
