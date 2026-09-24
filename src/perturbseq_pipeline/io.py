@@ -755,7 +755,12 @@ def write_guide_table(
 
     coo = X.tocoo()
     guide_ids = guides.var_names.to_numpy().astype(str)
-    targets = parse_target_genes(guide_ids, cfg.guides)
+    if "target_gene" in guides.var.columns:
+        # Targets already resolved by guide assignment (possibly from metadata
+        # via guides.target_feature_column); do not re-parse the guide IDs.
+        targets = guides.var["target_gene"].to_numpy().astype(str)
+    else:
+        targets = parse_target_genes(guide_ids, cfg.guides)
 
     barcodes = guides.obs_names.to_numpy().astype(str)
     if LANE_KEY in guides.obs.columns:

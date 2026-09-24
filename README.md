@@ -440,10 +440,20 @@ guides:
   detection_threshold: 3         # MOI statistics only — NOT used for assignment
   target_split_delims: ["_", "-", "."]   # AFF4_P1P2_1 -> AFF4
   target_regex: null             # override when targets contain a delimiter
+  target_feature_column: null    # guides.var column with the target when IDs do not encode it
+  ignored_target_values: [Ignore]   # metadata values that are not targets -> unassigned
   ambiguous_label: ambiguous     # the strings written into obs
   unassigned_label: unassigned
   ntc_label: non-targeting
 ```
+
+Guide IDs do not always encode the target. 10x Flex CRISPRi libraries, for
+example, name guides like `TSS100020_17082653_23-ENST00000606659` and keep the
+gene in the guide feature metadata (`target_gene_name: CNOT7`). Set
+`guides.target_feature_column` to that column and the pipeline reads targets
+from it instead of parsing the ID; values listed in `ignored_target_values`
+(such as `Ignore`) are treated as unassigned. Leaving the column `null` keeps
+the ID-parsing behaviour.
 
 ### Tuning the ambiguous rate
 
