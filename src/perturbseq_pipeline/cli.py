@@ -2676,28 +2676,6 @@ def _build_parser() -> argparse.ArgumentParser:
         default=None,
         help="write a multi-lane run to <outdir>/<subdir> (e.g. 'combined') unless -o is given",
     )
-    pr = sub.add_parser(
-        "pair-report",
-        help="build the root pair-guide report over several completed runs",
-    )
-    pr.add_argument("-c", "--config", required=True, help="the shared run config")
-    pr.add_argument("--run", action="append", required=True, metavar="LABEL=DIR", help="completed run directory (repeatable; label 'combined' marks the pooled run)")
-    pr.add_argument("--audit-dir", default=None, help="directory with the audit / pair-reference tables")
-    pr.add_argument("-o", "--outdir", required=True, help="root output directory (report.html, run_manifest.json, README.md)")
-    pr.add_argument("--job-ids", default="", help="comma-separated SLURM job ids to record")
-    pr.add_argument("--previous-run", default=None, help="root directory of a previous run to compare against (supplemental section; read-only)")
-    pr.add_argument("--base-commit", default=None, help="git commit at task start; code changes are reported relative to it")
-    pr.add_argument("--slurm-dir", default=None, help="directory with the SBATCH scripts and job ledger (default <outdir>/slurm)")
-
-    rb = sub.add_parser(
-        "rebuild-report",
-        help="rebuild the full HTML reports (per-run + root index) of a finished pair-guide run from its on-disk outputs",
-    )
-    rb.add_argument("--root", required=True, help="root result directory (report.html, run_manifest.json, tables/)")
-    rb.add_argument("--run", action="append", required=True, metavar="LABEL=DIR", help="completed run directory (repeatable; label 'combined' marks the pooled run)")
-    rb.add_argument("--previous-run", default=None, help="previous root directory named in the supplemental comparison section")
-    rb.add_argument("--title", default=None, help="report title override")
-
     init = sub.add_parser(
         "init-config",
         help="write a default config",
@@ -2752,28 +2730,9 @@ def main(
 
         return 0
 
-    if args.command == "rebuild-report":
-        from .report_rebuild import rebuild_all
-
-        runs = dict(item.split("=", 1) for item in args.run)
-        summary = rebuild_all(Path(args.root), runs, previous_run=Path(args.previous_run) if args.previous_run else None, title=args.title)
-        for k, v in summary.items():
-            print(f"{k}: {v['report']} ({v['size_mb']} MB, {v['n_figures_embedded']} figures embedded, {len(v['missing_figures'])} missing)")
-        return 0
-
     cfg = Config.from_yaml(
         args.config
     )
-    if args.command == "pair-report":
-        from .multi_run_report import build_root_report
-
-        runs = dict(item.split("=", 1) for item in args.run)
-        build_root_report(cfg, runs, Path(args.outdir), audit_dir=Path(args.audit_dir) if args.audit_dir else None,
-                          config_path=args.config, job_ids=[j for j in args.job_ids.split(",") if j],
-                          previous_run=Path(args.previous_run) if args.previous_run else None, base_commit=args.base_commit,
-                          slurm_dir=Path(args.slurm_dir) if args.slurm_dir else None)
-        print(f"Wrote root pair-guide report to {Path(args.outdir) / 'report.html'}")
-        return 0
     if getattr(args, "lane", None):
         lane = args.lane
         for attr in ("mtx_dirs", "guide_mtx_dirs"):
