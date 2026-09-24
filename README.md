@@ -144,6 +144,13 @@ clustering. Where section 8 groups perturbations by shared downstream genes,
 this groups them by similarity of the cell states they produce. The cost grows
 with the square of the target count, so it is off in the large-screen example.
 
+**Reference / inspiration:** The perturbation-distance analyses in sections 9
+and 10 were conceptually inspired by and developed with reference to the
+perturbation-analysis approaches available in
+[scverse Pertpy](https://github.com/scverse/pertpy). The implementation in
+this pipeline is integrated into the unified Perturb-seq workflow described
+here.
+
 **11 · Master perturbation table** *(optional)*
 `tables/perturbation_meta.csv` joins the target-level results of sections 4
 and 6 to 10 into one table, with the atlas, PS-versus-distance and module
