@@ -144,6 +144,81 @@ class QCConfig:
 
 
 @dataclass
+class GuideDesignConfig:
+    """Designed-guide reference table (xlsx/csv/tsv).
+
+    Column names are auto-detected unless given explicitly. Every designed
+    guide is retained in the reference, whether or not it is observed.
+    """
+
+    path: Optional[str] = None
+    #: Sheet name or index for workbooks. ``None`` = first sheet.
+    sheet: Optional[Union[str, int]] = None
+    protospacer_column: Optional[str] = None
+    target_column: Optional[str] = None
+    guide_id_column: Optional[str] = None
+    scaffold_column: Optional[str] = None
+    #: Optional table mapping protospacer -> scaffold class when the design
+    #: workbook lacks a scaffold column.
+    scaffold_table: Optional[str] = None
+    #: Case-insensitive regexes recognising control guides by target label.
+    #: ``None`` falls back to ``guides.ntc_patterns``.
+    control_patterns: Optional[List[str]] = None
+    #: Template for synthetic guide ids when the table has no id column.
+    #: Fields: target (sanitised), n (1-based index within target).
+    id_format: str = "{target}_{n}"
+    #: Uppercase protospacers before matching.
+    uppercase: bool = True
+
+
+@dataclass
+class GuideFastqConfig:
+    """Read-structure parameters for the streaming guide counter.
+
+    Defaults describe 10x 5' feature-barcode reads where R1 carries
+    ``[barcode][UMI][TSO][0-n G][protospacer][scaffold]``. The protospacer is
+    located *relative to the scaffold anchor* rather than at a fixed offset so
+    variable non-templated G runs do not lose reads.
+    """
+
+    #: Glob (recursive) used to find the read carrying barcode + spacer.
+    read_pattern: str = "*_R1_*.fastq.gz"
+    barcode_length: int = 16
+    umi_length: int = 12
+    protospacer_length: int = 20
+    #: Scaffold class -> anchor sequence expected immediately after the
+    #: protospacer. Classes are free-form labels (e.g. A / C).
+    scaffolds: Dict[str, str] = field(
+        default_factory=lambda: {"A": "GTTTAAGAGCTA", "C": "GTTTCAGAGCTA"}
+    )
+    #: Earliest read position at which a scaffold anchor may start.
+    anchor_search_start: int = 40
+    #: Positional fallback: retry the exact spacer match shifted by up to this
+    #: many bases (still an exact sequence match). 0 disables.
+    position_shift: int = 1
+    #: Sequence mismatches tolerated in the spacer. 0 = exact only (default).
+    max_mismatches: int = 0
+    #: Template-switch oligo, recorded as a diagnostic only.
+    tso: Optional[str] = "TTTCTTATATGGG"
+    #: Process at most this many reads per file (subset validation).
+    max_reads: Optional[int] = None
+    #: Worker processes (one per FASTQ file). ``None`` = min(files, CPUs).
+    n_workers: Optional[int] = None
+    #: Reads accumulated before an intermediate UMI de-duplication pass.
+    chunk_size: int = 2_000_000
+    #: Keep one in N unmatched protospacers for the diagnostics table.
+    unmatched_sample_rate: int = 50
+    #: Number of top unmatched protospacers to report.
+    unmatched_top_n: int = 50
+    #: Count each designed protospacer separately per scaffold class, i.e. the
+    #: count-matrix features are ``<guide_id>:<scaffold>`` (designed spacer x
+    #: scaffold anchor). Required when one spacer is cloned behind more than one
+    #: scaffold (e.g. an NTC filler used in several constructs) and it turns
+    #: wrong-scaffold (chimeric) reads into explicit off-design features.
+    scaffold_specific_features: bool = False
+
+
+@dataclass
 class GuideConfig:
     """Guide-calling rules.
 
@@ -186,6 +261,12 @@ class GuideConfig:
     unassigned_label: str = "unassigned"
     ambiguous_label: str = "ambiguous"
     ntc_label: str = "non-targeting"
+
+    #: Designed-guide reference (workbook / table of designed protospacers)
+    #: used by the streaming guide counter.
+    design: GuideDesignConfig = field(default_factory=GuideDesignConfig)
+    #: Read-structure settings for counting guides from feature-barcode FASTQs.
+    fastq: GuideFastqConfig = field(default_factory=GuideFastqConfig)
 
 
 @dataclass
@@ -627,6 +708,24 @@ class Config:
             raise ValueError("guides.dominance_ratio must be >= 1")
         if self.guides.min_umi < 0:
             raise ValueError("guides.min_umi must be >= 0")
+
+        fq = self.guides.fastq
+        for key in ("barcode_length", "umi_length", "protospacer_length"):
+            if getattr(fq, key) <= 0:
+                raise ValueError(f"guides.fastq.{key} must be > 0")
+        if fq.position_shift < 0:
+            raise ValueError("guides.fastq.position_shift must be >= 0")
+        if fq.max_mismatches not in (0, 1):
+            raise ValueError("guides.fastq.max_mismatches must be 0 or 1")
+        if not fq.scaffolds:
+            raise ValueError("guides.fastq.scaffolds must define at least one scaffold anchor")
+        for name, anchor_seq in fq.scaffolds.items():
+            if not anchor_seq or set(str(anchor_seq).upper()) - set("ACGTN"):
+                raise ValueError(f"guides.fastq.scaffolds[{name!r}] must be a nucleotide string")
+        if fq.chunk_size <= 0:
+            raise ValueError("guides.fastq.chunk_size must be > 0")
+        if fq.max_reads is not None and fq.max_reads <= 0:
+            raise ValueError("guides.fastq.max_reads must be > 0 or null")
 
         valid_controls = {"ntc", "other"}
         bad = set(self.perturbation.controls) - valid_controls
