@@ -51,6 +51,10 @@ def _base_config(synthetic, outdir: Path, **overrides) -> Config:
         "qc": {"min_genes_per_cell": 10, "min_genes_final": 50, "max_pct_mt": 100},
         "cluster": {"n_top_genes": 80, "n_pcs": 10},
         "perturbation": {"min_cells_per_target": 5, "top_n_report": 2},
+        # The optional stages are off by default; this suite asserts on their outputs.
+        "modules": {"enabled": True},
+        "ps_score": {"enabled": True},
+        "lochness": {"enabled": True},
     }
     for key, value in overrides.items():
         data.setdefault(key, {}).update(value)

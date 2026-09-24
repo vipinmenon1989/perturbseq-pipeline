@@ -682,7 +682,8 @@ class ProgramEnrichmentConfig:
 class ModulesConfig:
     """Co-functional modules and co-regulated gene programs."""
 
-    enabled: bool = True
+    #: Optional stage, off by default; set ``enabled: true`` to run it.
+    enabled: bool = False
 
     cluster_key: str = "leiden"
 
@@ -744,7 +745,8 @@ class ModulesConfig:
 class PSScoreConfig:
     """Per-cell perturbation-response scoring through ``pertps``."""
 
-    enabled: bool = True
+    #: Optional stage, off by default; set ``enabled: true`` to run it.
+    enabled: bool = False
 
     require: bool = False
 
@@ -792,7 +794,8 @@ class PSScoreConfig:
 class LochnessConfig:
     """Local neighbourhood enrichment of each perturbation."""
 
-    enabled: bool = True
+    #: Optional stage, off by default; set ``enabled: true`` to run it.
+    enabled: bool = False
 
     genotype_key: str = "target_gene"
 
@@ -835,7 +838,8 @@ class LochnessConfig:
 class DistanceConfig:
     """Perturbation distance vs control analysis."""
 
-    enabled: bool = True
+    #: Optional stage, off by default; set ``enabled: true`` to run it.
+    enabled: bool = False
 
     representation: str = "X_pca"
 
@@ -867,7 +871,8 @@ class DistanceConfig:
 class DistanceSpaceConfig:
     """Pairwise perturbation distance space analysis."""
 
-    enabled: bool = True
+    #: Optional stage, off by default; set ``enabled: true`` to run it.
+    enabled: bool = False
 
     metric: str = "edistance"
 

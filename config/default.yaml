@@ -203,7 +203,7 @@ enrichment:
   permutations: 1000
   top_n_report: 12
 modules:
-  enabled: true
+  enabled: false
   cluster_key: leiden
   gene_selection: cluster_markers
   n_marker_genes_per_cluster: 100
@@ -238,7 +238,7 @@ modules:
     max_genes: 1500
     top_terms_per_program: 5
 ps_score:
-  enabled: true
+  enabled: false
   require: false
   top_n_biomarkers: 100
   scale_factor: 3.0
@@ -255,7 +255,7 @@ ps_score:
   lda_large_max_cells: 200000
   lda_large_stratified: true
 lochness:
-  enabled: true
+  enabled: false
   genotype_key: target_gene
   n_neighbors: 300
   n_pcs: 20
@@ -269,7 +269,7 @@ lochness:
   store_all_target_scores: true
   max_targets_in_obs: 500
 distance:
-  enabled: true
+  enabled: false
   representation: X_pca
   primary_metric: edistance
   secondary_metric: mmd
@@ -281,7 +281,7 @@ distance:
   fdr_threshold: 0.05
   stratify_by: null
 distance_space:
-  enabled: true
+  enabled: false
   metric: edistance
   representation: X_pca
   n_components: 10

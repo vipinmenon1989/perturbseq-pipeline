@@ -83,6 +83,20 @@ ps_score:
   expression_cut: mean          # mean | median | quantile
   top_n_report: 12
 
+lochness:
+  # Cluster-free neighbourhood enrichment of every perturbation (section 7).
+  enabled: true
+  top_n_report: 12
+
+modules:
+  # Co-functional modules and gene programs (section 8); skips itself when the
+  # lane has too few perturbations.
+  enabled: true
+  top_n_report: 12
+
+# Energy distance / distance space (sections 9-10) stay off in the demo; set
+# distance.enabled / distance_space.enabled to true to add them.
+
 report:
   title: "Perturb-seq demo report — ESC TF screen (S1 lane 1)"
   embed_figures: true
