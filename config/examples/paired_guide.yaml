@@ -1,0 +1,61 @@
+# Dual-guide library (one scaffold-A and one scaffold-C guide per construct),
+# gene expression and guides quantified separately, paired-guide assignment as
+# the primary label set.
+#
+#   perturbseq-pipeline run --config config/examples/paired_guide.yaml            # all lanes
+#   perturbseq-pipeline run --config config/examples/paired_guide.yaml --lane W1  # one lane -> results/.../samples/W1
+
+run:
+  name: my_dual_guide_screen
+  outdir: results/my_dual_guide_screen
+  seed: 0
+
+input:
+  mode: mtx
+  mtx_dirs:                       # gene expression, one 10x directory per lane
+    W1: /path/W1/GEX/filtered_feature_bc_matrix
+    W2: /path/W2/GEX/filtered_feature_bc_matrix
+  guide_mtx_dirs:                 # guide UMI counts, same lane keys
+    W1: /path/W1/guide_counts
+    W2: /path/W2/guide_counts
+  cell_id_format: prefix          # <lane>_<barcode>: a per-lane run is a row subset of the combined run
+
+metadata:
+  file: /path/sample_manifest.csv # one row per lane, joined on lane_id
+
+guides:
+  assignment_mode: dual_guide_pair   # alias: pair
+  pair_assignment_primary: true
+  # One row per designed guide: guide_id, target, scaffold class and (optionally)
+  # the construct / pair id. With construct ids a pair counts only when both
+  # guides share a designed construct; without a reference the same-target rule
+  # applies and the scaffold class is read from the guide matrix features.
+  # The file must exist when the config is loaded:
+  # pair_reference: /path/guide_reference.csv
+  scaffold_column: auto           # scaffold | scaffold_class | scaffold_id
+  pair_id_column: auto            # pair_id | construct_id | vector_id
+  scaffold_classes: [A, C]
+  require_complete_pair: true
+  ntc_partner_policy: ambiguous   # or provisional_target
+  single_guide_diagnostic: true   # also evaluate the single-guide rule, for comparison only
+  min_umi: 3
+  dominance_ratio: 2.0
+  ntc_label: non-targeting
+
+cluster:
+  batch_key: null
+
+enrichment:
+  enabled: true
+modules:
+  enabled: false
+ps_score:
+  enabled: false
+lochness:
+  enabled: true
+distance:
+  enabled: true
+distance_space:
+  enabled: false
+meta_analysis:
+  enabled: true

@@ -14,6 +14,11 @@ Every run produces three deliverables:
 3. **all diagnostic figures** on disk — including the per-target figures that
    were too numerous to embed in the report.
 
+Inputs can be 10x MTX directories or an existing `.h5ad`; guides can be called
+one per cell or as scaffold pairs; every analysis stage after guide assignment
+is switched on or off in the YAML config. The same code runs a one-lane demo
+and a multi-million-cell screen on an HPC node.
+
 ---
 
 ## What it does
@@ -22,15 +27,25 @@ Every run produces three deliverables:
 Standard single-cell QC (genes/UMIs per cell, mitochondrial, ribosomal and
 hemoglobin fractions, per-lane breakdowns) *plus* Perturb-seq-specific guide QC:
 guide UMI depth, guides detected per cell (MOI), top-vs-second guide dominance,
-assignment outcome per lane, and guide/target library representation.
+assignment outcome per lane, and guide/target library representation. Every
+loaded cell is also written to an all-cells `.h5ad` before any filter, so the
+before/after cell counts are on disk, not only in the report.
 
-**2 · Clustering**
+**2 · Guide assignment**
+Two modes, selected with `guides.assignment_mode`. `single_guide` (the default)
+assigns each cell to its dominant guide. `dual_guide_pair` resolves the
+strongest guide of each scaffold class and interprets the pair through an
+optional construct reference. Both write the same `obs['target_gene']` and
+`obs['perturbation_class']` columns, which every later stage reads. See
+[Guide calling](#guide-calling).
+
+**3 · Clustering**
 Library-size normalization, log1p, HVG selection, PCA, optional Harmony batch
 correction, UMAP and Leiden clustering — with the embedding coloured by cluster,
 lane, QC metrics, assignment class and target gene, so technical artefacts are
 visible rather than implicit.
 
-**3 · Perturbation strength**
+**4 · Perturbation strength**
 For every target gene also measured in the expression matrix, the gene's *own*
 expression is compared between perturbed and control cells. Effective CRISPR
 perturbation lowers it, so the call is directional: a target is **effective**
@@ -43,7 +58,7 @@ Results are reported against **two control definitions** side by side:
 | `ntc` | cells carrying non-targeting guides | preferred; same handling, no on-target effect |
 | `other` | cells assigned to a *different* target gene | larger n, but controls are themselves perturbed |
 
-**4 · Cluster enrichment**
+**5 · Cluster enrichment** *(optional)*
 The follow-on question: did losing the gene push cells into a particular
 transcriptional state? Every target is tested against every cluster with
 Fisher's exact test (BH-FDR across all pairs), reporting odds ratio, direction,
@@ -56,8 +71,8 @@ On the demo lane this recovers SMARCC1 (core SWI/SNF) taking over one cluster,
 and EZH2 with SUZ12 — both core PRC2 subunits — independently landing in the
 same one.
 
-**5 · Per-cell perturbation response** *(optional)*
-Sections 3 and 4 treat all cells carrying a guide as one group, but a perturbed
+**6 · Per-cell perturbation response (PS score)** *(optional)*
+Sections 4 and 5 treat all cells carrying a guide as one group, but a perturbed
 population is rarely uniform. This stage scores **each cell** using
 [PS_python](https://github.com/weili-lab/PS_python), the lab's scMAGeCK-style
 perturbation score, and combines it with the target's own expression to separate
@@ -69,7 +84,7 @@ pip install -e ".[ps]"    # brings in pertps from PS_python
 ```
 
 It also builds PS_python's **supervised LDA embedding**: where the UMAP in
-section 2 is unsupervised and knows nothing about which guide a cell carries,
+section 3 is unsupervised and knows nothing about which guide a cell carries,
 this one is trained on the perturbation labels, so its axes are chosen to
 separate perturbations. Scores are shown in that space, one figure per target.
 Disable with `ps_score.compute_lda_umap: false` if the extra few minutes and few
@@ -78,19 +93,19 @@ GB are not worth it.
 Without the extra the stage is skipped and the report says so; set
 `ps_score.require: true` to make it a hard failure.
 
-**6 · lochNESS neighbourhood enrichment**
+**7 · lochNESS neighbourhood enrichment** *(optional)*
 Ported from [pertTF](https://github.com/davidliwei/pertTF). For every cell and
 every perturbation, the share of that cell's 300 nearest neighbours carrying the
 perturbation, divided by its overall share, minus one — so 0 is background and
 positive means locally over-represented. Continuous and cluster-free, so unlike
-section 4 it also sees structure inside a cluster or across two, and it maps
+section 5 it also sees structure inside a cluster or across two, and it maps
 *where* a perturbation accumulates. One figure per perturbation.
 
-On the demo lane it independently reproduces the section-4 result (SALL4 and
+On the demo lane it independently reproduces the section-5 result (SALL4 and
 SMARCC1 strongest; EZH2, SUZ12, NANOG and CTNNB1 all peaking in the same
 cluster) without using clusters at all.
 
-**7 · Co-functional modules & gene programs**
+**8 · Co-functional modules & gene programs** *(optional)*
 The "regulome" map, after
 [Chen et al. 2023](https://www.nature.com/articles/s41586-023-06733-x). A
 perturbation×gene matrix of log2FC-vs-control is clustered on both axes:
@@ -98,10 +113,12 @@ perturbations into **co-functional modules** (Spearman-correlation clustering)
 and downstream genes into **co-regulated programs** (Pearson-correlation
 clustering). It then relates the two — a signed module×program strength matrix
 and alluvial — and draws the TF-hub and module–module networks. Every cell is
-also scored for each program. Modules (`M1..`) and programs (`P1..`) are numbered
-clusters, not biological labels; their member TFs and top genes are in the
-tables so you can annotate them. The number of modules/programs is configurable
-(`modules.n_modules` / `modules.n_programs`, or an automatic dendrogram cut).
+also scored for each program, and programs are annotated by over-representation
+against built-in gene-set collections. Modules (`M1..`) and programs (`P1..`)
+are numbered clusters, not biological labels; their member TFs and top genes
+are in the tables so you can annotate them. The number of modules/programs is
+configurable (`modules.n_modules` / `modules.n_programs`, or an automatic
+dendrogram cut).
 
 ```bash
 pip install -e ".[networks]"   # optional: the network-graph layouts (networkx)
@@ -109,6 +126,34 @@ pip install -e ".[networks]"   # optional: the network-graph layouts (networkx)
 
 The stage skips itself when a run has too few perturbations to be meaningful (a
 single small lane), so it is most useful on a full multi-lane screen.
+
+**9 · Perturbation distance** *(optional)*
+How far did each perturbation move the whole transcriptome, not just its own
+target? The **energy distance** between perturbed and control cells in PCA
+space (with **MMD** as a secondary metric) measures the global displacement of
+the cell distribution; a permutation test and BH-FDR say whether the shift is
+larger than chance. Cells are subsampled deterministically
+(`distance.max_cells_per_target`, `distance.max_control_cells`) so the cost is
+bounded on large screens.
+
+**10 · Perturbation distance space** *(optional)*
+The same distance between every pair of perturbations gives a
+perturbation×perturbation matrix, its PCoA coordinates, the nearest phenotypic
+neighbours of each target, and **phenotype modules** from hierarchical
+clustering. Where section 8 groups perturbations by shared downstream genes,
+this groups them by similarity of the cell states they produce. The cost grows
+with the square of the target count, so it is off in the large-screen example.
+
+**11 · Master perturbation table** *(optional)*
+`tables/perturbation_meta.csv` joins the target-level results of sections 4
+and 6 to 10 into one table, with the atlas, PS-versus-distance and module
+concordance figures.
+
+Stages 5 to 11 are enabled per section (`enrichment.enabled`,
+`modules.enabled`, `ps_score.enabled`, `lochness.enabled`,
+`distance.enabled`, `distance_space.enabled`, `meta_analysis.enabled`). A
+disabled stage writes nothing and appears as `disabled` in the report's module
+status table.
 
 ---
 
@@ -121,11 +166,16 @@ pip install -e .
 
 # optional extras
 pip install -e ".[harmony]"   # batch correction across lanes
+pip install -e ".[ps]"        # per-cell PS scores (pertps from PS_python)
+pip install -e ".[networks]"  # network-graph layouts for the modules stage
+pip install -e ".[gpu]"       # CuPy / cuML / rapids-singlecell acceleration
 pip install -e ".[demo]"      # gdown, for fetching the demo data
+pip install -e ".[dev]"       # pytest
 ```
 
 Requires Python >= 3.9. Runs on Colab (Drive mounted), a workstation, or an HPC
-login node. No GPU needed.
+node. No GPU needed; when one is present and the `gpu` extra is installed,
+`compute.backend: auto` uses it for the dense linear algebra.
 
 ---
 
@@ -152,11 +202,22 @@ There is also a runnable notebook that walks through the whole thing:
 
 ## Inputs
 
-Start a config from the documented defaults:
+Start a config from the documented defaults, or from one of the examples:
 
 ```bash
 perturbseq-pipeline init-config my_run.yaml
 ```
+
+| Example | Shows |
+|---|---|
+| `config/demo.yaml` | one 10x lane, single-guide, every stage on |
+| `config/examples/h5ad_input.yaml` | `.h5ad` input with the optional stages chosen explicitly |
+| `config/examples/paired_guide.yaml` | separate GEX and guide matrices, paired-guide assignment, per-lane runs |
+| `config/examples/large_hpc.yaml` | scaling, compute and storage settings for a multi-million-cell screen |
+| `config/examples/basic_qc_samples.yaml` | several 10x wells, guide FASTQ counting, QC-only checkpoint |
+
+`input.mode` is `auto` by default and follows whichever of `mtx_dirs`, `h5ad`
+or `samples` is set; `mtx` and `h5ad` force one layout.
 
 ### Option 1 — 10x count matrices
 
@@ -236,7 +297,8 @@ called cells in the THP-1 run. The pipeline subsets it to the barcodes in the
 expression matrix, filling any missing ones with zeros rather than dropping
 those cells, and logs the match rate per lane (it was 100% for all three THP-1
 channels). No overlap at all is an error, since that almost always means the two
-matrices use different barcode formats.
+matrices use different barcode formats; a bare-versus-`-1` suffix mismatch is
+reconciled automatically first.
 
 **Point GEX at the called cells and guides at whatever exists.** In the THP-1
 tree that is `GEX/filtered` and `sgRNA/raw` — `sgRNA` has no `filtered` output.
@@ -252,6 +314,21 @@ names = ['ADGRV1_1', 'gene_desert_3', 'non-targeting_20']
 t = parse_target_genes(names, cfg.guides)
 print(dict(zip(names, t)), dict(zip(t, is_non_targeting(t, cfg.guides))))"
 ```
+
+When guide ids do not encode the target at all (10x Flex CRISPRi libraries name
+guides by transcription start site), point `guides.target_feature_column` at
+the guide-feature column that does, e.g. `target_gene_name`; values listed in
+`guides.ignored_target_values` become `unassigned`.
+
+#### 1.3 Per-lane and combined runs
+
+```bash
+perturbseq-pipeline run -c my_run.yaml --lane S1lane1            # -> <outdir>/samples/S1lane1
+perturbseq-pipeline run -c my_run.yaml --combined-subdir combined # -> <outdir>/combined
+```
+
+With `input.cell_id_format: prefix` cells are named `<lane>_<barcode>` in both,
+so a per-lane object is an exact row subset of the combined object.
 
 ### Option 2 — an existing `.h5ad`
 
@@ -282,6 +359,16 @@ as the count-matrix path** (top guide must clear `guides.min_umi` and beat the
 runner-up by `guides.dominance_ratio`) rather than keeping whichever row came
 last, which would pick a guide at random for every multiplet.
 
+### Option 3 — several 10x wells, QC checkpoint only
+
+For a fresh sequencing run the first question is often just "what did we get".
+A `samples:` block lists the wells, `run.stop_after: qc` runs a QC-only stage
+and stops: per-well expression QC with MAD or fixed thresholds, Scrublet
+doublet scores and guide-derived multiplet flags (flagged, never removed),
+guide UMIs counted straight from the feature FASTQs or taken from a matrix, and
+one all-cells `.h5ad` plus one expression-QC-pass `.h5ad` with a QC report.
+`config/examples/basic_qc_samples.yaml` is a complete example.
+
 ### Sample metadata
 
 **Required for any run spanning more than one lane.** One row per lane, joined
@@ -301,19 +388,48 @@ S1lane2,S1,2,ESC,TF_screen,1
 ```
 results/<run>/
 ├── report.html                      # deliverable 2 — self-contained
+├── report.md                        # the same content, figures by relative path
 ├── processed.h5ad                   # deliverable 1 — includes the guide matrix
+├── processed_all_cells.h5ad         # every loaded cell, before QC filtering
 ├── figures/                         # deliverable 3
 │   ├── qc/                          # cell QC, before and after filtering
-│   ├── guides/                      # Perturb-seq guide QC
+│   ├── guides/                      # Perturb-seq guide QC (+ pair status in pair mode)
 │   ├── clustering/                  # PCA, UMAPs, cluster composition
-│   └── perturbation/
-│       ├── perturbation_volcano.png
-│       ├── perturbation_waterfall.png
-│       └── per_gene/                # EVERY target, not just those in the report
+│   ├── perturbation/
+│   │   ├── perturbation_volcano.png
+│   │   ├── perturbation_waterfall.png
+│   │   └── per_gene/                # EVERY target, not just those in the report
+│   ├── enrichment/  modules/  ps_score/  lochness/
+│   └── distance/  distance_space/
 ├── tables/                          # CSVs for all report tables
-├── logs/  run.log + resolved_config.yaml
+│   ├── qc_steps.csv  guide_assignment.csv  clusters.csv  perturbation.csv
+│   ├── perturbation_distance.csv  phenotype_modules.csv  perturbation_meta.csv
+│   ├── module_status.csv            # one row per stage: completed / skipped / disabled
+│   └── compute_profile.csv          # seconds and memory per stage
+├── logs/  run.log + resolved_config.yaml + run_manifest.json
 └── <run>_results.tar.gz             # shareable bundle, matrices excluded
 ```
+
+### The run manifest
+
+`logs/run_manifest.json` records what ran, from which code, on which inputs:
+
+| Field | Contents |
+|---|---|
+| `git` | branch, commit, whether the tree had uncommitted changes |
+| `execution` | the exact command line, interpreter and working directory |
+| `config_path`, `resolved_config` | the config given and the fully resolved copy |
+| `random_seed` | `run.seed` |
+| `input` | every input path with existence and size, the lanes actually loaded, metadata and pair-reference files |
+| `guides.assignment_mode` | `single_guide` or `dual_guide_pair` |
+| `enabled_modules` | the `enabled` flag of every optional stage |
+| `module_status` | per stage: `completed`, `skipped` (with the reason), or `disabled`, and seconds spent |
+| `execution_mode`, `compute` | STANDARD or LARGE; backend, workers, CPUs seen, GPU present |
+| `environment` | host, conda env, SLURM job, package versions |
+
+The same facts appear in the report's *Run provenance* section, and
+`logs/module_status.json` is updated after every stage so a failed run still
+shows how far it got.
 
 ### The guide barcode table
 
@@ -371,12 +487,21 @@ output:
 | `layers['counts']` | raw integer counts |
 | `obsm['guide_counts']` | the raw guide count matrix, sparse (cells x guides) |
 | `uns['guide_names']`, `uns['guide_target_genes']` | guide IDs and their parsed targets |
+| `uns['guide_scaffolds']`, `uns['guide_pair_ids']` | scaffold class and construct id per guide, when known |
 | `obs['target_gene']` | assigned target, or `ambiguous` / `unassigned` / `non-targeting` |
 | `obs['perturbation_class']` | `targeting` / `non-targeting` / `ambiguous` / `unassigned` |
 | `obs['guide_id']`, `top_guide_count`, `second_guide_count` | guide-call diagnostics |
+| `obs['guide_assignment_mode']`, `pair_assignment_status`, `guide_A_*`, `guide_C_*` | pair-mode call and per-slot detail |
 | `obs['total_guide_counts']`, `n_guides_detected` | guide depth and MOI |
 | `obs['leiden']`, `obsm['X_umap']` | clustering and embedding |
+| `obs['ps_score']`, `lochness_self`, `obsm['X_lda_umap']` | per-cell scores from the optional stages |
 | `obs[...]` | all sample metadata columns |
+
+Column and key names that would be illegal or fragile in HDF5 (a target such as
+`LIPA (rs1412444)` becomes `lochness_LIPA__rs1412444_`) are sanitised on write;
+the original names stay in the tables and the mapping is stored in
+`uns['column_name_mapping']` and next to the file as
+`<stem>_column_name_mapping.csv`.
 
 ### One file, both matrices
 
@@ -434,6 +559,7 @@ weak or because the runner-up is too close to it.
 
 ```yaml
 guides:
+  assignment_mode: single_guide  # or dual_guide_pair, see below
   min_umi: 3            # the top guide must reach this many UMIs
   dominance_ratio: 2.0  # ...and exceed the runner-up by this factor
   max_second_umi: -1    # hard cap on the runner-up; -1 disables the gate
@@ -444,6 +570,36 @@ guides:
   unassigned_label: unassigned
   ntc_label: non-targeting
 ```
+
+### Paired-guide mode
+
+Dual-guide libraries put one guide on a scaffold-A vector position and one on
+a scaffold-C position; the single-guide rule labels every such cell
+`ambiguous` by design. `dual_guide_pair` applies the same gate **within each
+scaffold class** and then interprets the pair:
+
+```yaml
+guides:
+  assignment_mode: dual_guide_pair
+  pair_assignment_primary: true
+  pair_reference: guide_reference.csv   # optional: guide_id, target, scaffold, construct id
+  scaffold_classes: [A, C]
+  require_complete_pair: true
+  ntc_partner_policy: ambiguous         # targeting + NTC without a designed construct
+```
+
+| `pair_assignment_status` | `perturbation_class` |
+|---|---|
+| `pair_targeting` (same designed target in both slots) | `targeting` |
+| `pair_non_targeting` (two non-targeting guides) | `non-targeting` — the primary control |
+| `pair_targeting_plus_ntc` (designed target + NTC construct) | `targeting`, or `ambiguous` when `designed_targeting_plus_ntc_primary: false` |
+| `dual_target_ambiguous`, `incomplete_pair`, `ambiguous_scaffold_*`, `unknown_guide`, `below_min_umi`, `unresolved_pair` | `ambiguous` |
+| `no_guide` | `unassigned` |
+
+Downstream stages see only `target_gene` and `perturbation_class`, so they run
+unchanged. Pair-mode runs add per-lane pair QC, per-target ECDFs and a
+single-guide diagnostic to the report. Details and every status are in
+[`docs/paired_guide_assignment.md`](docs/paired_guide_assignment.md).
 
 ### Tuning the ambiguous rate
 
@@ -509,7 +665,7 @@ discarding anything:
 | | Cells | Written as | Used for |
 |---|---|---|---|
 | all cells | every QC-passing cell | `<name>_all_cells.h5ad` | the `all_cells_*` UMAPs, where ambiguous/unassigned cells are visible |
-| analysed | guide-assigned singlets | `<name>.h5ad` | clustering, perturbation, enrichment, PS scores, lochNESS |
+| analysed | guide-assigned singlets | `<name>.h5ad` | clustering, perturbation, enrichment, PS scores, lochNESS, distance |
 
 Each is embedded independently and is internally complete, so **cluster labels
 do not carry across the two files**. Set `output.write_unfiltered_h5ad: false`
@@ -524,6 +680,24 @@ Non-targeting guides are detected by pattern (`non`, `non_targeting`, `NTC`,
 
 ---
 
+## Scaling
+
+The same branch runs the demo lane and a screen of millions of cells. Nothing
+about the statistics changes with size; the memory strategy does.
+
+| Section | Keys | What they control |
+|---|---|---|
+| `scaling` | `mode: auto \| standard \| large`, `large_n_cells`, `large_n_perturbations`, `marker_max_cells`, `effect_gene_chunk`, `guide_chunk_size` | STANDARD keeps the historical in-memory paths; LARGE keeps matrices sparse (PCA scaling without densification), estimates HVGs on a bounded sample, accumulates the effect matrix in gene chunks, scores lochNESS in target chunks and samples cells for scatter plots |
+| `compute` | `backend: auto \| cpu \| gpu`, `n_jobs`, `blas_threads_per_worker`, `<stage>_n_jobs` | target-level tests, permutations and pairwise distances run in worker pools; the worker count follows `n_jobs` and the SLURM allocation; the GPU is used only for dense linear algebra when present |
+| `storage` | `mode: auto \| in_memory \| backed`, `backed_threshold_cells` | backed `.h5ad` reading above a cell count; embeddings stay in memory |
+
+`tables/compute_profile.csv` records seconds and memory per stage, and the run
+manifest records the mode that was actually used. Job templates and resource
+guidance for a scheduler are in [`docs/slurm.md`](docs/slurm.md); real datasets
+belong in a job, not on a login node.
+
+---
+
 ## Testing
 
 ```bash
@@ -534,18 +708,23 @@ pytest tests/ -v
 The suite generates a synthetic dataset with a **known ground truth** — some
 targets are genuinely knocked down, others are not — and asserts that the
 pipeline recovers exactly those, through both entry points and all three h5ad
-layouts.
+layouts. Further files cover paired-guide assignment on a synthetic dual-guide
+library, the QC-only stage on synthetic 10x wells and guide FASTQs, the
+distance and module stages, STANDARD-versus-LARGE numerical consistency, the
+compute backend, and the run manifest, module switches and HDF5-safe naming of
+this branch.
 
 ---
 
 ## Repository layout
 
 ```
-src/perturbseq_pipeline/   io · qc · guides · cluster · perturbation · plots · report · cli
-config/                    default.yaml (all documented defaults) · demo.yaml
+src/perturbseq_pipeline/   io · qc · guides · dual_guides · cluster · perturbation · enrichment ·
+                           modules · ps_score · lochness · distance · meta · basic_qc ·
+                           compute · data_access · run_manifest · plots · report · cli
+config/                    default.yaml (all documented defaults) · demo.yaml · examples/
 demo/                      fetch_demo_data.py · sample_metadata.csv
+docs/                      methods.md · paired_guide_assignment.md · slurm.md · PIPELINE_DEVELOPMENT.md
 notebooks/                 demo_run_pipeline.ipynb · prototype/ (original analyses)
-tests/                     synthetic data generator + end-to-end tests
+tests/                     synthetic data generators + end-to-end and unit tests
 ```
-
-`CLAUDE.md` records the project conventions, including where large files belong.

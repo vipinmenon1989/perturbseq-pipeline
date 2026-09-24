@@ -698,6 +698,12 @@ results/<run_name>/
 
 ## Development History & Changelog
 
+### 2026-09-23: Unified branch (feature/unified-perturbseq-pipeline)
+* **One implementation for every input and assignment mode**: MTX and H5AD input, single-guide and paired-guide (`guides.assignment_mode: dual_guide_pair`) assignment, the QC-only `samples` stage, and the optional stages (enrichment, modules, PS score, lochNESS, distance, distance space, meta table) selected through `<section>.enabled`. All optional stages read `obs['target_gene']` / `obs['perturbation_class']` from the guide-assignment stage.
+* **Run manifest** (`run_manifest.py`): `logs/run_manifest.json` records pipeline version, git commit and dirty state, the execution command, the input manifest, assignment mode, enabled modules, random seed, execution and compute mode, and per-stage completion status (`completed` / `skipped` / `disabled`); `logs/module_status.json` is updated after every stage and `tables/module_status.csv` plus a *Run provenance* section are added to the HTML and Markdown reports.
+* **Repository policy**: code-only branch based on `origin/main`; dataset configs, job scripts with site paths, results and reports are not tracked. Portable examples live in `config/examples/`; scheduler guidance in `docs/slurm.md`; pair-mode reference in `docs/paired_guide_assignment.md`.
+* **Dependencies**: `pertpy` removed from the hard dependencies (never imported).
+
 ### 2026-09-13: Basic QC stage (multi-well 10x h5, guide FASTQ counting, flag-only doublets)
 * **New first-class stage** `run.stop_after: qc` (`src/perturbseq_pipeline/basic_qc.py`), driven from `cli.run_pipeline` before Stage 1. Loads per-GEM-well 10x `.h5`/MTX inputs described under a new top-level `samples:` block, computes per-sample expression QC, runs Scrublet per sample, quantifies guides, flags guide-derived multiplets, concatenates, writes QC-level objects and stops. **Nothing is normalised and no doublet or guide multiplet is removed**; `gex_qc_pass` depends only on expression flags.
 * **Config** (`config.py`): `RunConfig.stop_after`, `Config.samples` + `SampleConfig`, `QCConfig.thresholds` (`QCThresholdConfig`: MAD/fixed, floors/ceilings, per-condition mt caps, per-sample overrides), `QCConfig.doublets` (`DoubletConfig`, deliberately without a `remove` switch), `GuideConfig.source/design/fastq/multiplet` (`GuideDesignConfig`, `GuideFastqConfig`, `GuideMultipletConfig`); `^no[-_. ]?target` added to the default `ntc_patterns`; `resolved_mode()` returns `"samples"`.
