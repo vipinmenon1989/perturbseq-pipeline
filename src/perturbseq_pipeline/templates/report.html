@@ -87,6 +87,7 @@
   {% if modules %}<a href="#modules">7. Modules &amp; programs</a>{% endif %}
   {% if distance %}<a href="#distance">8. Perturbation distance</a>{% endif %}
   {% if distance_space %}<a href="#distance_space">9. Distance space</a>{% endif %}
+  <a href="#provenance">Provenance</a>
   <a href="#outputs">Outputs</a>
 </p>
 
@@ -621,6 +622,28 @@ in <code>tables/pair_perturbation_by_target.csv</code>; per-target ECDFs in <cod
 </p>
 <div class="scroll">{{ tables.perturbation_meta }}</div>
 {% endif %}
+
+<!-- ===================== Provenance & module status ===================== -->
+<h2 id="provenance">Run provenance and module status</h2>
+<p class="lede">
+  What ran, from which code, on which inputs. The same facts are written to
+  <code>logs/run_manifest.json</code> together with the resolved configuration in
+  <code>logs/resolved_config.yaml</code>.
+</p>
+{% if provenance_rows %}
+<table>
+  {% for k, v in provenance_rows %}
+  <tr><th style="width:210px">{{ k }}</th><td class="mono">{{ v }}</td></tr>
+  {% endfor %}
+</table>
+{% endif %}
+<h3>Module completion status</h3>
+<p class="lede">
+  <i>completed</i>: the stage ran and produced results; <i>skipped</i>: the stage was
+  enabled but produced nothing (the note says why); <i>disabled</i>: switched off in the
+  configuration. Optional stages are enabled with <code>&lt;section&gt;.enabled</code>.
+</p>
+{{ tables.module_status }}
 
 <!-- ===================== Outputs ===================== -->
 <h2 id="outputs">Outputs</h2>

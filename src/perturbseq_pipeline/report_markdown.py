@@ -135,7 +135,10 @@ def write_markdown_report(inputs: ReportInputs, path: Path) -> Path:
         L += ["## 10. Cluster enrichment", "", T("enrichment", 60), ""]
 
     # ---- reproducibility --------------------------------------------------------------------------
-    L += ["## Outputs and reproducibility", ""] + [f"- {k}: `{v}`" for k, v in inputs.outputs.items()] + ["", f"- resolved configuration: `logs/resolved_config.yaml`; log: `logs/run.log`", f"- package versions: {_versions()}", ""]
+    L += ["## Outputs and reproducibility", ""] + [f"- {k}: `{v}`" for k, v in inputs.outputs.items()] + ["", f"- resolved configuration: `logs/resolved_config.yaml`; run manifest: `logs/run_manifest.json`; log: `logs/run.log`", f"- package versions: {_versions()}", ""]
+    if inputs.provenance_rows:
+        L += ["### Provenance", "", md_table(pd.DataFrame(inputs.provenance_rows, columns=["item", "value"]), 40)]
+    L += ["### Module completion status", "", md_table(inputs.module_status, 40)]
     path = Path(path)
     path.write_text("\n".join(L))
     logger.info("Markdown report written to %s", path)

@@ -49,6 +49,15 @@ import pandas as pd
 
 from . import __version__
 from .config import Config
+from .run_manifest import (
+    STATUS_COMPLETED,
+    STATUS_DISABLED,
+    STATUS_SKIPPED,
+    ModuleStatusTracker,
+    build_run_manifest,
+    manifest_summary_rows,
+    write_run_manifest,
+)
 
 
 logger = logging.getLogger(
@@ -127,6 +136,13 @@ class PipelineResult:
     #: :class:`perturbseq_pipeline.basic_qc.BasicQCResult` when the run
     #: stopped after the basic QC stage.
     basic_qc: object = None
+
+    #: ``logs/run_manifest.json``: git commit, command, inputs, assignment
+    #: mode, seed, enabled modules and per-stage completion status.
+    run_manifest: Optional[Path] = None
+
+    #: One row per stage with its completion status.
+    module_status: Optional[pd.DataFrame] = None
 
     def summary(
         self,
@@ -842,6 +858,28 @@ def run_pipeline(
         Path,
     ] = {}
 
+    status = ModuleStatusTracker(outdir / "logs" / "module_status.json")
+
+    def _finish_manifest(
+        *, lanes=None, execution_mode="", outputs=None, counts=None, runtime=None
+    ):
+        rec = build_run_manifest(
+            cfg,
+            outdir=outdir,
+            status=status,
+            config_path=config_path,
+            lanes=lanes,
+            execution_mode=execution_mode,
+            outputs=outputs,
+            counts=counts,
+            warnings=warnings,
+            runtime_seconds=runtime,
+        )
+        path = write_run_manifest(rec, outdir / "logs" / "run_manifest.json")
+        logger.info("Wrote run manifest %s", path)
+        return rec, path
+
+
     # =====================================================================
     # Basic QC stage (stop_after: qc) — annotate, do not remove; then stop
     # =====================================================================
@@ -850,10 +888,23 @@ def run_pipeline(
         from . import basic_qc as basic_qc_mod
 
         logger.info("=== Basic QC stage (run.stop_after = qc) ===")
+        status.start("basic_qc")
         qc_result = basic_qc_mod.run_basic_qc(
             cfg, outdir, registry, config_path=config_path
         )
+        status.mark(
+            "basic_qc",
+            STATUS_COMPLETED,
+            f"{qc_result.n_cells_all:,} cells loaded, {qc_result.n_cells_pass:,} pass expression QC",
+        )
         profiler.save_csv(tabledir / "compute_profile.csv")
+        _write_table("module_status", status.table(), tabledir, table_paths)
+        _, manifest_path = _finish_manifest(
+            execution_mode="basic_qc",
+            outputs={"Report": str(qc_result.report), "QC h5ad": str(qc_result.pass_h5ad)},
+            counts={"cells_loaded": qc_result.n_cells_all, "cells_expression_qc_pass": qc_result.n_cells_pass, "genes": qc_result.n_genes},
+            runtime=time.time() - start,
+        )
         result = PipelineResult(
             outdir=outdir,
             report=qc_result.report,
@@ -866,6 +917,8 @@ def run_pipeline(
             n_genes=qc_result.n_genes,
             runtime_seconds=time.time() - start,
             execution_mode="basic_qc",
+            run_manifest=manifest_path,
+            module_status=status.table(),
         )
         result.basic_qc = qc_result
         logger.info(
@@ -884,6 +937,7 @@ def run_pipeline(
     logger.info(
         "=== Stage 1/14: loading input ==="
     )
+    status.start("load")
 
     data = io_mod.load_data(
         cfg
@@ -924,6 +978,12 @@ def run_pipeline(
         "input loading",
         cfg=cfg,
     )
+    status.mark(
+        "load",
+        STATUS_COMPLETED,
+        f"{expr.n_obs:,} cells x {expr.n_vars:,} genes from {data.n_lanes} lane(s); guide source: {data.guide_source}",
+    )
+    status.start("qc")
 
     # =====================================================================
     # Stage 2: QC
@@ -1028,6 +1088,12 @@ def run_pipeline(
         cfg=cfg,
         large_mode=large_mode,
     )
+    status.mark(
+        "qc",
+        STATUS_COMPLETED,
+        f"{expr.n_obs:,} of {n_cells_input:,} cells retained; {expr.n_vars:,} genes",
+    )
+    status.start("guide_assignment")
 
     # =====================================================================
     # Stage 3: guide assignment
@@ -1160,6 +1226,13 @@ def run_pipeline(
         cfg=cfg,
         large_mode=large_mode,
     )
+    status.mark(
+        "guide_assignment",
+        STATUS_COMPLETED,
+        f"assignment_mode={cfg.guides.assignment_mode}; "
+        + "; ".join(f"{k}={v:,}" for k, v in expr.obs[guides_mod.OBS_CLASS].value_counts().items()),
+    )
+    status.start("clustering")
 
     # =====================================================================
     # Stage 4: normalization / embedding / clustering
@@ -1332,6 +1405,12 @@ def run_pipeline(
         cfg=cfg,
         large_mode=large_mode,
     )
+    status.mark(
+        "clustering",
+        STATUS_COMPLETED,
+        f"{expr.obs[cluster_mod.CLUSTER_KEY].nunique()} Leiden clusters",
+    )
+    status.start("perturbation")
 
     # =====================================================================
     # Stage 5: perturbation strength
@@ -1417,6 +1496,11 @@ def run_pipeline(
         cfg=cfg,
         large_mode=large_mode,
     )
+    status.mark(
+        "perturbation",
+        STATUS_COMPLETED,
+        f"{len(results.table)} targets tested, {len(results.hits) if not results.table.empty else 0} effective",
+    )
     if pair_mode:
         from . import pair_guide_report as pair_mod
 
@@ -1433,6 +1517,7 @@ def run_pipeline(
     enrichment = None
 
     if cfg.enrichment.enabled:
+        status.start("enrichment")
 
         logger.info(
             "=== Stage 6/14: perturbation enrichment across clusters ==="
@@ -1521,12 +1606,18 @@ def run_pipeline(
             large_mode=large_mode,
         )
 
+        status.mark(
+            "enrichment",
+            STATUS_COMPLETED if not enrichment.table.empty else STATUS_SKIPPED,
+            f"{int(enrichment.table['significant'].sum()) if not enrichment.table.empty else 0} significant target x cluster pairs",
+        )
     else:
 
         logger.info(
             "Cluster enrichment disabled "
             "(enrichment.enabled: false)"
         )
+        status.mark("enrichment", STATUS_DISABLED, "enrichment.enabled: false", enabled=False)
 
     # =====================================================================
     # Stage 7: modules/programs
@@ -1535,6 +1626,7 @@ def run_pipeline(
     modules_result = None
 
     if cfg.modules.enabled:
+        status.start("modules")
 
         logger.info(
             "=== Stage 7/14: co-functional modules & gene programs ==="
@@ -1729,12 +1821,25 @@ def run_pipeline(
                 large_mode=large_mode,
             )
 
+        if modules_result is not None and not modules_result.effect_matrix.empty:
+            status.mark(
+                "modules",
+                STATUS_COMPLETED,
+                f"{modules_result.n_modules} modules, {modules_result.n_programs} programs",
+            )
+        else:
+            status.mark(
+                "modules",
+                STATUS_SKIPPED,
+                getattr(modules_result, "note", "") or "too few perturbations or genes",
+            )
     else:
 
         logger.info(
             "Modules/programs disabled "
             "(modules.enabled: false)"
         )
+        status.mark("modules", STATUS_DISABLED, "modules.enabled: false", enabled=False)
 
     # =====================================================================
     # Stage 8: PS score
@@ -1743,6 +1848,7 @@ def run_pipeline(
     logger.info(
         "=== Stage 8/14: per-cell perturbation scores ==="
     )
+    status.start("ps_score")
 
     ps_results = ps_mod.compute_ps_scores(
         expr,
@@ -1865,6 +1971,12 @@ def run_pipeline(
         warnings.append(
             ps_results.note
         )
+    if not cfg.ps_score.enabled:
+        status.mark("ps_score", STATUS_DISABLED, "ps_score.enabled: false", enabled=False)
+    elif ps_results is not None and not ps_results.summary.empty:
+        status.mark("ps_score", STATUS_COMPLETED, f"{len(ps_results.summary)} targets scored")
+    else:
+        status.mark("ps_score", STATUS_SKIPPED, getattr(ps_results, "note", "") or "no target scored")
 
     # =====================================================================
     # Stage 9: lochNESS
@@ -1873,6 +1985,7 @@ def run_pipeline(
     lochness = None
 
     if cfg.lochness.enabled:
+        status.start("lochness")
 
         logger.info(
             "=== Stage 9/14: lochNESS neighbourhood enrichment ==="
@@ -1965,12 +2078,17 @@ def run_pipeline(
                 lochness.note
             )
 
+        if lochness is not None and not lochness.summary.empty:
+            status.mark("lochness", STATUS_COMPLETED, f"{len(lochness.summary)} targets scored")
+        else:
+            status.mark("lochness", STATUS_SKIPPED, getattr(lochness, "note", "") or "no target scored")
     else:
 
         logger.info(
             "lochNESS disabled "
             "(lochness.enabled: false)"
         )
+        status.mark("lochness", STATUS_DISABLED, "lochness.enabled: false", enabled=False)
 
     # =====================================================================
     # Stage 10: perturbation distance vs control
@@ -1979,6 +2097,7 @@ def run_pipeline(
     distance_results = None
 
     if cfg.distance.enabled:
+        status.start("distance")
 
         logger.info(
             "=== Stage 10/14: perturbation distance vs control ==="
@@ -2045,12 +2164,17 @@ def run_pipeline(
                 distance_results.note
             )
 
+        if distance_results is not None and not distance_results.table.empty:
+            status.mark("distance", STATUS_COMPLETED, f"{len(distance_results.table)} targets tested")
+        else:
+            status.mark("distance", STATUS_SKIPPED, getattr(distance_results, "note", "") or "no target tested")
     else:
 
         logger.info(
             "Perturbation distance disabled "
             "(distance.enabled: false)"
         )
+        status.mark("distance", STATUS_DISABLED, "distance.enabled: false", enabled=False)
 
     # =====================================================================
     # Stage 11: perturbation distance space
@@ -2059,6 +2183,7 @@ def run_pipeline(
     dist_space_results = None
 
     if cfg.distance_space.enabled:
+        status.start("distance_space")
 
         logger.info(
             "=== Stage 11/14: perturbation distance space ==="
@@ -2161,12 +2286,17 @@ def run_pipeline(
                 dist_space_results.note
             )
 
+        if dist_space_results is not None and not dist_space_results.distance_matrix.empty:
+            status.mark("distance_space", STATUS_COMPLETED, f"{len(dist_space_results.distance_matrix)} perturbations in the distance space")
+        else:
+            status.mark("distance_space", STATUS_SKIPPED, getattr(dist_space_results, "note", "") or "too few perturbations")
     else:
 
         logger.info(
             "Perturbation distance space disabled "
             "(distance_space.enabled: false)"
         )
+        status.mark("distance_space", STATUS_DISABLED, "distance_space.enabled: false", enabled=False)
 
     # =====================================================================
     # Stage 12: master perturbation meta table & plots
@@ -2175,6 +2305,7 @@ def run_pipeline(
     meta_table = None
 
     if cfg.meta_analysis.enabled:
+        status.start("meta_analysis")
 
         logger.info(
             "=== Stage 12/14: master perturbation meta table ==="
@@ -2204,6 +2335,14 @@ def run_pipeline(
             tables[
                 "perturbation_meta"
             ] = meta_table
+        status.mark(
+            "meta_analysis",
+            STATUS_COMPLETED if meta_table is not None and not meta_table.empty else STATUS_SKIPPED,
+            f"{0 if meta_table is None else len(meta_table)} targets in tables/perturbation_meta.csv",
+        )
+    else:
+        logger.info("Master perturbation meta table disabled (meta_analysis.enabled: false)")
+        status.mark("meta_analysis", STATUS_DISABLED, "meta_analysis.enabled: false", enabled=False)
 
     # Generate distance and distance space plots
     plots_mod.plot_distance_figures(
@@ -2233,6 +2372,7 @@ def run_pipeline(
     logger.info(
         "=== Stage 13/14: writing outputs ==="
     )
+    status.start("outputs")
 
     manifest = (
         registry.manifest()
@@ -2377,6 +2517,8 @@ def run_pipeline(
         cfg=cfg,
         large_mode=large_mode,
     )
+    status.mark("outputs", STATUS_COMPLETED, str(h5ad_path))
+    status.start("report")
 
     # =====================================================================
     # Stage 14: report
@@ -2459,6 +2601,30 @@ def run_pipeline(
             outdir
             / archive_name
         )
+    outputs["Run manifest"] = str(outdir / "logs" / "run_manifest.json")
+    # The report is the last stage; it is recorded as completed here so the
+    # status table inside the report is final. The manifest is rewritten
+    # once the report file exists.
+    status.mark("report", STATUS_COMPLETED, str(outdir / cfg.output.report_name))
+    module_status = status.table()
+    _write_table("module_status", module_status, tabledir, table_paths)
+    tables["module_status"] = module_status
+    run_counts = {
+        "cells_input": int(n_cells_input),
+        "cells_analysed": int(expr.n_obs),
+        "genes": int(expr.n_vars),
+        "lanes": int(data.n_lanes),
+        "targets_tested": int(len(results.table)),
+        "effective_knockdowns": int(n_hits),
+        "clusters": int(expr.obs[cluster_mod.CLUSTER_KEY].nunique()),
+    }
+    manifest_rec, manifest_path = _finish_manifest(
+        lanes=data.lanes,
+        execution_mode=execution_mode,
+        outputs=outputs,
+        counts=run_counts,
+        runtime=time.time() - start,
+    )
 
     summary_cards = [
         (
@@ -2533,6 +2699,8 @@ def run_pipeline(
             )
         ),
         outputs=outputs,
+        module_status=module_status,
+        provenance_rows=manifest_summary_rows(manifest_rec),
     )
 
     report_path = (
@@ -2573,6 +2741,15 @@ def run_pipeline(
         expr.n_obs,
         n_cells_input,
     )
+    if archive_path:
+        outputs["Results archive"] = str(archive_path)
+    manifest_rec, manifest_path = _finish_manifest(
+        lanes=data.lanes,
+        execution_mode=execution_mode,
+        outputs=outputs,
+        counts=run_counts,
+        runtime=runtime,
+    )
 
     result = PipelineResult(
         outdir=outdir,
@@ -2597,6 +2774,8 @@ def run_pipeline(
         meta_table=meta_table,
         compute_profile=profile_df if not profile_df.empty else None,
         execution_mode=execution_mode,
+        run_manifest=manifest_path,
+        module_status=module_status,
     )
 
     logger.info(

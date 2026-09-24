@@ -71,6 +71,10 @@ class ReportInputs:
     metadata_source: str = ""
     guide_source_text: str = ""
     outputs: Dict[str, str] = field(default_factory=dict)
+    #: One row per stage: module, status (completed / skipped / disabled), note.
+    module_status: Optional[pd.DataFrame] = None
+    #: ``(label, value)`` pairs from the run manifest (git commit, command, seed, ...).
+    provenance_rows: List[tuple] = field(default_factory=list)
 
 
 def _df_to_html(df: Optional[pd.DataFrame], max_rows: int = 200) -> str:
@@ -174,6 +178,7 @@ def build_report(inputs: ReportInputs, path: Path) -> Path:
             "perturbation_space_coordinates",
         )
     }
+    tables_html["module_status"] = _df_to_html(inputs.module_status, 50)
     tables_html["outputs"] = _df_to_html(
         pd.DataFrame(
             [{"deliverable": k, "path": v} for k, v in inputs.outputs.items()]
@@ -460,6 +465,7 @@ def build_report(inputs: ReportInputs, path: Path) -> Path:
         n_figures=len(reg.records),
         config_yaml=_config_yaml(cfg),
         versions=_versions(),
+        provenance_rows=inputs.provenance_rows,
     )
 
     path = Path(path)
