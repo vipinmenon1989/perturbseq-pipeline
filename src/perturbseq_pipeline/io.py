@@ -34,6 +34,9 @@ LANE_KEY = "lane_id"
 #: ``obs`` column holding a pre-computed per-cell guide label, when the input
 #: supplies one instead of a guide count matrix.
 RAW_GUIDE_LABEL = "guide_id_raw"
+#: ``obs`` column preserving the original 10x cell barcode when cell ids are
+#: rewritten (``input.cell_id_format: prefix``).
+BARCODE_KEY = "cell_barcode"
 
 
 @dataclass
@@ -154,6 +157,31 @@ def _load_mtx(cfg: Config) -> LoadedData:
             guides_all.var = gvar_backup.loc[guides_all.var_names]
 
     adata.var_names_make_unique()
+
+    if cfg.input.cell_id_format == "prefix":
+        # ``<lane>_<barcode>``: identical for single-lane and combined runs, so a
+        # per-lane object is an exact row subset of the combined object.
+        lane_of = adata.obs[LANE_KEY].astype(str).to_numpy()
+        if len(lanes) == 1:
+            bare = adata.obs_names.to_numpy().astype(str)
+        else:
+            # strip the "-<lane>" suffix appended by sc.concat(index_unique="-")
+            bare = np.array(
+                [
+                    n[: -(len(l) + 1)] if n.endswith("-" + l) else n
+                    for n, l in zip(adata.obs_names, lane_of)
+                ],
+                dtype=object,
+            )
+        new_names = pd.Index([f"{l}_{b}" for l, b in zip(lane_of, bare)])
+        if not new_names.is_unique:
+            raise ValueError("input.cell_id_format=prefix produced non-unique cell ids")
+        rename = dict(zip(adata.obs_names, new_names))
+        adata.obs_names = new_names
+        adata.obs[BARCODE_KEY] = pd.Index(bare).astype(str)
+        if guides_all is not None:
+            guides_all.obs_names = pd.Index([rename[n] for n in guides_all.obs_names])
+        logger.info("Cell ids use the '<lane>_<barcode>' prefix format (e.g. %s)", new_names[0])
 
     if guides_all is not None:
         # Expression and guides came from separate quantifications; nothing was

@@ -71,6 +71,10 @@ class InputConfig:
     #: notebooks (``sc.read_10x_mtx`` default).
     var_names: str = "gene_symbols"
     cache_mtx: bool = True
+    #: How cells from several MTX lanes are made unique: ``suffix`` (historical,
+    #: ``<barcode>-<lane>``) or ``prefix`` (``<lane>_<barcode>``). Applied to
+    #: single-lane runs too so per-lane and combined objects share one id scheme.
+    cell_id_format: str = "suffix"
     #: h5ad mode only. Name of the layer holding raw counts, when they are not
     #: in ``X`` (Seurat exports often put counts in ``X`` and log-normalized
     #: values in ``layers['logcounts']``).
@@ -603,6 +607,8 @@ class Config:
                     f"input.guide_mtx_dirs has lane(s) not in input.mtx_dirs: "
                     f"{sorted(extra)}"
                 )
+        if inp.cell_id_format not in ("suffix", "prefix"):
+            raise ValueError("input.cell_id_format must be 'suffix' or 'prefix'")
         if inp.mode == "h5ad" and not has_h5ad:
             raise ValueError("input.mode is 'h5ad' but input.h5ad is not set")
         if inp.mode == "auto":
