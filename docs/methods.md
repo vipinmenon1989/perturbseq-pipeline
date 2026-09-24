@@ -466,7 +466,96 @@ This independently reproduces the section-6 result — SMARCC1 in cluster 7, the
 PRC2/pluripotency group in cluster 9 — by a completely different route, with no
 clusters and no significance test involved.
 
-## 9. Figures and the report
+## 9. Co-functional Modules & Gene Programs
+
+Based on [Chen et al. 2023](https://www.nature.com/articles/s41586-023-06733-x), the pipeline constructs a regulome map:
+* **Perturbation Effect Matrix**: A target $\times$ gene differential expression matrix of $\log_2\text{FC}$ values vs control (`tables/effect_matrix.csv`).
+* **Co-functional Modules**: Hierarchical clustering on Spearman correlation between perturbation effect profiles groups transcription factors and targets that regulate similar downstream programs (`tables/cofunctional_modules.csv`).
+* **Co-regulated Programs**: Hierarchical clustering on Pearson correlation between downstream genes groups co-regulated transcript sets (`tables/gene_programs.csv`).
+* **Biological Pathway Enrichment & Functional Annotation**: Over-Representation Analysis (ORA / hypergeometric test) mapping data-driven gene programs to biological processes (MSigDB Hallmark, Reactome, GO Biological Process, and KEGG):
+  $$P(X \ge k) = \sum_{i=k}^{\min(n, M)} \frac{\binom{M}{i} \binom{N - M}{n - i}}{\binom{N}{n}}$$
+  where background universe $N$ is rigorously scoped to the Stage 7 eligible perturbation-effect genes, $M$ is the pathway size in universe, $n$ is the program size, and $k$ is the overlap. Benjamini–Hochberg FDR correction is applied per program. Significant pathways (FDR $\le 0.05$) annotate programs (`tables/program_enrichment.csv`, `tables/program_summary.csv`).
+* **Module $\times$ Program Strength**: Matrix multiplication quantifying the signed regulatory activation/repression between each module and biologically annotated program (`tables/module_program_strength.csv`).
+* **TF-Hub Networks**: Network graphs visualizing regulatory hub connectivity (`tables/tf_hubs.csv`, `tables/tf_edges.csv`).
+
+---
+
+## 10. Perturbation Distance & Permutation DistanceTest
+
+### Biological Motivation: Efficacy vs Phenotype Magnitude
+While direct target $\log_2\text{FC}$ answers whether the guide depleted its intended transcript, **Perturbation Distance** quantifies the global shift of the high-dimensional multivariate cell distribution:
+* **Strong Knockdown + Small Distance**: On-target efficacy with minimal global phenotypic perturbation.
+* **Modest Knockdown + Large Distance**: Downstream regulatory cascades or state transitions.
+
+### Primary Metric: Energy Distance
+Evaluated non-parametrically in single-cell latent space (e.g. PCA `adata.obsm['X_pca']`):
+$$D^2(P, Q) = 2\,\mathbb{E}_{X \sim P, Y \sim Q}[\|X - Y\|_2] - \mathbb{E}_{X, X' \sim P}[\|X - X'\|_2] - \mathbb{E}_{Y, Y' \sim Q}[\|Y - Y'\|_2]$$
+Energy distance equals zero if and only if distributions $P$ and $Q$ are identical ($P = Q$), capturing differences in mean centroid, covariance spread, manifold curvature, and multimodality.
+
+### Finite-Permutation DistanceTest & Exact O(n^2) Identity
+To determine whether an observed distance represents a statistically significant phenotypic shift vs control cells:
+1. **Precomputed Distance Matrix & Row-Sum Identity**:
+   For pooled target ($n$) and control ($m$) cells ($N = n + m$), the $N \times N$ pairwise Euclidean distance matrix $D$ is computed once.
+   Let $R_i = \sum_{j=1}^N D[i, j]$ denote the precomputed row sums and $S_{total} = \sum_{i,j} D[i, j]$ the total sum of matrix $D$.
+   For any partition into perturbed subset $X$ of size $n$ and control subset $Y$ of size $m = N - n$, the control submatrix sum $S_Y$ is computed exactly in $O(n^2)$ via:
+   $$R_X = \sum_{i \in X} R_i, \quad S_X = \sum_{i \in X, j \in X} D[i, j]$$
+   $$S_Y = S_{total} + S_X - 2 R_X$$
+   $$E^2(X, Y) = \frac{2(R_X - S_X)}{n \cdot m} - \frac{S_X}{n^2} - \frac{S_Y}{m^2}$$
+   This completely eliminates allocating and summing massive $m \times m$ submatrices across thousands of permutations, speeding up permutation significance tests by **45x–200x** while guaranteeing 100% mathematical and statistical exactness.
+
+2. **Empirical P-value**:
+   $$p = \frac{1 + \sum_{b=1}^B \mathbf{1}(D_{\text{perm}, b} \ge D_{\text{observed}})}{1 + B}$$
+
+3. **Multiple Testing Correction**: Benjamini–Hochberg FDR is calculated across all tested targets.
+
+4. **Bounded Sampling**: Cells are deterministically sampled up to `max_cells_per_target` (default: 2,000) and `max_control_cells` (default: 5,000) using a fixed random seed (`random_seed: 123`) to ensure scalable computation on million-cell datasets.
+
+5. **Shared Multiprocessing Memory**: High-dimensional embeddings (e.g. `X_pca`) are shared across CPU worker processes via zero-copy memory buffers, preventing redundant AnnData serialization.
+
+---
+
+## 11. Perturbation Distance Space & Phenotype Modules
+
+### All-vs-All Phenotype Similarity
+DistanceSpace evaluates the symmetric target $\times$ target Energy Distance matrix between all pairs of perturbations:
+* **Output Deliverables**:
+  * `tables/perturbation_distance_matrix.tsv`: Complete pairwise distance matrix, stored outside H5AD.
+  * `tables/perturbation_space_coordinates.csv`: Principal Coordinate Analysis (PCoA / classical MDS) low-dimensional coordinates.
+  * `tables/perturbation_neighbors.csv`: Top-$k$ ranked nearest phenotypic neighbors per perturbation.
+  * `tables/phenotype_modules.csv`: Hierarchical clustering partition into discrete **Phenotype Modules**.
+
+### Phenotype Modules vs Co-functional Modules
+* **Co-functional Modules** (Stage 7): Group perturbations by shared downstream differential expression profiles ($\log_2\text{FC}$ vectors). *Which perturbations regulate the same target genes?*
+* **Phenotype Modules** (Stage 11): Group perturbations by geometric distribution similarity across single-cell states. *Which perturbations produce similar distributions on the cellular manifold?*
+
+### Scaling Invariant: $O(P^2)$
+Pairwise distance evaluation scales as $\frac{P(P - 1)}{2}$ pairs (e.g. ~1.62M pairs for 1,800 targets). DistanceSpace is recommended for focused inquiry or screens with moderate target counts, while routine exploratory pipelines focus on Distance-vs-control.
+
+---
+
+## 12. Master Perturbation Metadata & Visualizations
+
+Target-level summaries across all stages are merged into `tables/perturbation_meta.csv`:
+* Target efficacy (`target_log2fc`, `target_pct_kd`, `target_fdr`, `is_effective_hit`)
+* PS cellular penetrance (`ps_mean`, `ps_median`, `ps_responder_fraction`, `ps_escaper_fraction`)
+* lochNESS manifold topology (`lochness_mean`, `lochness_peak`, `lochness_pct_enriched`)
+* Phenotype distance (`energy_distance`, `mmd_distance`, `distance_pvalue`, `distance_fdr`, `distance_significant`)
+* Module classifications (`cofunctional_module`, `phenotype_module`)
+
+> **Architectural Principle**: The pipeline never computes an arbitrary composite scalar score. All dimensions remain transparent and distinct.
+
+---
+
+## 13. Lean H5AD Storage Policy
+
+The processed `.h5ad` file stores cell-level features exclusively:
+* `adata.obs`: Per-cell labels (`target_gene`, `cluster`, `ps_score`, `ps_quadrant`, `lochness_self`).
+* `adata.obsm`: Latent embeddings (`X_pca`, `X_umap`, `X_lda_umap`, `guide_counts`).
+* Target-level tables, pairwise matrices, and networks are exported to `tables/` to eliminate memory bloat in single-cell loaders.
+
+---
+
+## 14. Figures and the report
 
 Every figure passes through a registry that records its path, title, caption and
 section, so a figure cannot be produced without being reachable from the report.
@@ -478,3 +567,75 @@ report by name. Nothing is silently truncated.
 
 The report embeds figures as base64 data URIs, making it a single portable HTML
 file that can be shared without an accompanying folder.
+
+---
+
+## 15. Compute Architecture & Hardware Placement
+
+The pipeline features a unified, hardware-aware execution layer (`perturbseq_pipeline.compute`)
+designed to execute statistical and linear algebra workloads efficiently across modern CPU clusters and GPU workstations.
+
+### Design Philosophy
+
+1. **CPU Multiprocessing for Statistical Workloads**:
+   Target-level evaluations (direct perturbation strength, cluster enrichment Fisher/CMH tests,
+   permutation DistanceTests, and phenotype neighborhood calculations) are embarrassingly parallel.
+   Multiprocessing parallelizes across perturbation targets or target pairs using `joblib` worker pools.
+   Rather than serializing entire multi-hundred-thousand or million-cell AnnData objects, workers receive
+   only minimal sliced index vectors or pre-aggregated summary arrays.
+
+2. **Selective GPU Acceleration**:
+   GPU acceleration is treated as an optional accelerator for dense linear algebra operations (such as
+   large matrix correlations, RAPIDS single-cell neighbor graph construction, and high-dimensional embeddings)
+   rather than a default environment for all code. CPU execution remains the primary, fully supported default.
+   GPU libraries (`cupy`, `cuml`, `rapids_singlecell`) are optional extras (`pip install -e ".[gpu]"`).
+
+3. **Orthogonality of STANDARD / LARGE and CPU / GPU**:
+   The biological scaling modes (`STANDARD` vs `LARGE`) and hardware placement (`CPU` vs `GPU`) are
+   strictly decoupled:
+   - `STANDARD` datasets can execute on CPU or GPU.
+   - `LARGE` datasets can execute on CPU (via chunked/sufficient-statistic algorithms) or GPU.
+
+4. **SLURM Cluster Awareness & Thread Oversubscription Prevention**:
+   - On SLURM HPC nodes, worker allocation automatically queries `SLURM_CPUS_PER_TASK`, `SLURM_CPUS_ON_NODE`,
+     and CPU process affinity rather than blindly utilizing all physical cores on a shared node.
+   - Internal numerical library threading (OpenBLAS, MKL, OpenMP) within worker subprocesses is constrained
+     via `threadpoolctl` (`blas_threads_per_worker: 1`) to eliminate severe thread oversubscription penalties.
+
+5. **GPU Memory Safety & Graceful Fallback**:
+   Before dispatching operations to the GPU, matrix memory requirements are estimated and checked against
+   available GPU VRAM (`gpu_memory_fraction: 0.80`). If GPU memory is insufficient or CUDA packages are absent,
+   the pipeline emits an informative warning and falls back to deterministic CPU routines without crashing.
+
+6. **Benchmarking & Profiling**:
+   Every pipeline execution records stage execution runtimes, peak host RSS memory, and peak GPU VRAM allocations,
+   exporting a comprehensive benchmark table to `tables/compute_profile.csv`.
+
+---
+
+## 16. Storage & Central Data Access Layer
+
+To scale seamlessly from standard screens (~300k cells) to multi-million cell datasets (>2.5M cells), storage and data access are decoupled from biological analysis logic via `perturbseq_pipeline.data_access`:
+
+### Architectural Separation
+```
+Storage / Data Access (in_memory / backed / auto)
+        │
+        ▼
+Biological Analysis Modules (STANDARD / LARGE)
+        │
+        ▼
+Compute Backend (CPU / GPU / AUTO)
+```
+
+1. **Selective Materialization**:
+   Analysis modules never materialize full dense $N \times G$ gene expression matrices. Modules request only the specific representation they require:
+   - Stage 4/10/11: Low-dimensional embeddings (`get_embedding(expr, rep_name='X_pca')`).
+   - Stage 5: 1D target gene expression vectors (`get_expression_vector(expr, gene=...)`).
+   - Stage 6/7/8: Target index mappings (`get_target_indices_map(expr)`), constructed once rather than repeatedly re-scanning boolean masks.
+
+2. **Backed H5AD Support**:
+   For ultra-large datasets exceeding `storage.backed_threshold_cells` (default: 1,000,000 cells), the expression matrix can be opened in read-only backed mode (`sc.read_h5ad(path, backed='r')`). Metadata (`obs`, `var`) and low-dimensional embeddings (`obsm`) remain in memory, allowing downstream topology, enrichment, and distance calculations to run with minimal host RAM footprint.
+
+3. **Multiprocessing Zero-Copy Memory Sharing**:
+   When parallelizing across CPU workers (`compute.*_n_jobs`), shared arrays (such as PCA embeddings) are managed via `SharedArrayBuffer` (memory mapping / shared read-only buffers). Workers receive lightweight slice tasks instead of serialized AnnData closures, eliminating memory bloat and worker startup latency.

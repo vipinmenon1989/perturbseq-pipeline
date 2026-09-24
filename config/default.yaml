@@ -45,17 +45,20 @@ guides:
   dominance_ratio: 2.0
   max_second_umi: -1
   detection_threshold: 3
+  target_feature_column: null
+  ignored_target_values:
+  - Ignore
   target_regex: null
   target_split_delims:
   - _
   - '-'
   - .
   ntc_patterns:
-  - ^non[-_.]?targeting
+  - ^non[-_. ]?targeting
   - ^non$
   - ^ntc
   - scramble
-  - ^safe[-_.]?harbor
+  - ^safe[-_. ]?harbor
   unassigned_label: unassigned
   ambiguous_label: ambiguous
   ntc_label: non-targeting
@@ -120,6 +123,20 @@ modules:
   min_perturbations: 5
   min_genes: 10
   top_n_report: 12
+  program_enrichment:
+    enabled: true
+    method: ora
+    species: human
+    sources:
+    - hallmark
+    - reactome
+    - go_bp
+    custom_gmt_files: {}
+    fdr_alpha: 0.05
+    min_overlap: 2
+    min_genes: 5
+    max_genes: 1500
+    top_terms_per_program: 5
 ps_score:
   enabled: true
   require: false
@@ -135,6 +152,8 @@ ps_score:
   lda_n_pcs: 40
   lda_max_genes: 5000
   lda_highlight_threshold: 0.8
+  lda_large_max_cells: 200000
+  lda_large_stratified: true
 lochness:
   enabled: true
   genotype_key: target_gene
@@ -146,6 +165,74 @@ lochness:
   enrichment_cut: 0.5
   noise_delta: 0.0
   top_n_report: 12
+  target_chunk_size: 128
+  store_all_target_scores: true
+  max_targets_in_obs: 500
+distance:
+  enabled: true
+  representation: X_pca
+  primary_metric: edistance
+  secondary_metric: mmd
+  min_cells: 30
+  max_cells_per_target: 2000
+  max_control_cells: 5000
+  n_permutations: 1000
+  random_seed: 123
+  fdr_threshold: 0.05
+  stratify_by: null
+distance_space:
+  enabled: true
+  metric: edistance
+  representation: X_pca
+  n_components: 10
+  nearest_neighbors: 10
+  clustering: true
+  n_modules: null
+  cluster_distance_threshold: null
+  linkage_method: average
+  min_cells: 30
+  max_cells_per_target: 2000
+  random_seed: 123
+meta_analysis:
+  enabled: true
+visualization:
+  perturbation_atlas: true
+  ps_distance_map: true
+  perturbation_space: true
+  module_concordance: true
+  atlas_top_n: 50
+scaling:
+  mode: auto
+  large_n_cells: 1000000
+  large_n_perturbations: 5000
+  marker_max_cells: 200000
+  effect_gene_chunk: 256
+  guide_chunk_size: 20000
+  guide_max_dense_elements: 20000000
+  collect_between_stages: true
+  log_memory: true
+  report_preview_rows: 500
+compute:
+  backend: auto
+  n_jobs: 16
+  gpu_device: 0
+  gpu_min_cells: 200000
+  gpu_min_dense_elements: 50000000
+  gpu_memory_fraction: 0.8
+  cpu_parallel_backend: loky
+  blas_threads_per_worker: 1
+  distance_n_jobs: null
+  perturbation_n_jobs: null
+  enrichment_n_jobs: null
+  modules_n_jobs: null
+  lochness_n_jobs: null
+  log_backend_decisions: true
+storage:
+  mode: auto
+  backed_threshold_cells: 1000000
+  prefer_backed_h5ad: true
+  keep_embeddings_in_memory: true
+  shared_worker_arrays: true
 report:
   title: Perturb-seq analysis report
   embed_figures: true

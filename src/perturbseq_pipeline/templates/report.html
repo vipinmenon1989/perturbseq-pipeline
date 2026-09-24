@@ -85,6 +85,8 @@
   {% if ps %}<a href="#ps">5. Per-cell response</a>{% endif %}
   {% if lochness %}<a href="#lochness">6. lochNESS</a>{% endif %}
   {% if modules %}<a href="#modules">7. Modules &amp; programs</a>{% endif %}
+  {% if distance %}<a href="#distance">8. Perturbation distance</a>{% endif %}
+  {% if distance_space %}<a href="#distance_space">9. Distance space</a>{% endif %}
   <a href="#outputs">Outputs</a>
 </p>
 
@@ -412,15 +414,15 @@
   both axes: perturbations into <b>{{ modules.n_modules }} co-functional modules</b>
   ({{ modules.module_correlation }}-correlation) and downstream genes into
   <b>{{ modules.n_programs }} co-regulated programs</b> ({{ modules.program_correlation }}-correlation,
-  {{ modules.linkage }} linkage). Module (M) and program (P) ids are arbitrary cluster labels — see
-  the tables for their member TFs / top genes; they are not biological names.
+  {{ modules.linkage }} linkage). Gene programs are biologically annotated via Over-Representation
+  Analysis (ORA / hypergeometric test) against MSigDB Hallmark, Reactome, and Gene Ontology collections.
 </p>
 
 <div class="note">
-  <b>How the effect is measured.</b> Each entry is a pseudobulk mean-difference log2FC of a gene
-  between a perturbation's cells and the {{ modules.control_label }} control (the same quantity the
-  perturbation test reports). Gene selection uses cluster markers. The number of modules/programs is
-  a chosen parameter, not inferred — read the clusters as an exploratory grouping.
+  <b>Biological Interpretation:</b> Program identifiers (<code>P1</code>, <code>P2</code>, &hellip;) remain authoritative
+  while biological labels reflect significant pathway enrichment (FDR &le; 0.05). Perturbation modules
+  (<code>M1</code>, <code>M2</code>, &hellip;) are interpreted through their signed regulatory effects on these
+  annotated programs.
 </div>
 
 <div class="cards">
@@ -430,16 +432,83 @@
   <div class="card"><div class="v">{{ modules.top_hub }}</div><div class="k">Top hub TF ({{ modules.top_hub_n }} DE genes)</div></div>
 </div>
 
-<h3>7.1 The regulome map</h3>
+<h3>7.1 The regulome map &amp; pathway enrichment</h3>
 {% for f in figures.modules %}{{ render_figure(f) }}{% endfor %}
 
-<h3>7.2 Co-functional modules (perturbations)</h3>
+<h3>7.2 Gene programs &amp; biological pathway annotations</h3>
+{% if modules.programs %}
+<div class="programs-container" style="margin-bottom: 1.5rem;">
+  {% for p in modules.programs %}
+  <div class="program-card" style="border: 1px solid #e2e8f0; border-radius: 6px; padding: 1rem; margin-bottom: 1rem; background: #fafafa;">
+    <h4 style="margin: 0 0 0.5rem 0; color: #1e293b;">
+      <b>{{ p.display_label }}</b>
+      <span style="font-size: 0.85em; font-weight: normal; color: #64748b;">({{ p.all_genes_count }} member genes)</span>
+    </h4>
+    <div style="font-size: 0.9em; margin-bottom: 0.5rem;">
+      <b>Top genes:</b> <code style="font-size: 0.85em;">{{ p.top_genes|join(', ') }}{% if p.all_genes_count > 10 %}, &hellip;{% endif %}</code>
+    </div>
+    {% if p.top_pathways %}
+    <div style="font-size: 0.9em;">
+      <b>Top enriched pathways:</b>
+      <ul style="margin: 0.25rem 0 0 1.25rem; padding: 0;">
+        {% for pw in p.top_pathways %}
+        <li>
+          <b>{{ pw.clean_term }}</b> (<code>{{ pw.source }}</code>) &mdash; FDR: <b>{{ pw.fdr }}</b>, overlap: {{ pw.overlap_count }} genes
+        </li>
+        {% endfor %}
+      </ul>
+    </div>
+    {% else %}
+    <div style="font-size: 0.9em; color: #64748b; font-style: italic;">No significant pathway enrichment (FDR &gt; 0.05).</div>
+    {% endif %}
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+
+{% if tables.program_summary %}
+<h4>7.2.1 Program summary table</h4>
+<div class="scroll">{{ tables.program_summary }}</div>
+{% else %}
+<div class="scroll">{{ tables.gene_programs }}</div>
+{% endif %}
+
+{% if tables.program_enrichment %}
+<h4>7.2.2 Full pathway enrichment table</h4>
+<div class="scroll">{{ tables.program_enrichment }}</div>
+{% endif %}
+
+<h3>7.3 Co-functional perturbation modules</h3>
+{% if modules.modules_list %}
+<div class="modules-container" style="margin-bottom: 1.5rem;">
+  {% for m in modules.modules_list %}
+  <div class="module-card" style="border: 1px solid #e2e8f0; border-radius: 6px; padding: 0.75rem 1rem; margin-bottom: 0.75rem; background: #fff;">
+    <h4 style="margin: 0 0 0.35rem 0;">
+      <b>Module {{ m.module_id }}</b>
+      <span style="font-size: 0.85em; font-weight: normal; color: #64748b;">({{ m.n_targets }} perturbations: <code>{{ m.members[:8]|join(', ') }}{% if m.n_targets > 8 %}, &hellip;{% endif %}</code>)</span>
+    </h4>
+    <div style="font-size: 0.88em;">
+      {% if m.positive_programs %}
+      <span style="color: #b91c1c; font-weight: 500;">Activates:</span>
+      {% for p_label, val in m.positive_programs %}<b>{{ p_label }}</b> (+{{ "%.2f"|format(val) }}){% if not loop.last %}, {% endif %}{% endfor %}
+      {% endif %}
+      {% if m.positive_programs and m.negative_programs %} | {% endif %}
+      {% if m.negative_programs %}
+      <span style="color: #1d4ed8; font-weight: 500;">Represses:</span>
+      {% for p_label, val in m.negative_programs %}<b>{{ p_label }}</b> ({{ "%.2f"|format(val) }}){% if not loop.last %}, {% endif %}{% endfor %}
+      {% endif %}
+      {% if not m.positive_programs and not m.negative_programs %}
+      <span style="color: #64748b; font-style: italic;">Neutral regulatory profile across gene programs.</span>
+      {% endif %}
+    </div>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+
 <div class="scroll">{{ tables.cofunctional_modules }}</div>
 
-<h3>7.3 Gene programs</h3>
-<div class="scroll">{{ tables.gene_programs }}</div>
-
-<h3>7.4 Module &rarr; program strength</h3>
+<h3>7.4 Module &rarr; program regulatory strength</h3>
 <div class="scroll">{{ tables.module_program_strength }}</div>
 
 <h3>7.5 Hub transcription factors</h3>
@@ -461,6 +530,67 @@
   </div>
 </div>
 {% endif %}
+{% endif %}
+
+<!-- ===================== 8. Perturbation distance ===================== -->
+{% if distance %}
+<h2 id="distance">8. Perturbation distance vs control</h2>
+<p class="lede">
+  Quantifies the high-dimensional phenotypic displacement (in PCA space) between cells carrying each
+  perturbation and unperturbed control cells using <b>Energy Distance</b> (and optional MMD).
+  Statistical significance is assessed via a finite-permutation <b>DistanceTest</b> followed by
+  Benjamini–Hochberg FDR correction.
+</p>
+
+<div class="cards">
+  <div class="card"><div class="v">{{ distance.n_targets }}</div><div class="k">Targets tested</div></div>
+  <div class="card"><div class="v">{{ distance.n_hits }}</div><div class="k">Significant (FDR &lt; {{ distance.fdr_threshold }})</div></div>
+  <div class="card"><div class="v">{{ distance.top_target }}</div><div class="k">Max distance ({{ distance.top_distance }})</div></div>
+  <div class="card"><div class="v">{{ distance.primary_metric }}</div><div class="k">Primary metric</div></div>
+</div>
+
+<h3>8.1 Perturbation overview and atlas</h3>
+{% for f in figures.distance %}{{ render_figure(f) }}{% endfor %}
+
+<h3>8.2 Target-level distance statistics</h3>
+<div class="scroll">{{ tables.perturbation_distance }}</div>
+{% endif %}
+
+<!-- ===================== 9. Distance space & Phenotype modules ===================== -->
+{% if distance_space %}
+<h2 id="distance_space">9. Perturbation distance space &amp; phenotype modules</h2>
+<p class="lede">
+  Constructs a pairwise target &times; target phenotypic distance matrix, projects perturbations
+  into low-dimensional coordinates via classical <b>PCoA</b> (retaining positive eigenvalues),
+  identifies nearest phenotypic neighbors, and clusters perturbations into distinct <b>Phenotype Modules</b>.
+</p>
+
+<div class="cards">
+  <div class="card"><div class="v">{{ distance_space.n_targets }}</div><div class="k">Perturbations mapped</div></div>
+  <div class="card"><div class="v">{{ distance_space.n_modules }}</div><div class="k">Phenotype modules</div></div>
+  <div class="card"><div class="v">{{ distance_space.n_components }}</div><div class="k">PCoA dimensions</div></div>
+  <div class="card"><div class="v">{{ distance_space.linkage }}</div><div class="k">Linkage method</div></div>
+</div>
+
+<h3>9.1 Phenotype space and concordance</h3>
+{% for f in figures.distance_space %}{{ render_figure(f) }}{% endfor %}
+
+<h3>9.2 Phenotype module assignments</h3>
+<div class="scroll">{{ tables.phenotype_modules }}</div>
+
+<h3>9.3 Nearest phenotypic neighbors</h3>
+<div class="scroll">{{ tables.perturbation_neighbors }}</div>
+{% endif %}
+
+<!-- ===================== 10. Master perturbation meta table ===================== -->
+{% if tables.perturbation_meta %}
+<h2>10. Master perturbation meta table</h2>
+<p class="lede">
+  Merged reference table across all orthogonal biological dimensions: efficacy (log2FC, FDR),
+  penetrance (PS score, responder fractions), manifold topology (lochNESS enrichment),
+  phenotype magnitude (Energy distance, FDR), and biological organization (co-functional and phenotype modules).
+</p>
+<div class="scroll">{{ tables.perturbation_meta }}</div>
 {% endif %}
 
 <!-- ===================== Outputs ===================== -->
