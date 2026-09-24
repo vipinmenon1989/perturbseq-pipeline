@@ -193,6 +193,7 @@ def test_small_groups_skipped_and_reported():
     """Targets below min_cells should be skipped cleanly and recorded in skipped table."""
     expr = _create_synthetic_anndata()
     cfg = Config()
+    cfg.distance.enabled = True  # optional stage, off by default
     cfg.distance.min_cells = 50
     cfg.distance.n_permutations = 100
 
@@ -218,6 +219,7 @@ def test_distance_space_symmetry_and_zero_diagonal():
     """DistanceSpace must produce a symmetric matrix with 0 diagonal."""
     expr = _create_synthetic_anndata()
     cfg = Config()
+    cfg.distance_space.enabled = True  # optional stage, off by default
     cfg.distance_space.min_cells = 30
 
     res = compute_distance_space(expr, cfg)
@@ -255,6 +257,7 @@ def test_nearest_neighbors_ranking():
     """Nearest neighbors should return closest phenotypic targets excluding self."""
     expr = _create_synthetic_anndata()
     cfg = Config()
+    cfg.distance_space.enabled = True  # optional stage, off by default
     cfg.distance_space.min_cells = 30
     cfg.distance_space.nearest_neighbors = 2
 

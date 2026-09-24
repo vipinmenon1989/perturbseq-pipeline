@@ -336,12 +336,14 @@ def test_distance_serial_vs_parallel_equivalence(synthetic_perturbation_adata):
     adata = synthetic_perturbation_adata
 
     cfg_serial = Config()
+    cfg_serial.distance.enabled = True  # optional stage, off by default
     cfg_serial.compute.n_jobs = 1
     cfg_serial.distance.min_cells = 5
     cfg_serial.distance.n_permutations = 50
     cfg_serial.distance.random_seed = 42
 
     cfg_parallel = Config()
+    cfg_parallel.distance.enabled = True
     cfg_parallel.compute.n_jobs = 2
     cfg_parallel.distance.min_cells = 5
     cfg_parallel.distance.n_permutations = 50

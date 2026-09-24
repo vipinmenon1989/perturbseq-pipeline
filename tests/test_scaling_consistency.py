@@ -515,6 +515,7 @@ def test_scaling_mode_auto_switches_on_perturbation_count():
 def test_lochness_large_mode_avoids_full_score_matrix(consistency_adata):
     """In LARGE mode, lochNESS must compute lochness_self without populating full per-target columns."""
     cfg = Config()
+    cfg.lochness.enabled = True  # optional stage, off by default
     cfg.scaling.mode = "large"
     cfg.lochness.min_cells_per_target = 5
     cfg.lochness.n_neighbors = 15
