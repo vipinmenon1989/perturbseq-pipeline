@@ -16,6 +16,9 @@ input:
   - CRISPR Guide Capture
   var_names: gene_symbols
   cache_mtx: true
+  # suffix (<barcode>-<lane>, historical) or prefix (<lane>_<barcode>); prefix
+  # gives a single-lane run the same cell ids as the combined run.
+  cell_id_format: suffix
   counts_layer: null
   normalized_layer: null
   guide_table: null
