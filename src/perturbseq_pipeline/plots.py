@@ -1,11 +1,33 @@
 """All figures produced by the pipeline.
 
-Every figure goes through :class:`FigureRegistry`, which writes the file *and*
+Every figure goes through :class:`FigureRegistry`, which writes the file and
 records its title, caption and section. The report builder then renders whatever
-is registered, so a figure can never be produced without being reachable: those
-not shown inline are still written to disk and linked from the report.
+is registered.
 
 Library code never calls ``plt.show()``; the Agg backend is forced on import.
+
+Large-dataset plotting
+----------------------
+The statistical pipeline may contain millions of cells and thousands of
+perturbations, but plotting every cell and creating one image for every target
+does not add analytical information.
+
+For ordinary datasets the original plotting behaviour is preserved.
+
+For large datasets, plotting automatically becomes bounded:
+
+* scatter/UMAP panels use a reproducible subset of cells;
+* QC distributions use a representative cell subset;
+* overview target rankings show only the strongest targets;
+* large heatmaps are limited to the most informative targets;
+* per-target figures are generated only for a bounded top set;
+* PS large mode uses ``ps_score`` / ``ps_quadrant`` rather than thousands of
+  target-specific ``obs`` columns;
+* lochNESS large mode uses ``lochness_self`` and target summaries rather than
+  the intentionally omitted full cell × perturbation score matrix.
+
+These restrictions affect visualization only. All analytical stages operate on
+the full cell and perturbation populations.
 """
 
 from __future__ import annotations
@@ -41,11 +63,21 @@ from .guides import (
     OBS_TOTAL,
 )
 from .io import LANE_KEY
-from .perturbation import CONTROL_LABELS, CONTROL_NTC, CONTROL_OTHER, PerturbationResults
+from .perturbation import (
+    CONTROL_LABELS,
+    CONTROL_NTC,
+    CONTROL_OTHER,
+    PerturbationResults,
+)
 
 logger = logging.getLogger(__name__)
 
 sns.set_theme(style="ticks", context="notebook")
+
+
+# ---------------------------------------------------------------------------
+# Report sections
+# ---------------------------------------------------------------------------
 
 SECTION_QC = "qc"
 SECTION_GUIDES = "guides"
@@ -60,6 +92,9 @@ SECTION_PS_LDA = "ps_score/lda"
 SECTION_LOCHNESS = "lochness"
 SECTION_LOCHNESS_PER_TARGET = "lochness/per_target"
 SECTION_MODULES = "modules"
+SECTION_DISTANCE = "distance"
+SECTION_DISTANCE_SPACE = "distance_space"
+
 
 _CLASS_COLORS = {
     CLASS_TARGETING: "#2b6cb0",
@@ -70,47 +105,102 @@ _CLASS_COLORS = {
 
 
 # ---------------------------------------------------------------------------
+# Large-dataset plotting safeguards
+# ---------------------------------------------------------------------------
+
+# Replogle (~310k cells) keeps standard plotting.
+# KOLF (~2.66M cells) automatically enters bounded plotting.
+LARGE_DATASET_N_CELLS = 1_000_000
+
+# A huge perturbation collection independently activates bounded plotting.
+LARGE_DATASET_N_TARGETS = 5_000
+
+# Maximum number of cells rendered in ordinary UMAP/scatter panels.
+LARGE_PLOT_MAX_CELLS = 150_000
+
+# Background cells in per-target panels.
+LARGE_PLOT_BACKGROUND_CELLS = 75_000
+
+# Number of control cells drawn in expression distribution panels.
+LARGE_PLOT_MAX_CONTROL_CELLS = 20_000
+
+# Maximum number of target-specific figures.
+LARGE_PLOT_MAX_PER_TARGET = 50
+
+# Maximum target count in wide overview bar charts.
+LARGE_PLOT_MAX_OVERVIEW_TARGETS = 200
+
+# Maximum number of perturbation rows rendered in heatmaps.
+LARGE_PLOT_MAX_HEATMAP_TARGETS = 500
+
+
+# ---------------------------------------------------------------------------
 # Registry
 # ---------------------------------------------------------------------------
 
 
 def _slugify(name: str) -> str:
-    """File-system-safe figure name (stage labels contain spaces)."""
+    """File-system-safe figure name."""
+
     import re
 
-    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", str(name)).strip("_")
+    slug = re.sub(
+        r"[^A-Za-z0-9._-]+",
+        "_",
+        str(name),
+    ).strip("_")
+
     return slug or "figure"
 
 
 @dataclass
 class FigureRecord:
-    """A figure on disk plus the metadata the report needs."""
+    """A figure on disk plus report metadata."""
 
     path: Path
     name: str
     section: str
     title: str
     caption: str = ""
-    #: False for the per-gene figures beyond the top-N; still written to disk.
+
+    #: False for supplementary / non-inline figures.
     in_report: bool = True
 
     def data_uri(self) -> str:
-        """Base64 ``data:`` URI so the report can be a single portable file."""
-        mime = "image/png" if self.path.suffix == ".png" else "image/svg+xml"
-        return f"data:{mime};base64,{base64.b64encode(self.path.read_bytes()).decode()}"
+        """Return the figure as a base64 data URI."""
+
+        mime = (
+            "image/png"
+            if self.path.suffix == ".png"
+            else "image/svg+xml"
+        )
+
+        payload = base64.b64encode(
+            self.path.read_bytes()
+        ).decode()
+
+        return (
+            f"data:{mime};base64,{payload}"
+        )
 
 
 @dataclass
 class FigureRegistry:
-    """Saves figures under ``<outdir>/figures/<section>/`` and indexes them."""
+    """Save figures and maintain a report index."""
 
     outdir: Path
     cfg: Config
-    records: List[FigureRecord] = field(default_factory=list)
+
+    records: List[FigureRecord] = field(
+        default_factory=list
+    )
 
     @property
     def figdir(self) -> Path:
-        return Path(self.outdir) / "figures"
+        return (
+            Path(self.outdir)
+            / "figures"
+        )
 
     def save(
         self,
@@ -121,62 +211,347 @@ class FigureRegistry:
         caption: str = "",
         in_report: bool = True,
     ) -> FigureRecord:
-        """Write ``fig`` and register it. Always closes the figure."""
-        ext = self.cfg.report.figure_format
-        name = _slugify(name)
-        path = self.figdir / section / f"{name}.{ext}"
-        path.parent.mkdir(parents=True, exist_ok=True)
-        fig.savefig(path, dpi=self.cfg.report.figure_dpi, bbox_inches="tight")
-        if self.cfg.output.save_figures_pdf:
-            fig.savefig(path.with_suffix(".pdf"), bbox_inches="tight")
-        plt.close(fig)
-        rec = FigureRecord(path, name, section, title, caption, in_report)
-        self.records.append(rec)
+        """Write and register a figure."""
+
+        ext = (
+            self.cfg.report.figure_format
+        )
+
+        name = _slugify(
+            name
+        )
+
+        path = (
+            self.figdir
+            / section
+            / f"{name}.{ext}"
+        )
+
+        path.parent.mkdir(
+            parents=True,
+            exist_ok=True,
+        )
+
+        fig.savefig(
+            path,
+            dpi=self.cfg.report.figure_dpi,
+            bbox_inches="tight",
+        )
+
+        if (
+            self.cfg.output.save_figures_pdf
+        ):
+
+            fig.savefig(
+                path.with_suffix(
+                    ".pdf"
+                ),
+                bbox_inches="tight",
+            )
+
+        plt.close(
+            fig
+        )
+
+        rec = FigureRecord(
+            path=path,
+            name=name,
+            section=section,
+            title=title,
+            caption=caption,
+            in_report=in_report,
+        )
+
+        self.records.append(
+            rec
+        )
+
         return rec
 
-    def by_section(self, section: str, only_in_report: bool = True) -> List[FigureRecord]:
+    def by_section(
+        self,
+        section: str,
+        only_in_report: bool = True,
+    ) -> List[FigureRecord]:
+
         return [
-            r
-            for r in self.records
-            if r.section == section and (r.in_report or not only_in_report)
+            record
+            for record in self.records
+            if (
+                record.section == section
+                and (
+                    record.in_report
+                    or not only_in_report
+                )
+            )
         ]
 
-    def extras(self, section: str) -> List[FigureRecord]:
-        """Figures written to disk but deliberately not embedded in the report."""
-        return [r for r in self.records if r.section == section and not r.in_report]
+    def extras(
+        self,
+        section: str,
+    ) -> List[FigureRecord]:
+        """Figures written but not embedded inline."""
+
+        return [
+            record
+            for record in self.records
+            if (
+                record.section == section
+                and not record.in_report
+            )
+        ]
 
     def manifest(self) -> pd.DataFrame:
+
         return pd.DataFrame(
             [
                 {
-                    "section": r.section,
-                    "name": r.name,
-                    "title": r.title,
-                    "in_report": r.in_report,
-                    "path": str(r.path),
+                    "section": record.section,
+                    "name": record.name,
+                    "title": record.title,
+                    "in_report": record.in_report,
+                    "caption": record.caption,
+                    "path": str(
+                        record.path
+                    ),
                 }
-                for r in self.records
+                for record
+                in self.records
             ]
         )
 
 
 # ---------------------------------------------------------------------------
-# Small helpers
+# General helpers
 # ---------------------------------------------------------------------------
 
 
-def _obs_values(adata, key: str) -> np.ndarray:
-    return adata.obs[key].to_numpy()
+def _is_large_plot_dataset(
+    expr,
+    n_targets: Optional[int] = None,
+    cfg: Optional[Config] = None,
+) -> bool:
+    """Return True when bounded plotting should be used."""
+
+    if cfg is not None:
+        return cfg.use_large_mode(expr.n_obs, n_perturbations=n_targets)
+
+    return (
+        expr.n_obs
+        >= LARGE_DATASET_N_CELLS
+        or (
+            n_targets is not None
+            and n_targets
+            >= LARGE_DATASET_N_TARGETS
+        )
+    )
 
 
-def _gene_values(adata, gene: str) -> np.ndarray:
+def _plot_indices(
+    n_cells: int,
+    max_cells: int,
+    seed: int,
+    always_include: Optional[
+        np.ndarray
+    ] = None,
+) -> np.ndarray:
+    """Reproducibly select cells for visualization.
+
+    ``always_include`` contains integer cell indices that must be retained.
+    """
+
+    if (
+        n_cells <= max_cells
+        and always_include is None
+    ):
+
+        return np.arange(
+            n_cells,
+            dtype=np.int64,
+        )
+
+    rng = np.random.default_rng(
+        seed
+    )
+
+    if always_include is None:
+
+        n_take = min(
+            max_cells,
+            n_cells,
+        )
+
+        return np.sort(
+            rng.choice(
+                n_cells,
+                size=n_take,
+                replace=False,
+            )
+        ).astype(
+            np.int64
+        )
+
+    always_include = np.unique(
+        np.asarray(
+            always_include,
+            dtype=np.int64,
+        )
+    )
+
+    remaining_budget = max(
+        max_cells
+        - len(always_include),
+        0,
+    )
+
+    if remaining_budget == 0:
+
+        return always_include
+
+    candidate_mask = np.ones(
+        n_cells,
+        dtype=bool,
+    )
+
+    candidate_mask[
+        always_include
+    ] = False
+
+    available = np.flatnonzero(
+        candidate_mask
+    )
+
+    if (
+        len(available)
+        <= remaining_budget
+    ):
+
+        sampled = available
+
+    else:
+
+        sampled = rng.choice(
+            available,
+            size=remaining_budget,
+            replace=False,
+        )
+
+    return np.sort(
+        np.concatenate(
+            [
+                always_include,
+                sampled,
+            ]
+        )
+    ).astype(
+        np.int64
+    )
+
+
+def _sample_pool(
+    pool: np.ndarray,
+    max_n: int,
+    seed: int,
+) -> np.ndarray:
+    """Sample from an existing integer-index pool."""
+
+    pool = np.asarray(
+        pool,
+        dtype=np.int64,
+    )
+
+    if len(pool) <= max_n:
+        return pool
+
+    rng = np.random.default_rng(
+        seed
+    )
+
+    return np.sort(
+        rng.choice(
+            pool,
+            size=max_n,
+            replace=False,
+        )
+    )
+
+
+def _obs_values(
+    adata,
+    key: str,
+) -> np.ndarray:
+
+    return (
+        adata.obs[
+            key
+        ]
+        .to_numpy()
+    )
+
+
+def _gene_values(
+    adata,
+    gene: str,
+    cell_indices: Optional[
+        np.ndarray
+    ] = None,
+) -> np.ndarray:
+    """Return log-normalized expression of one gene.
+
+    When ``cell_indices`` is supplied only those rows are read, preventing
+    unnecessary million-cell dense vectors in plotting code.
+    """
+
     from scipy import sparse
 
-    layer = adata.layers[LOGNORM_LAYER] if LOGNORM_LAYER in adata.layers else adata.X
-    col = layer[:, adata.var_names.get_loc(gene)]
-    if sparse.issparse(col):
-        col = col.toarray()
-    return np.asarray(col).ravel()
+    layer = (
+        adata.layers[
+            LOGNORM_LAYER
+        ]
+        if LOGNORM_LAYER
+        in adata.layers
+        else adata.X
+    )
+
+    gene_idx = (
+        adata.var_names
+        .get_loc(
+            gene
+        )
+    )
+
+    if cell_indices is None:
+
+        col = layer[
+            :,
+            gene_idx,
+        ]
+
+    else:
+
+        col = layer[
+            np.asarray(
+                cell_indices,
+                dtype=np.int64,
+            ),
+            gene_idx,
+        ]
+
+    if sparse.issparse(
+        col
+    ):
+
+        col = (
+            col
+            .toarray()
+        )
+
+    return (
+        np.asarray(
+            col
+        )
+        .ravel()
+    )
 
 
 def _scatter_umap(
@@ -188,47 +563,160 @@ def _scatter_umap(
     size: float = 3.0,
     cmap: str = "viridis",
     legend: bool = True,
+    max_points: Optional[int] = None,
+    seed: int = 0,
 ) -> None:
-    """UMAP scatter drawn directly with matplotlib (rasterized for small files)."""
+    """UMAP scatter with optional reproducible point downsampling."""
+
+    coords = np.asarray(
+        coords
+    )
+
+    values = np.asarray(
+        values
+    )
+
+    if (
+        max_points is not None
+        and len(coords) > max_points
+    ):
+
+        idx = _plot_indices(
+            len(coords),
+            max_points,
+            seed,
+        )
+
+        coords = coords[
+            idx
+        ]
+
+        values = values[
+            idx
+        ]
+
     if categorical:
-        cats = pd.Index(pd.unique(pd.Series(values).astype(str))).sort_values()
-        palette = sns.color_palette("tab20", max(len(cats), 3))
-        for i, cat in enumerate(cats):
-            m = values.astype(str) == cat
+
+        values_str = (
+            values.astype(str)
+        )
+
+        cats = (
+            pd.Index(
+                pd.unique(
+                    values_str
+                )
+            )
+            .sort_values()
+        )
+
+        palette = sns.color_palette(
+            "tab20",
+            max(
+                len(cats),
+                3,
+            ),
+        )
+
+        for i, cat in enumerate(
+            cats
+        ):
+
+            mask = (
+                values_str
+                == cat
+            )
+
             ax.scatter(
-                coords[m, 0],
-                coords[m, 1],
+                coords[
+                    mask,
+                    0,
+                ],
+                coords[
+                    mask,
+                    1,
+                ],
                 s=size,
-                color=palette[i % len(palette)],
-                label=str(cat),
+                color=palette[
+                    i % len(
+                        palette
+                    )
+                ],
+                label=str(
+                    cat
+                ),
                 linewidths=0,
                 rasterized=True,
             )
-        if legend and len(cats) <= 25:
+
+        if (
+            legend
+            and len(cats) <= 25
+        ):
+
             ax.legend(
                 markerscale=4,
                 fontsize=7,
                 loc="center left",
-                bbox_to_anchor=(1.01, 0.5),
+                bbox_to_anchor=(
+                    1.01,
+                    0.5,
+                ),
                 frameon=False,
             )
+
     else:
-        sc = ax.scatter(
-            coords[:, 0],
-            coords[:, 1],
+
+        scatter = ax.scatter(
+            coords[
+                :,
+                0,
+            ],
+            coords[
+                :,
+                1,
+            ],
             c=values,
             s=size,
             cmap=cmap,
             linewidths=0,
             rasterized=True,
         )
-        plt.colorbar(sc, ax=ax, shrink=0.75)
-    ax.set_title(title, fontsize=10)
-    ax.set_xlabel("UMAP1", fontsize=8)
-    ax.set_ylabel("UMAP2", fontsize=8)
-    ax.set_xticks([])
-    ax.set_yticks([])
-    sns.despine(ax=ax, left=True, bottom=True)
+
+        plt.colorbar(
+            scatter,
+            ax=ax,
+            shrink=0.75,
+        )
+
+    ax.set_title(
+        title,
+        fontsize=10,
+    )
+
+    ax.set_xlabel(
+        "UMAP1",
+        fontsize=8,
+    )
+
+    ax.set_ylabel(
+        "UMAP2",
+        fontsize=8,
+    )
+
+    ax.set_xticks(
+        []
+    )
+
+    ax.set_yticks(
+        []
+    )
+
+    sns.despine(
+        ax=ax,
+        left=True,
+        bottom=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -236,286 +724,1063 @@ def _scatter_umap(
 # ---------------------------------------------------------------------------
 
 
-def plot_qc(adata, reg: FigureRegistry, stage: str = "prefilter") -> None:
-    """Violin + scatter QC panels, split by lane when there is more than one."""
-    obs = adata.obs
-    metrics = [
-        ("n_genes_by_counts", "Genes per cell"),
-        ("total_counts", "UMIs per cell"),
-        ("pct_counts_mt", "% mitochondrial"),
-        ("pct_counts_ribo", "% ribosomal"),
-    ]
-    metrics = [(m, l) for m, l in metrics if m in obs.columns]
-    multi_lane = LANE_KEY in obs.columns and obs[LANE_KEY].nunique() > 1
+def plot_qc(
+    adata,
+    reg: FigureRegistry,
+    stage: str = "prefilter",
+) -> None:
+    """Violin and scatter QC panels.
 
-    fig, axes = plt.subplots(1, len(metrics), figsize=(3.4 * len(metrics), 3.6))
-    axes = np.atleast_1d(axes)
-    for ax, (metric, label) in zip(axes, metrics):
-        if multi_lane:
-            sns.violinplot(
-                x=obs[LANE_KEY].astype(str), y=obs[metric], ax=ax, inner="box", cut=0
-            )
-            ax.tick_params(axis="x", rotation=45, labelsize=7)
-            ax.set_xlabel("")
-        else:
-            sns.violinplot(y=obs[metric], ax=ax, inner="box", cut=0)
-        ax.set_ylabel(label, fontsize=9)
-        if metric == "total_counts":
-            ax.set_yscale("log")
-    fig.suptitle(f"Cell QC metrics ({stage}, n = {adata.n_obs:,} cells)", fontsize=11)
-    fig.tight_layout()
-    reg.save(
-        fig,
-        f"qc_violin_{stage}",
-        SECTION_QC,
-        f"Cell QC distributions ({stage})",
-        "Distribution of per-cell QC metrics"
-        + (" for each lane." if multi_lane else ".")
-        + " Long lower tails in genes/UMIs indicate empty or dying cells;"
-        " a high mitochondrial fraction indicates stressed cells.",
+    Million-cell runs use a representative subset for distributions, while
+    exact lane counts still use all cells.
+    """
+
+    obs = adata.obs
+
+    large_plot = (
+        _is_large_plot_dataset(
+            adata
+        )
     )
 
-    if {"total_counts", "n_genes_by_counts"} <= set(obs.columns):
-        fig, ax = plt.subplots(figsize=(5.2, 4.4))
-        color = obs["pct_counts_mt"] if "pct_counts_mt" in obs.columns else None
-        s = ax.scatter(
-            obs["total_counts"],
-            obs["n_genes_by_counts"],
+    if large_plot:
+
+        idx = _plot_indices(
+            adata.n_obs,
+            LARGE_PLOT_MAX_CELLS,
+            reg.cfg.run.seed,
+        )
+
+        plot_obs = (
+            obs.iloc[
+                idx
+            ]
+        )
+
+        logger.info(
+            "Large-data QC plotting: using %d/%d cells",
+            len(plot_obs),
+            adata.n_obs,
+        )
+
+    else:
+
+        plot_obs = obs
+
+    metrics = [
+        (
+            "n_genes_by_counts",
+            "Genes per cell",
+        ),
+        (
+            "total_counts",
+            "UMIs per cell",
+        ),
+        (
+            "pct_counts_mt",
+            "% mitochondrial",
+        ),
+        (
+            "pct_counts_ribo",
+            "% ribosomal",
+        ),
+    ]
+
+    metrics = [
+        (metric, label)
+        for metric, label
+        in metrics
+        if metric
+        in plot_obs.columns
+    ]
+
+    multi_lane = (
+        LANE_KEY
+        in obs.columns
+        and obs[
+            LANE_KEY
+        ].nunique() > 1
+    )
+
+    if metrics:
+
+        fig, axes = plt.subplots(
+            1,
+            len(metrics),
+            figsize=(
+                3.4
+                * len(metrics),
+                3.6,
+            ),
+        )
+
+        axes = np.atleast_1d(
+            axes
+        )
+
+        for ax, (
+            metric,
+            label,
+        ) in zip(
+            axes,
+            metrics,
+        ):
+
+            if multi_lane:
+
+                sns.violinplot(
+                    x=plot_obs[
+                        LANE_KEY
+                    ].astype(str),
+                    y=plot_obs[
+                        metric
+                    ],
+                    ax=ax,
+                    inner="box",
+                    cut=0,
+                )
+
+                ax.tick_params(
+                    axis="x",
+                    rotation=45,
+                    labelsize=7,
+                )
+
+                ax.set_xlabel(
+                    ""
+                )
+
+            else:
+
+                sns.violinplot(
+                    y=plot_obs[
+                        metric
+                    ],
+                    ax=ax,
+                    inner="box",
+                    cut=0,
+                )
+
+            ax.set_ylabel(
+                label,
+                fontsize=9,
+            )
+
+            if (
+                metric
+                == "total_counts"
+            ):
+
+                ax.set_yscale(
+                    "log"
+                )
+
+        fig.suptitle(
+            f"Cell QC metrics "
+            f"({stage}, n = {adata.n_obs:,} cells)",
+            fontsize=11,
+        )
+
+        fig.tight_layout()
+
+        reg.save(
+            fig,
+            f"qc_violin_{stage}",
+            SECTION_QC,
+            f"Cell QC distributions ({stage})",
+            (
+                "Distribution of per-cell QC metrics"
+                + (
+                    " for each lane."
+                    if multi_lane
+                    else "."
+                )
+                + (
+                    f" Plot based on a reproducible subset of "
+                    f"{len(plot_obs):,} cells."
+                    if large_plot
+                    else ""
+                )
+            ),
+        )
+
+    if {
+        "total_counts",
+        "n_genes_by_counts",
+    } <= set(
+        plot_obs.columns
+    ):
+
+        fig, ax = plt.subplots(
+            figsize=(
+                5.2,
+                4.4,
+            )
+        )
+
+        color = (
+            plot_obs[
+                "pct_counts_mt"
+            ]
+            if "pct_counts_mt"
+            in plot_obs.columns
+            else None
+        )
+
+        scatter = ax.scatter(
+            plot_obs[
+                "total_counts"
+            ],
+            plot_obs[
+                "n_genes_by_counts"
+            ],
             c=color,
             s=3,
             cmap="viridis",
             linewidths=0,
             rasterized=True,
         )
+
         if color is not None:
-            plt.colorbar(s, ax=ax, label="% mitochondrial")
-        ax.set_xscale("log")
-        ax.set_xlabel("Total UMIs per cell")
-        ax.set_ylabel("Genes per cell")
-        ax.set_title("Library size vs complexity", fontsize=11)
-        sns.despine(ax=ax)
+
+            plt.colorbar(
+                scatter,
+                ax=ax,
+                label="% mitochondrial",
+            )
+
+        ax.set_xscale(
+            "log"
+        )
+
+        ax.set_xlabel(
+            "Total UMIs per cell"
+        )
+
+        ax.set_ylabel(
+            "Genes per cell"
+        )
+
+        ax.set_title(
+            "Library size vs complexity",
+            fontsize=11,
+        )
+
+        sns.despine(
+            ax=ax
+        )
+
         fig.tight_layout()
+
         reg.save(
             fig,
             f"qc_scatter_{stage}",
             SECTION_QC,
             f"UMIs vs genes ({stage})",
-            "Each point is a cell. Healthy cells lie on the main diagonal band;"
-            " points below it with high mitochondrial content are typically dying.",
+            (
+                "Each point is a cell."
+                + (
+                    f" A reproducible subset of {len(plot_obs):,} cells is shown."
+                    if large_plot
+                    else ""
+                )
+            ),
         )
 
     if multi_lane:
-        fig, ax = plt.subplots(figsize=(max(4, 0.7 * obs[LANE_KEY].nunique()), 3.6))
-        counts = obs[LANE_KEY].astype(str).value_counts().sort_index()
-        ax.bar(counts.index, counts.to_numpy(), color="#4a5568")
-        ax.set_ylabel("Cells")
-        ax.set_xlabel("Lane")
-        ax.tick_params(axis="x", rotation=45, labelsize=8)
-        ax.set_title("Cells per lane", fontsize=11)
-        sns.despine(ax=ax)
+
+        fig, ax = plt.subplots(
+            figsize=(
+                max(
+                    4,
+                    0.7
+                    * obs[
+                        LANE_KEY
+                    ].nunique(),
+                ),
+                3.6,
+            )
+        )
+
+        counts = (
+            obs[
+                LANE_KEY
+            ]
+            .astype(str)
+            .value_counts()
+            .sort_index()
+        )
+
+        ax.bar(
+            counts.index,
+            counts.to_numpy(),
+        )
+
+        ax.set_ylabel(
+            "Cells"
+        )
+
+        ax.set_xlabel(
+            "Lane"
+        )
+
+        ax.tick_params(
+            axis="x",
+            rotation=45,
+            labelsize=8,
+        )
+
+        ax.set_title(
+            "Cells per lane",
+            fontsize=11,
+        )
+
+        sns.despine(
+            ax=ax
+        )
+
         fig.tight_layout()
+
         reg.save(
             fig,
             f"qc_cells_per_lane_{stage}",
             SECTION_QC,
             f"Cells per lane ({stage})",
-            "Large imbalances between lanes can bias clustering and should be "
-            "considered when interpreting batch effects.",
+            "Exact number of retained cells per lane.",
         )
 
 
 # ---------------------------------------------------------------------------
-# Perturb-seq guide QC figures
+# Guide QC figures
 # ---------------------------------------------------------------------------
 
 
-def plot_guide_qc(expr, guides, reg: FigureRegistry, cfg: Config) -> None:
-    """Guide-specific QC: UMI depth, multiplicity, dominance and assignment."""
+def plot_guide_qc(
+    expr,
+    guides,
+    reg: FigureRegistry,
+    cfg: Config,
+) -> None:
+    """Guide-specific QC."""
+
     obs = expr.obs
 
-    if OBS_TOTAL in obs.columns:
-        fig, ax = plt.subplots(figsize=(5.2, 3.8))
-        vals = obs[OBS_TOTAL].to_numpy()
-        ax.hist(np.log10(vals + 1), bins=60, color="#4a5568")
-        ax.set_xlabel("log10(total guide UMIs per cell + 1)")
-        ax.set_ylabel("Cells")
-        ax.set_title("Guide UMI depth per cell", fontsize=11)
-        ax.axvline(np.log10(cfg.guides.min_umi + 1), color="#e53e3e", ls="--", lw=1)
-        sns.despine(ax=ax)
+    large_plot = _is_large_plot_dataset(
+        expr
+    )
+
+    if large_plot:
+
+        idx = _plot_indices(
+            expr.n_obs,
+            LARGE_PLOT_MAX_CELLS,
+            cfg.run.seed,
+        )
+
+        plot_obs = (
+            obs.iloc[
+                idx
+            ]
+        )
+
+    else:
+
+        plot_obs = obs
+
+    if OBS_TOTAL in plot_obs.columns:
+
+        fig, ax = plt.subplots(
+            figsize=(
+                5.2,
+                3.8,
+            )
+        )
+
+        vals = (
+            plot_obs[
+                OBS_TOTAL
+            ]
+            .to_numpy()
+        )
+
+        ax.hist(
+            np.log10(
+                vals + 1
+            ),
+            bins=60,
+        )
+
+        ax.set_xlabel(
+            "log10(total guide UMIs per cell + 1)"
+        )
+
+        ax.set_ylabel(
+            "Cells"
+        )
+
+        ax.set_title(
+            "Guide UMI depth per cell",
+            fontsize=11,
+        )
+
+        ax.axvline(
+            np.log10(
+                cfg.guides.min_umi
+                + 1
+            ),
+            ls="--",
+            lw=1,
+        )
+
+        sns.despine(
+            ax=ax
+        )
+
         fig.tight_layout()
+
         reg.save(
             fig,
             "guide_umi_depth",
             SECTION_GUIDES,
             "Guide UMI depth",
-            f"Total guide UMIs per cell. The dashed line marks guides.min_umi = "
-            f"{cfg.guides.min_umi}. A large spike at zero means guide capture failed "
-            "for many cells.",
+            (
+                f"Guide UMI distribution. "
+                f"guides.min_umi = {cfg.guides.min_umi}."
+                + (
+                    f" A reproducible subset of {len(plot_obs):,} cells is shown."
+                    if large_plot
+                    else ""
+                )
+            ),
         )
 
-    if OBS_NDETECTED in obs.columns:
-        det = obs[OBS_NDETECTED].to_numpy()
-        fig, ax = plt.subplots(figsize=(5.2, 3.8))
-        top = int(min(det.max(), 15))
-        ax.hist(np.clip(det, 0, top), bins=np.arange(-0.5, top + 1.5, 1), color="#2b6cb0")
-        ax.set_xlabel(f"Guides detected per cell (> {cfg.guides.detection_threshold} UMI)")
-        ax.set_ylabel("Cells")
-        ax.set_title(f"Guide multiplicity (mean MOI = {det.mean():.2f})", fontsize=11)
-        sns.despine(ax=ax)
+    if OBS_NDETECTED in plot_obs.columns:
+
+        detected = (
+            plot_obs[
+                OBS_NDETECTED
+            ]
+            .to_numpy()
+        )
+
+        fig, ax = plt.subplots(
+            figsize=(
+                5.2,
+                3.8,
+            )
+        )
+
+        top = int(
+            min(
+                detected.max(),
+                15,
+            )
+        )
+
+        ax.hist(
+            np.clip(
+                detected,
+                0,
+                top,
+            ),
+            bins=np.arange(
+                -0.5,
+                top + 1.5,
+                1,
+            ),
+        )
+
+        ax.set_xlabel(
+            (
+                "Guides detected per cell "
+                f"(> {cfg.guides.detection_threshold} UMI)"
+            )
+        )
+
+        ax.set_ylabel(
+            "Cells"
+        )
+
+        ax.set_title(
+            (
+                "Guide multiplicity "
+                f"(sample mean = {detected.mean():.2f})"
+            ),
+            fontsize=11,
+        )
+
+        sns.despine(
+            ax=ax
+        )
+
         fig.tight_layout()
+
         reg.save(
             fig,
             "guide_multiplicity",
             SECTION_GUIDES,
             "Guides per cell (MOI)",
-            "Number of distinct guides detected per cell. A low-MOI screen should "
-            "be dominated by the 1-guide bar; a heavy tail indicates multiplets.",
+            "Distribution of detected guide multiplicity.",
         )
 
-    if {OBS_TOP, OBS_SECOND} <= set(obs.columns):
-        fig, ax = plt.subplots(figsize=(5.4, 4.6))
-        x = obs[OBS_TOP].to_numpy() + 1
-        y = obs[OBS_SECOND].to_numpy() + 1
-        klass = obs[OBS_CLASS].astype(str).to_numpy() if OBS_CLASS in obs.columns else None
+    if {
+        OBS_TOP,
+        OBS_SECOND,
+    } <= set(
+        plot_obs.columns
+    ):
+
+        fig, ax = plt.subplots(
+            figsize=(
+                5.4,
+                4.6,
+            )
+        )
+
+        x = (
+            plot_obs[
+                OBS_TOP
+            ]
+            .to_numpy()
+            + 1
+        )
+
+        y = (
+            plot_obs[
+                OBS_SECOND
+            ]
+            .to_numpy()
+            + 1
+        )
+
+        klass = (
+            plot_obs[
+                OBS_CLASS
+            ]
+            .astype(str)
+            .to_numpy()
+            if OBS_CLASS
+            in plot_obs.columns
+            else None
+        )
+
         if klass is not None:
-            for cl, color in _CLASS_COLORS.items():
-                m = klass == cl
-                if m.sum():
+
+            for cl, color in (
+                _CLASS_COLORS.items()
+            ):
+
+                mask = (
+                    klass == cl
+                )
+
+                if mask.sum():
+
                     ax.scatter(
-                        x[m], y[m], s=4, alpha=0.5, color=color, label=cl,
-                        linewidths=0, rasterized=True,
+                        x[
+                            mask
+                        ],
+                        y[
+                            mask
+                        ],
+                        s=4,
+                        alpha=0.5,
+                        color=color,
+                        label=cl,
+                        linewidths=0,
+                        rasterized=True,
                     )
-            ax.legend(markerscale=3, fontsize=8, frameon=False)
+
+            ax.legend(
+                markerscale=3,
+                fontsize=8,
+                frameon=False,
+            )
+
         else:
-            ax.scatter(x, y, s=4, alpha=0.5, linewidths=0, rasterized=True)
-        lim = np.array([1, max(x.max(), y.max())])
-        ax.plot(lim, lim / cfg.guides.dominance_ratio, color="#e53e3e", ls="--", lw=1,
-                label=f"ratio = {cfg.guides.dominance_ratio}")
-        ax.set_xscale("log")
-        ax.set_yscale("log")
-        ax.set_xlabel("Highest guide count + 1")
-        ax.set_ylabel("Second highest guide count + 1")
-        ax.set_title("Guide dominance per cell", fontsize=11)
-        sns.despine(ax=ax)
+
+            ax.scatter(
+                x,
+                y,
+                s=4,
+                alpha=0.5,
+                linewidths=0,
+                rasterized=True,
+            )
+
+        lim = np.array(
+            [
+                1,
+                max(
+                    x.max(),
+                    y.max(),
+                ),
+            ]
+        )
+
+        ax.plot(
+            lim,
+            lim
+            / cfg.guides.dominance_ratio,
+            ls="--",
+            lw=1,
+        )
+
+        ax.set_xscale(
+            "log"
+        )
+
+        ax.set_yscale(
+            "log"
+        )
+
+        ax.set_xlabel(
+            "Highest guide count + 1"
+        )
+
+        ax.set_ylabel(
+            "Second highest guide count + 1"
+        )
+
+        ax.set_title(
+            "Guide dominance per cell",
+            fontsize=11,
+        )
+
+        sns.despine(
+            ax=ax
+        )
+
         fig.tight_layout()
+
         reg.save(
             fig,
             "guide_top_vs_second",
             SECTION_GUIDES,
             "Top vs second guide count",
-            "Cells far below the dashed line have one clearly dominant guide and are "
-            "confidently assigned; cells near the diagonal are ambiguous.",
+            "Cells far below the diagonal have one clearly dominant guide.",
         )
 
     if OBS_CLASS in obs.columns:
-        counts = obs[OBS_CLASS].value_counts()
-        fig, ax = plt.subplots(figsize=(5.0, 3.6))
-        labels = [c for c in _CLASS_COLORS if c in counts.index]
-        vals = [counts[c] for c in labels]
-        ax.bar(labels, vals, color=[_CLASS_COLORS[c] for c in labels])
-        for i, v in enumerate(vals):
-            ax.text(i, v, f"{100 * v / expr.n_obs:.1f}%", ha="center", va="bottom", fontsize=8)
-        ax.set_ylabel("Cells")
-        ax.set_title("Guide assignment outcome", fontsize=11)
-        ax.tick_params(axis="x", rotation=20, labelsize=8)
-        sns.despine(ax=ax)
+
+        counts = (
+            obs[
+                OBS_CLASS
+            ]
+            .value_counts()
+        )
+
+        labels = [
+            cl
+            for cl
+            in _CLASS_COLORS
+            if cl
+            in counts.index
+        ]
+
+        values = [
+            counts[
+                cl
+            ]
+            for cl
+            in labels
+        ]
+
+        fig, ax = plt.subplots(
+            figsize=(
+                5.0,
+                3.6,
+            )
+        )
+
+        ax.bar(
+            labels,
+            values,
+            color=[
+                _CLASS_COLORS[
+                    cl
+                ]
+                for cl
+                in labels
+            ],
+        )
+
+        for i, value in enumerate(
+            values
+        ):
+
+            ax.text(
+                i,
+                value,
+                (
+                    f"{100 * value / expr.n_obs:.1f}%"
+                ),
+                ha="center",
+                va="bottom",
+                fontsize=8,
+            )
+
+        ax.set_ylabel(
+            "Cells"
+        )
+
+        ax.set_title(
+            "Guide assignment outcome",
+            fontsize=11,
+        )
+
+        ax.tick_params(
+            axis="x",
+            rotation=20,
+            labelsize=8,
+        )
+
+        sns.despine(
+            ax=ax
+        )
+
         fig.tight_layout()
+
         reg.save(
             fig,
             "guide_assignment_classes",
             SECTION_GUIDES,
             "Guide assignment outcome",
-            "How many cells received a confident guide call. 'ambiguous' cells have "
-            "guide counts but no dominant guide; 'unassigned' cells have none.",
+            "Exact guide assignment counts across all cells.",
         )
 
-        if LANE_KEY in obs.columns and obs[LANE_KEY].nunique() > 1:
-            tab = (
-                obs.groupby([LANE_KEY, OBS_CLASS], observed=True)
+        if (
+            LANE_KEY in obs.columns
+            and obs[
+                LANE_KEY
+            ].nunique() > 1
+        ):
+
+            table = (
+                obs.groupby(
+                    [
+                        LANE_KEY,
+                        OBS_CLASS,
+                    ],
+                    observed=True,
+                )
                 .size()
-                .unstack(fill_value=0)
+                .unstack(
+                    fill_value=0
+                )
             )
-            frac = tab.div(tab.sum(axis=1), axis=0) * 100
-            fig, ax = plt.subplots(figsize=(max(4.5, 0.8 * len(frac)), 3.8))
-            bottom = np.zeros(len(frac))
-            for cl in [c for c in _CLASS_COLORS if c in frac.columns]:
-                ax.bar(frac.index.astype(str), frac[cl], bottom=bottom,
-                       color=_CLASS_COLORS[cl], label=cl)
-                bottom += frac[cl].to_numpy()
-            ax.set_ylabel("% of cells")
-            ax.set_xlabel("Lane")
-            ax.legend(fontsize=7, frameon=False, bbox_to_anchor=(1.01, 1), loc="upper left")
-            ax.tick_params(axis="x", rotation=45, labelsize=8)
-            ax.set_title("Assignment outcome per lane", fontsize=11)
-            sns.despine(ax=ax)
+
+            frac = (
+                table.div(
+                    table.sum(
+                        axis=1
+                    ),
+                    axis=0,
+                )
+                * 100
+            )
+
+            fig, ax = plt.subplots(
+                figsize=(
+                    max(
+                        4.5,
+                        0.8
+                        * len(frac),
+                    ),
+                    3.8,
+                )
+            )
+
+            bottom = np.zeros(
+                len(frac)
+            )
+
+            for cl in [
+                cl
+                for cl
+                in _CLASS_COLORS
+                if cl
+                in frac.columns
+            ]:
+
+                ax.bar(
+                    frac.index.astype(
+                        str
+                    ),
+                    frac[
+                        cl
+                    ],
+                    bottom=bottom,
+                    color=_CLASS_COLORS[
+                        cl
+                    ],
+                    label=cl,
+                )
+
+                bottom += (
+                    frac[
+                        cl
+                    ]
+                    .to_numpy()
+                )
+
+            ax.set_ylabel(
+                "% of cells"
+            )
+
+            ax.set_xlabel(
+                "Lane"
+            )
+
+            ax.legend(
+                fontsize=7,
+                frameon=False,
+                bbox_to_anchor=(
+                    1.01,
+                    1,
+                ),
+                loc="upper left",
+            )
+
+            ax.tick_params(
+                axis="x",
+                rotation=45,
+                labelsize=8,
+            )
+
+            ax.set_title(
+                "Assignment outcome per lane",
+                fontsize=11,
+            )
+
+            sns.despine(
+                ax=ax
+            )
+
             fig.tight_layout()
+
             reg.save(
                 fig,
                 "guide_assignment_per_lane",
                 SECTION_GUIDES,
                 "Assignment outcome per lane",
-                "A lane with a much lower assignment rate usually had a failed or "
-                "shallow guide library.",
+                "Exact assignment composition by lane.",
             )
 
-    _plot_representation(expr, guides, reg, cfg)
+    _plot_representation(
+        expr,
+        guides,
+        reg,
+        cfg,
+    )
 
 
-def _plot_representation(expr, guides, reg: FigureRegistry, cfg: Config) -> None:
-    """Cells per target gene and per guide — library-balance diagnostics."""
+def _plot_representation(
+    expr,
+    guides,
+    reg: FigureRegistry,
+    cfg: Config,
+) -> None:
+    """Target and guide representation."""
+
     obs = expr.obs
+
     if OBS_TARGET not in obs.columns:
         return
-    counts = obs[OBS_TARGET].astype(str).value_counts()
-    counts = counts.drop(
-        [cfg.guides.unassigned_label, cfg.guides.ambiguous_label], errors="ignore"
+
+    counts = (
+        obs[
+            OBS_TARGET
+        ]
+        .astype(str)
+        .value_counts()
     )
+
+    counts = counts.drop(
+        [
+            cfg.guides.unassigned_label,
+            cfg.guides.ambiguous_label,
+        ],
+        errors="ignore",
+    )
+
     if counts.empty:
         return
-    fig, ax = plt.subplots(figsize=(max(6, 0.16 * len(counts)), 3.8))
-    colors = ["#38a169" if t == cfg.guides.ntc_label else "#2b6cb0" for t in counts.index]
-    ax.bar(range(len(counts)), counts.to_numpy(), color=colors)
-    ax.set_xticks(range(len(counts)))
-    ax.set_xticklabels(counts.index, rotation=90, fontsize=6)
-    ax.set_ylabel("Cells")
-    ax.set_title(f"Cells per target gene ({len(counts)} targets)", fontsize=11)
-    ax.axhline(cfg.perturbation.min_cells_per_target, color="#e53e3e", ls="--", lw=1)
-    sns.despine(ax=ax)
+
+    original_n = len(
+        counts
+    )
+
+    if (
+        original_n
+        > LARGE_PLOT_MAX_OVERVIEW_TARGETS
+    ):
+
+        counts = counts.head(
+            LARGE_PLOT_MAX_OVERVIEW_TARGETS
+        )
+
+        logger.info(
+            "Target representation plot restricted to top %d/%d targets",
+            len(counts),
+            original_n,
+        )
+
+    fig, ax = plt.subplots(
+        figsize=(
+            max(
+                6,
+                min(
+                    24,
+                    0.12
+                    * len(counts)
+                    + 4,
+                ),
+            ),
+            3.8,
+        )
+    )
+
+    colors = [
+        (
+            "#38a169"
+            if target
+            == cfg.guides.ntc_label
+            else "#2b6cb0"
+        )
+        for target
+        in counts.index
+    ]
+
+    ax.bar(
+        range(
+            len(counts)
+        ),
+        counts.to_numpy(),
+        color=colors,
+    )
+
+    ax.set_xticks(
+        range(
+            len(counts)
+        )
+    )
+
+    ax.set_xticklabels(
+        counts.index,
+        rotation=90,
+        fontsize=5,
+    )
+
+    ax.set_ylabel(
+        "Cells"
+    )
+
+    ax.set_title(
+        (
+            f"Cells per target "
+            f"({original_n} targets total)"
+        ),
+        fontsize=11,
+    )
+
+    ax.axhline(
+        cfg.perturbation.min_cells_per_target,
+        ls="--",
+        lw=1,
+    )
+
+    sns.despine(
+        ax=ax
+    )
+
     fig.tight_layout()
+
     reg.save(
         fig,
         "target_representation",
         SECTION_GUIDES,
         "Cells per target gene",
-        "Green is the non-targeting control group. The dashed line is "
-        f"perturbation.min_cells_per_target = {cfg.perturbation.min_cells_per_target}; "
-        "targets below it cannot be tested reliably.",
+        (
+            f"Top {len(counts)} targets by cell count are shown."
+            if original_n
+            > len(counts)
+            else "Cells assigned to each perturbation."
+        ),
     )
 
     if guides is not None:
+
         from .guides import guide_representation
 
-        rep = guide_representation(guides, expr)
+        rep = guide_representation(
+            guides,
+            expr,
+        )
+
         if not rep.empty:
-            fig, ax = plt.subplots(figsize=(5.4, 3.8))
-            ax.plot(np.arange(1, len(rep) + 1), rep["n_cells"].to_numpy(), lw=1.2)
-            ax.set_yscale("symlog")
-            ax.set_xlabel("Guide rank")
-            ax.set_ylabel("Cells assigned")
-            n_zero = int((rep["n_cells"] == 0).sum())
+
+            fig, ax = plt.subplots(
+                figsize=(
+                    5.4,
+                    3.8,
+                )
+            )
+
+            ax.plot(
+                np.arange(
+                    1,
+                    len(rep)
+                    + 1,
+                ),
+                rep[
+                    "n_cells"
+                ].to_numpy(),
+                lw=1.2,
+            )
+
+            ax.set_yscale(
+                "symlog"
+            )
+
+            ax.set_xlabel(
+                "Guide rank"
+            )
+
+            ax.set_ylabel(
+                "Cells assigned"
+            )
+
+            n_zero = int(
+                (
+                    rep[
+                        "n_cells"
+                    ]
+                    == 0
+                ).sum()
+            )
+
             ax.set_title(
-                f"Guide representation ({len(rep)} guides, {n_zero} with no cells)",
+                (
+                    f"Guide representation "
+                    f"({len(rep)} guides, "
+                    f"{n_zero} with no cells)"
+                ),
                 fontsize=11,
             )
-            sns.despine(ax=ax)
+
+            sns.despine(
+                ax=ax
+            )
+
             fig.tight_layout()
+
             reg.save(
                 fig,
                 "guide_representation",
                 SECTION_GUIDES,
                 "Guide representation",
-                "Cells assigned per guide, ranked. A steep drop or many zero-cell "
-                "guides indicates an unbalanced or partly failed guide library.",
+                "Cells assigned per guide, ranked.",
             )
 
 
@@ -533,240 +1798,892 @@ def plot_clustering(
     section: str = SECTION_CLUSTERING,
     label: str = "",
 ) -> None:
-    """PCA scree, UMAP by cluster / QC / lane / perturbation class.
+    """PCA and UMAP diagnostics."""
 
-    ``name_prefix``/``section``/``label`` let the same figures be produced for a
-    second embedding (the all-cell one written under ``cluster.assigned_only``)
-    without overwriting the analysis figures.
-    """
-    if "pca" in expr.uns and "variance_ratio" in expr.uns["pca"]:
-        vr = expr.uns["pca"]["variance_ratio"]
-        fig, ax = plt.subplots(figsize=(4.8, 3.6))
-        ax.plot(np.arange(1, len(vr) + 1), vr, "o-", ms=3)
-        ax.set_yscale("log")
-        ax.set_xlabel("Principal component")
-        ax.set_ylabel("Variance ratio")
-        ax.set_title(f"PCA scree plot{label}", fontsize=11)
-        sns.despine(ax=ax)
+    if (
+        "pca" in expr.uns
+        and "variance_ratio"
+        in expr.uns["pca"]
+    ):
+
+        variance_ratio = (
+            expr.uns[
+                "pca"
+            ][
+                "variance_ratio"
+            ]
+        )
+
+        fig, ax = plt.subplots(
+            figsize=(
+                4.8,
+                3.6,
+            )
+        )
+
+        ax.plot(
+            np.arange(
+                1,
+                len(
+                    variance_ratio
+                )
+                + 1,
+            ),
+            variance_ratio,
+            "o-",
+            ms=3,
+        )
+
+        ax.set_yscale(
+            "log"
+        )
+
+        ax.set_xlabel(
+            "Principal component"
+        )
+
+        ax.set_ylabel(
+            "Variance ratio"
+        )
+
+        ax.set_title(
+            f"PCA scree plot{label}",
+            fontsize=11,
+        )
+
+        sns.despine(
+            ax=ax
+        )
+
         fig.tight_layout()
+
         reg.save(
             fig,
             f"{name_prefix}pca_variance",
             section,
             f"PCA variance ratio{label}",
-            "Where the curve flattens suggests how many components carry signal; "
-            f"the pipeline used {cfg.cluster.n_pcs} for the neighbor graph.",
+            (
+                f"The pipeline used {cfg.cluster.n_pcs} PCs "
+                "for the neighbour graph."
+            ),
         )
 
     if "X_umap" not in expr.obsm:
         return
-    coords = np.asarray(expr.obsm["X_umap"])
+
+    coords = np.asarray(
+        expr.obsm[
+            "X_umap"
+        ]
+    )
+
     obs = expr.obs
 
+    large_plot = (
+        _is_large_plot_dataset(
+            expr
+        )
+    )
+
+    max_points = (
+        LARGE_PLOT_MAX_CELLS
+        if large_plot
+        else None
+    )
+
     if CLUSTER_KEY in obs.columns:
-        fig, ax = plt.subplots(figsize=(6.0, 5.0))
-        _scatter_umap(ax, coords, obs[CLUSTER_KEY].astype(str).to_numpy(), True,
-                      f"Leiden clusters (resolution {cfg.cluster.leiden_resolution})")
+
+        fig, ax = plt.subplots(
+            figsize=(
+                6.0,
+                5.0,
+            )
+        )
+
+        _scatter_umap(
+            ax,
+            coords,
+            obs[
+                CLUSTER_KEY
+            ]
+            .astype(str)
+            .to_numpy(),
+            True,
+            (
+                "Leiden clusters "
+                f"(resolution "
+                f"{cfg.cluster.leiden_resolution})"
+            ),
+            max_points=max_points,
+            seed=cfg.run.seed,
+        )
+
         fig.tight_layout()
+
         reg.save(
             fig,
             f"{name_prefix}umap_clusters",
             section,
             f"UMAP coloured by Leiden cluster{label}",
-            f"{obs[CLUSTER_KEY].nunique()} clusters at resolution "
-            f"{cfg.cluster.leiden_resolution}.",
+            (
+                f"{obs[CLUSTER_KEY].nunique()} clusters."
+                + (
+                    f" Up to {LARGE_PLOT_MAX_CELLS:,} cells shown."
+                    if large_plot
+                    else ""
+                )
+            ),
         )
 
     qc_keys = [
-        (k, l)
-        for k, l in [
-            ("n_genes_by_counts", "Genes per cell"),
-            ("total_counts", "Total UMIs"),
-            ("pct_counts_mt", "% mitochondrial"),
+        (
+            key,
+            title,
+        )
+        for key, title
+        in [
+            (
+                "n_genes_by_counts",
+                "Genes per cell",
+            ),
+            (
+                "total_counts",
+                "Total UMIs",
+            ),
+            (
+                "pct_counts_mt",
+                "% mitochondrial",
+            ),
         ]
-        if k in obs.columns
+        if key
+        in obs.columns
     ]
+
     if qc_keys:
-        fig, axes = plt.subplots(1, len(qc_keys), figsize=(4.6 * len(qc_keys), 4.0))
-        for ax, (k, l) in zip(np.atleast_1d(axes), qc_keys):
-            _scatter_umap(ax, coords, obs[k].to_numpy(), False, l)
+
+        fig, axes = plt.subplots(
+            1,
+            len(qc_keys),
+            figsize=(
+                4.6
+                * len(qc_keys),
+                4.0,
+            ),
+        )
+
+        for ax, (
+            key,
+            title,
+        ) in zip(
+            np.atleast_1d(
+                axes
+            ),
+            qc_keys,
+        ):
+
+            _scatter_umap(
+                ax,
+                coords,
+                obs[
+                    key
+                ].to_numpy(),
+                False,
+                title,
+                max_points=max_points,
+                seed=cfg.run.seed,
+            )
+
         fig.tight_layout()
+
         reg.save(
             fig,
             f"{name_prefix}umap_qc_metrics",
             section,
             f"UMAP coloured by QC metrics{label}",
-            "A cluster driven purely by library size or mitochondrial content is a "
-            "technical artefact rather than a biological state.",
+            "QC metrics projected onto the transcriptional embedding.",
         )
 
-    if LANE_KEY in obs.columns and obs[LANE_KEY].nunique() > 1:
-        fig, ax = plt.subplots(figsize=(6.0, 5.0))
-        _scatter_umap(ax, coords, obs[LANE_KEY].astype(str).to_numpy(), True, "Lane")
+    if (
+        LANE_KEY in obs.columns
+        and obs[
+            LANE_KEY
+        ].nunique() > 1
+    ):
+
+        fig, ax = plt.subplots(
+            figsize=(
+                6.0,
+                5.0,
+            )
+        )
+
+        _scatter_umap(
+            ax,
+            coords,
+            obs[
+                LANE_KEY
+            ]
+            .astype(str)
+            .to_numpy(),
+            True,
+            "Lane",
+            max_points=max_points,
+            seed=cfg.run.seed,
+        )
+
         fig.tight_layout()
+
         reg.save(
             fig,
             f"{name_prefix}umap_lane",
             section,
             f"UMAP coloured by lane{label}",
-            "Lanes should intermix. Separation by lane means a batch effect; set "
-            "cluster.batch_key to enable Harmony correction.",
+            "Lane composition on the UMAP.",
         )
 
     if OBS_CLASS in obs.columns:
-        fig, ax = plt.subplots(figsize=(6.0, 5.0))
-        _scatter_umap(ax, coords, obs[OBS_CLASS].astype(str).to_numpy(), True,
-                      "Guide assignment class")
+
+        fig, ax = plt.subplots(
+            figsize=(
+                6.0,
+                5.0,
+            )
+        )
+
+        _scatter_umap(
+            ax,
+            coords,
+            obs[
+                OBS_CLASS
+            ]
+            .astype(str)
+            .to_numpy(),
+            True,
+            "Guide assignment class",
+            max_points=max_points,
+            seed=cfg.run.seed,
+        )
+
         fig.tight_layout()
+
         reg.save(
             fig,
             f"{name_prefix}umap_assignment_class",
             section,
             f"UMAP coloured by guide assignment{label}",
-            "Unassigned cells clustering together often indicates a technically "
-            "distinct population (e.g. low-quality cells) rather than a biological one.",
+            "Guide assignment classes on the UMAP.",
         )
 
     if OBS_TARGET in obs.columns:
-        targets = obs[OBS_TARGET].astype(str)
-        n_targets = targets.nunique()
-        fig, ax = plt.subplots(figsize=(7.2, 5.0))
-        _scatter_umap(ax, coords, targets.to_numpy(), True,
-                      f"Target gene ({n_targets} levels)", legend=n_targets <= 25)
-        fig.tight_layout()
-        reg.save(
-            fig,
-            "umap_target_gene",
-            SECTION_CLUSTERING,
-            "UMAP coloured by target gene",
-            "Most Perturb-seq screens show perturbed cells mixed throughout the "
-            "embedding; a target forming its own island has a strong phenotype."
-            + ("" if n_targets <= 25 else " Legend omitted (too many targets)."),
+
+        targets = (
+            obs[
+                OBS_TARGET
+            ]
+            .astype(str)
         )
 
-    if CLUSTER_KEY in obs.columns and LANE_KEY in obs.columns and obs[LANE_KEY].nunique() > 1:
-        tab = (
-            obs.groupby([CLUSTER_KEY, LANE_KEY], observed=True).size().unstack(fill_value=0)
+        n_targets = (
+            targets.nunique()
         )
-        frac = tab.div(tab.sum(axis=1), axis=0) * 100
-        fig, ax = plt.subplots(figsize=(max(5, 0.5 * len(frac)), 3.8))
-        bottom = np.zeros(len(frac))
-        palette = sns.color_palette("tab20", frac.shape[1])
-        for i, lane in enumerate(frac.columns):
-            ax.bar(frac.index.astype(str), frac[lane], bottom=bottom, color=palette[i],
-                   label=str(lane))
-            bottom += frac[lane].to_numpy()
-        ax.set_xlabel("Leiden cluster")
-        ax.set_ylabel("% of cluster")
-        ax.legend(fontsize=7, frameon=False, bbox_to_anchor=(1.01, 1), loc="upper left")
-        ax.set_title("Lane composition per cluster", fontsize=11)
-        sns.despine(ax=ax)
+
+        fig, ax = plt.subplots(
+            figsize=(
+                7.2,
+                5.0,
+            )
+        )
+
+        _scatter_umap(
+            ax,
+            coords,
+            targets.to_numpy(),
+            True,
+            f"Target gene ({n_targets} levels)",
+            legend=n_targets <= 25,
+            max_points=max_points,
+            seed=cfg.run.seed,
+        )
+
         fig.tight_layout()
+
         reg.save(
             fig,
-            "cluster_lane_composition",
-            SECTION_CLUSTERING,
+            f"{name_prefix}umap_target_gene",
+            section,
+            "UMAP coloured by target gene",
+            (
+                "Perturbation identity on the UMAP."
+                + (
+                    " Legend omitted because there are too many targets."
+                    if n_targets > 25
+                    else ""
+                )
+            ),
+        )
+
+    if (
+        CLUSTER_KEY in obs.columns
+        and LANE_KEY in obs.columns
+        and obs[
+            LANE_KEY
+        ].nunique() > 1
+    ):
+
+        table = (
+            obs.groupby(
+                [
+                    CLUSTER_KEY,
+                    LANE_KEY,
+                ],
+                observed=True,
+            )
+            .size()
+            .unstack(
+                fill_value=0
+            )
+        )
+
+        frac = (
+            table.div(
+                table.sum(
+                    axis=1
+                ),
+                axis=0,
+            )
+            * 100
+        )
+
+        fig, ax = plt.subplots(
+            figsize=(
+                max(
+                    5,
+                    0.5
+                    * len(frac),
+                ),
+                3.8,
+            )
+        )
+
+        bottom = np.zeros(
+            len(frac)
+        )
+
+        palette = sns.color_palette(
+            "tab20",
+            frac.shape[
+                1
+            ],
+        )
+
+        for i, lane in enumerate(
+            frac.columns
+        ):
+
+            ax.bar(
+                frac.index.astype(
+                    str
+                ),
+                frac[
+                    lane
+                ],
+                bottom=bottom,
+                color=palette[
+                    i
+                ],
+                label=str(
+                    lane
+                ),
+            )
+
+            bottom += (
+                frac[
+                    lane
+                ]
+                .to_numpy()
+            )
+
+        ax.set_xlabel(
+            "Leiden cluster"
+        )
+
+        ax.set_ylabel(
+            "% of cluster"
+        )
+
+        ax.legend(
+            fontsize=7,
+            frameon=False,
+            bbox_to_anchor=(
+                1.01,
+                1,
+            ),
+            loc="upper left",
+        )
+
+        ax.set_title(
             "Lane composition per cluster",
-            "Clusters made up almost entirely of one lane are candidates for batch "
-            "correction.",
+            fontsize=11,
+        )
+
+        sns.despine(
+            ax=ax
+        )
+
+        fig.tight_layout()
+
+        reg.save(
+            fig,
+            f"{name_prefix}cluster_lane_composition",
+            section,
+            "Lane composition per cluster",
+            "Exact lane composition within Leiden clusters.",
         )
 
 
 # ---------------------------------------------------------------------------
-# Perturbation figures
+# Perturbation overview
 # ---------------------------------------------------------------------------
 
 
 def plot_perturbation_overview(
-    results: PerturbationResults, reg: FigureRegistry, cfg: Config
+    results: PerturbationResults,
+    reg: FigureRegistry,
+    cfg: Config,
 ) -> None:
-    """Volcano and waterfall summarizing knockdown across all targets."""
+    """Volcano and ranked knockdown summary."""
+
     if results.table.empty:
         return
-    tbl = results.table
-    primary = results.primary_control
-    lfc = tbl[f"log2fc_{primary}"].to_numpy(dtype=float)
-    fdr = tbl[f"ks_fdr_{primary}"].to_numpy(dtype=float)
-    hit = tbl[f"is_hit_{primary}"].to_numpy(dtype=bool)
-    names = tbl["target_gene"].to_numpy()
 
-    fig, ax = plt.subplots(figsize=(6.0, 4.8))
-    with np.errstate(divide="ignore"):
-        y = -np.log10(np.clip(fdr, 1e-300, 1))
-    ax.scatter(lfc[~hit], y[~hit], s=18, color="#a0aec0", label="not significant")
-    ax.scatter(lfc[hit], y[hit], s=22, color="#c53030", label="effective knockdown")
-    ax.axhline(-np.log10(cfg.perturbation.fdr_alpha), color="#718096", ls="--", lw=1)
-    ax.axvline(cfg.perturbation.max_log2fc_for_hit, color="#718096", ls="--", lw=1)
-    for i in np.argsort(lfc)[: min(12, len(lfc))]:
-        ax.annotate(names[i], (lfc[i], y[i]), fontsize=7,
-                    xytext=(3, 3), textcoords="offset points")
-    ax.set_xlabel("log2 fold change (perturbed / control)")
-    ax.set_ylabel("-log10 FDR (KS test)")
-    ax.set_title(f"Perturbation strength — control: {CONTROL_LABELS[primary]}", fontsize=10)
-    ax.legend(fontsize=8, frameon=False)
-    sns.despine(ax=ax)
+    table = (
+        results.table
+    )
+
+    primary = (
+        results.primary_control
+    )
+
+    lfc = (
+        table[
+            f"log2fc_{primary}"
+        ]
+        .to_numpy(
+            dtype=float
+        )
+    )
+
+    fdr = (
+        table[
+            f"ks_fdr_{primary}"
+        ]
+        .to_numpy(
+            dtype=float
+        )
+    )
+
+    hit = (
+        table[
+            f"is_hit_{primary}"
+        ]
+        .to_numpy(
+            dtype=bool
+        )
+    )
+
+    names = (
+        table[
+            "target_gene"
+        ]
+        .to_numpy()
+    )
+
+    fig, ax = plt.subplots(
+        figsize=(
+            6.0,
+            4.8,
+        )
+    )
+
+    with np.errstate(
+        divide="ignore"
+    ):
+
+        y = -np.log10(
+            np.clip(
+                fdr,
+                1e-300,
+                1,
+            )
+        )
+
+    ax.scatter(
+        lfc[
+            ~hit
+        ],
+        y[
+            ~hit
+        ],
+        s=18,
+        label="not significant",
+        alpha=0.7,
+    )
+
+    ax.scatter(
+        lfc[
+            hit
+        ],
+        y[
+            hit
+        ],
+        s=22,
+        label="effective knockdown",
+        alpha=0.8,
+    )
+
+    ax.axhline(
+        -np.log10(
+            cfg.perturbation.fdr_alpha
+        ),
+        ls="--",
+        lw=1,
+    )
+
+    ax.axvline(
+        cfg.perturbation.max_log2fc_for_hit,
+        ls="--",
+        lw=1,
+    )
+
+    finite_lfc = np.nan_to_num(
+        lfc,
+        nan=np.inf,
+    )
+
+    for idx in np.argsort(
+        finite_lfc
+    )[
+        :min(
+            12,
+            len(lfc),
+        )
+    ]:
+
+        if np.isfinite(
+            lfc[
+                idx
+            ]
+        ) and np.isfinite(
+            y[
+                idx
+            ]
+        ):
+
+            ax.annotate(
+                names[
+                    idx
+                ],
+                (
+                    lfc[
+                        idx
+                    ],
+                    y[
+                        idx
+                    ],
+                ),
+                fontsize=7,
+                xytext=(
+                    3,
+                    3,
+                ),
+                textcoords="offset points",
+            )
+
+    ax.set_xlabel(
+        "log2 fold change (perturbed / control)"
+    )
+
+    ax.set_ylabel(
+        "-log10 FDR (KS test)"
+    )
+
+    ax.set_title(
+        (
+            "Perturbation strength — control: "
+            f"{CONTROL_LABELS[primary]}"
+        ),
+        fontsize=10,
+    )
+
+    ax.legend(
+        fontsize=8,
+        frameon=False,
+    )
+
+    sns.despine(
+        ax=ax
+    )
+
     fig.tight_layout()
+
     reg.save(
         fig,
         "perturbation_volcano",
         SECTION_PERTURBATION,
         "Volcano of perturbation strength",
-        "Each point is a target gene, comparing its own expression in perturbed vs "
-        "control cells. Effective perturbations fall in the upper-left: significantly "
-        "reduced expression.",
+        "Each point is one target gene.",
     )
 
-    order = np.argsort(lfc)
-    fig, ax = plt.subplots(figsize=(max(6, 0.18 * len(order)), 4.0))
-    ax.bar(
-        range(len(order)),
-        lfc[order],
-        color=["#c53030" if hit[i] else "#a0aec0" for i in order],
+    # Bounded waterfall.
+    ranked = (
+        table.sort_values(
+            f"log2fc_{primary}",
+            ascending=True,
+        )
     )
-    ax.set_xticks(range(len(order)))
-    ax.set_xticklabels(names[order], rotation=90, fontsize=6)
-    ax.axhline(0, color="black", lw=0.8)
-    ax.set_ylabel("log2 fold change")
+
+    original_n = len(
+        ranked
+    )
+
+    if (
+        original_n
+        > LARGE_PLOT_MAX_OVERVIEW_TARGETS
+    ):
+
+        ranked = ranked.head(
+            LARGE_PLOT_MAX_OVERVIEW_TARGETS
+        )
+
+    fig, ax = plt.subplots(
+        figsize=(
+            max(
+                6,
+                min(
+                    24,
+                    0.10
+                    * len(ranked)
+                    + 4,
+                ),
+            ),
+            4.0,
+        )
+    )
+
+    ranked_lfc = (
+        ranked[
+            f"log2fc_{primary}"
+        ]
+        .to_numpy(
+            dtype=float
+        )
+    )
+
+    ranked_hit = (
+        ranked[
+            f"is_hit_{primary}"
+        ]
+        .to_numpy(
+            dtype=bool
+        )
+    )
+
+    ranked_names = (
+        ranked[
+            "target_gene"
+        ]
+        .to_numpy()
+    )
+
+    ax.bar(
+        range(
+            len(ranked)
+        ),
+        ranked_lfc,
+    )
+
+    ax.set_xticks(
+        range(
+            len(ranked)
+        )
+    )
+
+    ax.set_xticklabels(
+        ranked_names,
+        rotation=90,
+        fontsize=5,
+    )
+
+    ax.axhline(
+        0,
+        lw=0.8,
+    )
+
+    ax.set_ylabel(
+        "log2 fold change"
+    )
+
     ax.set_title(
-        f"Knockdown per target ({int(hit.sum())}/{len(hit)} effective at FDR < "
-        f"{cfg.perturbation.fdr_alpha})",
+        (
+            f"Strongest knockdowns "
+            f"({int(hit.sum())}/{len(hit)} effective)"
+        ),
         fontsize=10,
     )
-    sns.despine(ax=ax)
+
+    sns.despine(
+        ax=ax
+    )
+
     fig.tight_layout()
+
     reg.save(
         fig,
         "perturbation_waterfall",
         SECTION_PERTURBATION,
         "Knockdown strength per target",
-        "Targets sorted by fold change. Red bars are significant reductions; bars "
-        "near zero mean the guide did not measurably reduce its target.",
+        (
+            f"Top {len(ranked)} of {original_n} targets shown, "
+            "ranked by knockdown strength."
+            if original_n > len(ranked)
+            else "Targets ranked by knockdown strength."
+        ),
     )
 
-    if len(results.controls_used) > 1:
-        other = CONTROL_OTHER if primary == CONTROL_NTC else CONTROL_NTC
-        lfc2 = tbl[f"log2fc_{other}"].to_numpy(dtype=float)
-        ok = ~(np.isnan(lfc) | np.isnan(lfc2))
+    if len(
+        results.controls_used
+    ) > 1:
+
+        other = (
+            CONTROL_OTHER
+            if primary
+            == CONTROL_NTC
+            else CONTROL_NTC
+        )
+
+        lfc2 = (
+            table[
+                f"log2fc_{other}"
+            ]
+            .to_numpy(
+                dtype=float
+            )
+        )
+
+        ok = ~(
+            np.isnan(
+                lfc
+            )
+            | np.isnan(
+                lfc2
+            )
+        )
+
         if ok.sum() > 2:
-            fig, ax = plt.subplots(figsize=(4.8, 4.6))
-            ax.scatter(lfc[ok], lfc2[ok], s=20, color="#2b6cb0", alpha=0.8)
-            lim = [min(lfc[ok].min(), lfc2[ok].min()) - 0.1,
-                   max(lfc[ok].max(), lfc2[ok].max()) + 0.1]
-            ax.plot(lim, lim, ls="--", color="#718096", lw=1)
-            r = float(np.corrcoef(lfc[ok], lfc2[ok])[0, 1])
-            ax.set_xlabel(f"log2FC vs {CONTROL_LABELS[primary]}")
-            ax.set_ylabel(f"log2FC vs {CONTROL_LABELS[other]}")
-            ax.set_title(f"Control comparison (Pearson r = {r:.2f})", fontsize=10)
-            sns.despine(ax=ax)
+
+            fig, ax = plt.subplots(
+                figsize=(
+                    4.8,
+                    4.6,
+                )
+            )
+
+            ax.scatter(
+                lfc[
+                    ok
+                ],
+                lfc2[
+                    ok
+                ],
+                s=20,
+                alpha=0.8,
+            )
+
+            low = min(
+                lfc[
+                    ok
+                ].min(),
+                lfc2[
+                    ok
+                ].min(),
+            ) - 0.1
+
+            high = max(
+                lfc[
+                    ok
+                ].max(),
+                lfc2[
+                    ok
+                ].max(),
+            ) + 0.1
+
+            ax.plot(
+                [
+                    low,
+                    high,
+                ],
+                [
+                    low,
+                    high,
+                ],
+                ls="--",
+                lw=1,
+            )
+
+            r = float(
+                np.corrcoef(
+                    lfc[
+                        ok
+                    ],
+                    lfc2[
+                        ok
+                    ],
+                )[
+                    0,
+                    1
+                ]
+            )
+
+            ax.set_xlabel(
+                (
+                    "log2FC vs "
+                    f"{CONTROL_LABELS[primary]}"
+                )
+            )
+
+            ax.set_ylabel(
+                (
+                    "log2FC vs "
+                    f"{CONTROL_LABELS[other]}"
+                )
+            )
+
+            ax.set_title(
+                (
+                    "Control comparison "
+                    f"(Pearson r = {r:.2f})"
+                ),
+                fontsize=10,
+            )
+
+            sns.despine(
+                ax=ax
+            )
+
             fig.tight_layout()
+
             reg.save(
                 fig,
                 "perturbation_control_comparison",
                 SECTION_PERTURBATION,
                 "Effect size under both control definitions",
-                "Agreement between the two control groups. Points off the diagonal "
-                "are targets whose apparent effect depends on the control used.",
+                "Agreement between the two control definitions.",
             )
+
+
+# ---------------------------------------------------------------------------
+# Per-target perturbation plots
+# ---------------------------------------------------------------------------
 
 
 def plot_per_target(
@@ -774,1373 +2691,6179 @@ def plot_per_target(
     results: PerturbationResults,
     reg: FigureRegistry,
     cfg: Config,
-    rng: Optional[np.random.Generator] = None,
+    rng: Optional[
+        np.random.Generator
+    ] = None,
 ) -> None:
-    """One diagnostic figure per tested target gene.
+    """Per-target expression and embedding diagnostics.
 
-    Every target gets a figure on disk; only the top-N strongest are marked for
-    inline inclusion in the report (the rest are linked as extras).
+    Ordinary datasets retain the original all-target behavior. Large datasets
+    receive only a bounded set of top-ranked target figures.
     """
+
     if results.table.empty:
         return
-    rng = rng or np.random.default_rng(cfg.run.seed)
-    obs = expr.obs
-    targets_col = obs[OBS_TARGET].astype(str).to_numpy()
-    klass = obs[OBS_CLASS].astype(str).to_numpy()
-    coords = np.asarray(expr.obsm["X_umap"]) if "X_umap" in expr.obsm else None
-    primary = results.primary_control
-    top_n = cfg.perturbation.top_n_report
 
-    for i, row in results.table.iterrows():
-        gene = str(row["target_gene"])
-        values = _gene_values(expr, gene)
-        pert = (targets_col == gene) & (klass == CLASS_TARGETING)
-
-        groups = {"perturbed": values[pert]}
-        for control in results.controls_used:
-            if control == CONTROL_NTC:
-                m = klass == CLASS_NTC
-            else:
-                m = (klass == CLASS_TARGETING) & (targets_col != gene)
-            groups[CONTROL_LABELS[control]] = values[m]
-
-        n_panels = 3 if coords is not None else 2
-        fig, axes = plt.subplots(1, n_panels, figsize=(4.6 * n_panels, 4.0))
-
-        ax = axes[0]
-        for label, vals in groups.items():
-            if vals.size:
-                sns.ecdfplot(x=vals, ax=ax, label=f"{label} (n={vals.size:,})")
-        ax.set_xlabel(f"{gene} expression (log-normalized)")
-        ax.set_ylabel("Cumulative fraction of cells")
-        ax.legend(fontsize=7, frameon=False, loc="lower right")
-        fdr = row.get(f"ks_fdr_{primary}", np.nan)
-        lfc = row.get(f"log2fc_{primary}", np.nan)
-        ax.set_title(f"{gene}: log2FC = {lfc:.2f}, FDR = {fdr:.2g}", fontsize=10)
-        sns.despine(ax=ax)
-
-        ax = axes[1]
-        plot_df = pd.DataFrame(
-            {
-                "expression": np.concatenate([v for v in groups.values() if v.size]),
-                "group": np.concatenate(
-                    [[k] * v.size for k, v in groups.items() if v.size]
-                ),
-            }
+    rng = (
+        rng
+        or np.random.default_rng(
+            cfg.run.seed
         )
-        sns.violinplot(data=plot_df, x="group", y="expression", ax=ax, cut=0, inner="box")
-        ax.set_xlabel("")
-        ax.set_ylabel(f"{gene} expression")
-        ax.tick_params(axis="x", rotation=20, labelsize=7)
-        ax.set_title(f"{gene} expression by group", fontsize=10)
-        sns.despine(ax=ax)
+    )
 
+    obs = expr.obs
+
+    targets_col = (
+        obs[
+            OBS_TARGET
+        ]
+        .astype(str)
+        .to_numpy()
+    )
+
+    klass = (
+        obs[
+            OBS_CLASS
+        ]
+        .astype(str)
+        .to_numpy()
+    )
+
+    coords = (
+        np.asarray(
+            expr.obsm[
+                "X_umap"
+            ]
+        )
+        if "X_umap"
+        in expr.obsm
+        else None
+    )
+
+    primary = (
+        results.primary_control
+    )
+
+    top_n = (
+        cfg.perturbation.top_n_report
+    )
+
+    large_plot = (
+        _is_large_plot_dataset(
+            expr,
+            len(
+                results.table
+            ),
+        )
+    )
+
+    if large_plot:
+
+        n_plot = min(
+            LARGE_PLOT_MAX_PER_TARGET,
+            len(
+                results.table
+            ),
+        )
+
+        plot_table = (
+            results.table
+            .head(
+                n_plot
+            )
+            .copy()
+        )
+
+        logger.info(
+            "Large-data perturbation plotting: %d/%d targets",
+            len(plot_table),
+            len(
+                results.table
+            ),
+        )
+
+    else:
+
+        plot_table = (
+            results.table
+        )
+
+    for plot_rank, (
+        _,
+        row,
+    ) in enumerate(
+        plot_table.iterrows()
+    ):
+
+        gene = str(
+            row[
+                "target_gene"
+            ]
+        )
+
+        if gene not in expr.var_names:
+            continue
+
+        pert_indices = np.flatnonzero(
+            (
+                targets_col == gene
+            )
+            & (
+                klass
+                == CLASS_TARGETING
+            )
+        )
+
+        if not len(
+            pert_indices
+        ):
+            continue
+
+        # --------------------------------------------------------------
+        # Expression groups
+        # --------------------------------------------------------------
+
+        groups = {}
+
+        target_values = (
+            _gene_values(
+                expr,
+                gene,
+                pert_indices,
+            )
+        )
+
+        groups[
+            "perturbed"
+        ] = target_values
+
+        for control in (
+            results.controls_used
+        ):
+
+            if control == CONTROL_NTC:
+
+                pool = np.flatnonzero(
+                    klass == CLASS_NTC
+                )
+
+            else:
+
+                pool = np.flatnonzero(
+                    (
+                        klass
+                        == CLASS_TARGETING
+                    )
+                    & (
+                        targets_col
+                        != gene
+                    )
+                )
+
+            if large_plot:
+
+                ctrl_indices = (
+                    _sample_pool(
+                        pool,
+                        LARGE_PLOT_MAX_CONTROL_CELLS,
+                        cfg.run.seed
+                        + plot_rank,
+                    )
+                )
+
+            else:
+
+                ctrl_indices = (
+                    pool
+                )
+
+            groups[
+                CONTROL_LABELS[
+                    control
+                ]
+            ] = _gene_values(
+                expr,
+                gene,
+                ctrl_indices,
+            )
+
+        n_panels = (
+            3
+            if coords is not None
+            else 2
+        )
+
+        fig, axes = plt.subplots(
+            1,
+            n_panels,
+            figsize=(
+                4.6
+                * n_panels,
+                4.0,
+            ),
+        )
+
+        axes = np.atleast_1d(
+            axes
+        )
+
+        # ECDF
+        ax = axes[
+            0
+        ]
+
+        for label, values in (
+            groups.items()
+        ):
+
+            if values.size:
+
+                sns.ecdfplot(
+                    x=values,
+                    ax=ax,
+                    label=(
+                        f"{label} "
+                        f"(n={values.size:,})"
+                    ),
+                )
+
+        ax.set_xlabel(
+            (
+                f"{gene} expression "
+                "(log-normalized)"
+            )
+        )
+
+        ax.set_ylabel(
+            "Cumulative fraction of cells"
+        )
+
+        ax.legend(
+            fontsize=7,
+            frameon=False,
+            loc="lower right",
+        )
+
+        fdr = row.get(
+            f"ks_fdr_{primary}",
+            np.nan,
+        )
+
+        lfc = row.get(
+            f"log2fc_{primary}",
+            np.nan,
+        )
+
+        ax.set_title(
+            (
+                f"{gene}: "
+                f"log2FC = {lfc:.2f}, "
+                f"FDR = {fdr:.2g}"
+            ),
+            fontsize=10,
+        )
+
+        sns.despine(
+            ax=ax
+        )
+
+        # Violin
+        ax = axes[
+            1
+        ]
+
+        nonempty = [
+            (
+                label,
+                values,
+            )
+            for label, values
+            in groups.items()
+            if values.size
+        ]
+
+        if nonempty:
+
+            plot_df = pd.DataFrame(
+                {
+                    "expression": np.concatenate(
+                        [
+                            values
+                            for _,
+                            values
+                            in nonempty
+                        ]
+                    ),
+                    "group": np.concatenate(
+                        [
+                            np.repeat(
+                                label,
+                                len(
+                                    values
+                                ),
+                            )
+                            for label, values
+                            in nonempty
+                        ]
+                    ),
+                }
+            )
+
+            sns.violinplot(
+                data=plot_df,
+                x="group",
+                y="expression",
+                ax=ax,
+                cut=0,
+                inner="box",
+            )
+
+        ax.set_xlabel(
+            ""
+        )
+
+        ax.set_ylabel(
+            f"{gene} expression"
+        )
+
+        ax.tick_params(
+            axis="x",
+            rotation=20,
+            labelsize=7,
+        )
+
+        ax.set_title(
+            (
+                f"{gene} expression "
+                "by group"
+            ),
+            fontsize=10,
+        )
+
+        sns.despine(
+            ax=ax
+        )
+
+        # UMAP
         if coords is not None:
-            ax = axes[2]
-            frac = cfg.perturbation.umap_background_fraction
-            bg = rng.random(expr.n_obs) < frac
-            keep = bg | pert
-            ax.scatter(coords[keep & ~pert, 0], coords[keep & ~pert, 1], s=3,
-                       color="#e2e8f0", linewidths=0, rasterized=True,
-                       label=f"other cells ({int(frac * 100)}% shown)")
-            # A thin outline keeps perturbed cells with zero expression visible;
-            # without it the knocked-down cells — the point of the panel —
-            # render white on a pale background.
-            sc_ = ax.scatter(coords[pert, 0], coords[pert, 1], s=10, c=values[pert],
-                             cmap="Reds", vmin=0, edgecolors="#2d3748",
-                             linewidths=0.25, rasterized=True)
-            plt.colorbar(sc_, ax=ax, shrink=0.75, label=f"{gene} expression")
-            ax.set_title(f"Cells perturbed for {gene} (n={int(pert.sum()):,})", fontsize=10)
-            ax.set_xticks([])
-            ax.set_yticks([])
-            ax.legend(fontsize=7, frameon=False, loc="best", markerscale=3)
-            sns.despine(ax=ax, left=True, bottom=True)
+
+            ax = axes[
+                2
+            ]
+
+            if large_plot:
+
+                bg_pool = np.flatnonzero(
+                    ~(
+                        (
+                            targets_col == gene
+                        )
+                        & (
+                            klass
+                            == CLASS_TARGETING
+                        )
+                    )
+                )
+
+                bg_indices = _sample_pool(
+                    bg_pool,
+                    LARGE_PLOT_BACKGROUND_CELLS,
+                    cfg.run.seed
+                    + plot_rank,
+                )
+
+            else:
+
+                frac = (
+                    cfg.perturbation
+                    .umap_background_fraction
+                )
+
+                background_mask = (
+                    rng.random(
+                        expr.n_obs
+                    )
+                    < frac
+                )
+
+                bg_indices = np.flatnonzero(
+                    background_mask
+                    & ~(
+                        (
+                            targets_col
+                            == gene
+                        )
+                        & (
+                            klass
+                            == CLASS_TARGETING
+                        )
+                    )
+                )
+
+            ax.scatter(
+                coords[
+                    bg_indices,
+                    0,
+                ],
+                coords[
+                    bg_indices,
+                    1,
+                ],
+                s=3,
+                alpha=0.6,
+                linewidths=0,
+                rasterized=True,
+                label="background",
+            )
+
+            target_expr = (
+                target_values
+            )
+
+            scatter = ax.scatter(
+                coords[
+                    pert_indices,
+                    0,
+                ],
+                coords[
+                    pert_indices,
+                    1,
+                ],
+                s=10,
+                c=target_expr,
+                cmap="Reds",
+                linewidths=0.25,
+                rasterized=True,
+            )
+
+            plt.colorbar(
+                scatter,
+                ax=ax,
+                shrink=0.75,
+                label=(
+                    f"{gene} expression"
+                ),
+            )
+
+            ax.set_title(
+                (
+                    f"Cells perturbed for {gene} "
+                    f"(n={len(pert_indices):,})"
+                ),
+                fontsize=10,
+            )
+
+            ax.set_xticks(
+                []
+            )
+
+            ax.set_yticks(
+                []
+            )
+
+            ax.legend(
+                fontsize=7,
+                frameon=False,
+                loc="best",
+                markerscale=3,
+            )
+
+            sns.despine(
+                ax=ax,
+                left=True,
+                bottom=True,
+            )
 
         fig.tight_layout()
-        is_hit = bool(row.get(f"is_hit_{primary}", False))
+
+        is_hit = bool(
+            row.get(
+                f"is_hit_{primary}",
+                False,
+            )
+        )
+
         reg.save(
             fig,
             f"perturbation_{gene}",
             SECTION_PER_GENE,
             f"{gene} perturbation effect",
-            f"Expression of {gene} in cells carrying {gene} guides versus control "
-            f"cells. log2FC = {lfc:.2f}, KS FDR = {fdr:.2g}"
-            + (" — effective knockdown." if is_hit else " — no significant reduction."),
-            in_report=i < top_n,
+            (
+                f"Expression of {gene} in perturbed versus control cells. "
+                f"log2FC = {lfc:.2f}, KS FDR = {fdr:.2g}."
+                + (
+                    " Effective knockdown."
+                    if is_hit
+                    else ""
+                )
+            ),
+            in_report=(
+                plot_rank < top_n
+            ),
         )
+
     logger.info(
-        "Wrote %d per-target figures (%d shown in the report)",
-        len(results.table),
-        min(top_n, len(results.table)),
+        "Wrote %d per-target perturbation figures "
+        "(%d shown inline)",
+        len(
+            plot_table
+        ),
+        min(
+            top_n,
+            len(
+                plot_table
+            ),
+        ),
     )
 
 
 # ---------------------------------------------------------------------------
-# Cluster-enrichment figures
+# Enrichment helpers
 # ---------------------------------------------------------------------------
 
 
-def _order_by_similarity(matrix: pd.DataFrame) -> List[str]:
-    """Hierarchically order rows so similar profiles sit together."""
-    if matrix.shape[0] < 3:
-        return list(matrix.index)
+def _order_by_similarity(
+    matrix: pd.DataFrame,
+) -> List[str]:
+    """Hierarchically order rows by correlation."""
+
+    if (
+        matrix.shape[
+            0
+        ]
+        < 3
+    ):
+
+        return list(
+            matrix.index
+        )
+
     try:
-        from scipy.cluster.hierarchy import leaves_list, linkage
-        from scipy.spatial.distance import pdist
 
-        values = np.nan_to_num(matrix.to_numpy(dtype=float))
-        dist = pdist(values, metric="correlation")
-        if not np.all(np.isfinite(dist)):
-            return list(matrix.index)
-        return [matrix.index[i] for i in leaves_list(linkage(dist, method="average"))]
-    except Exception:  # pragma: no cover - ordering is cosmetic
-        return list(matrix.index)
+        from scipy.cluster.hierarchy import (
+            leaves_list,
+            linkage,
+        )
+
+        from scipy.spatial.distance import (
+            pdist,
+        )
+
+        values = np.nan_to_num(
+            matrix.to_numpy(
+                dtype=float
+            )
+        )
+
+        dist = pdist(
+            values,
+            metric="correlation",
+        )
+
+        if not np.all(
+            np.isfinite(
+                dist
+            )
+        ):
+
+            return list(
+                matrix.index
+            )
+
+        order = leaves_list(
+            linkage(
+                dist,
+                method="average",
+            )
+        )
+
+        return [
+            matrix.index[
+                idx
+            ]
+            for idx
+            in order
+        ]
+
+    except Exception:
+
+        return list(
+            matrix.index
+        )
 
 
-def plot_enrichment(expr, results, reg: FigureRegistry, cfg: Config) -> None:
-    """Heatmap, phenocopy map, composition bars, volcano and ranking."""
-    from .enrichment import enrichment_matrix, phenocopy_similarity, significance_matrix
+# ---------------------------------------------------------------------------
+# Enrichment overview
+# ---------------------------------------------------------------------------
+
+
+def plot_enrichment(
+    expr,
+    results,
+    reg: FigureRegistry,
+    cfg: Config,
+) -> None:
+    """Cluster-enrichment overview plots."""
+
+    from .enrichment import (
+        enrichment_matrix,
+        phenocopy_similarity,
+        significance_matrix,
+    )
 
     if results.table.empty:
         return
-    ecfg = cfg.enrichment
-    lor = enrichment_matrix(results)
-    fdr = significance_matrix(results)
+
+    ecfg = (
+        cfg.enrichment
+    )
+
+    lor = enrichment_matrix(
+        results
+    )
+
+    fdr = significance_matrix(
+        results
+    )
+
     if lor.empty:
         return
-    order = _order_by_similarity(lor)
-    lor = lor.loc[order]
-    fdr = fdr.loc[order]
 
-    # --- 1. main heatmap -------------------------------------------------
-    lim = float(np.nanpercentile(np.abs(lor.to_numpy()), 98)) or 1.0
-    height = max(4.0, 0.20 * len(lor) + 1.5)
-    fig, ax = plt.subplots(figsize=(max(6.0, 0.55 * lor.shape[1] + 4), height))
-    im = ax.imshow(lor.to_numpy(), cmap="RdBu_r", vmin=-lim, vmax=lim, aspect="auto")
-    ax.set_xticks(range(lor.shape[1]))
-    ax.set_xticklabels(lor.columns, fontsize=8)
-    ax.set_yticks(range(lor.shape[0]))
-    ax.set_yticklabels(lor.index, fontsize=6)
-    ax.set_xlabel(f"Cluster ({results.cluster_key})")
-    n_marked = 0
-    for i in range(lor.shape[0]):
-        for j in range(lor.shape[1]):
-            if fdr.iat[i, j] is not None and fdr.iat[i, j] < ecfg.fdr_alpha:
-                ax.text(j, i, "*", ha="center", va="center", fontsize=9, color="black")
-                n_marked += 1
-    plt.colorbar(im, ax=ax, shrink=0.6, label="log2 odds ratio")
+    # Restrict enormous heatmaps to strongest composition-changing targets.
+    if (
+        len(lor)
+        > LARGE_PLOT_MAX_HEATMAP_TARGETS
+    ):
+
+        strongest = list(
+            results.effect_magnitude[
+                "target_gene"
+            ]
+            .head(
+                LARGE_PLOT_MAX_HEATMAP_TARGETS
+            )
+        )
+
+        keep = (
+            lor.index
+            .intersection(
+                strongest
+            )
+        )
+
+        lor = lor.loc[
+            keep
+        ]
+
+        fdr = fdr.loc[
+            keep
+        ]
+
+        logger.info(
+            "Enrichment heatmap restricted to top %d targets",
+            len(lor),
+        )
+
+    order = _order_by_similarity(
+        lor
+    )
+
+    lor = lor.loc[
+        order
+    ]
+
+    fdr = fdr.loc[
+        order
+    ]
+
+    # Main heatmap
+    lim = (
+        float(
+            np.nanpercentile(
+                np.abs(
+                    lor.to_numpy()
+                ),
+                98,
+            )
+        )
+        or 1.0
+    )
+
+    height = max(
+        4.0,
+        min(
+            20.0,
+            0.12
+            * len(lor)
+            + 2.0,
+        ),
+    )
+
+    fig, ax = plt.subplots(
+        figsize=(
+            max(
+                6.0,
+                0.55
+                * lor.shape[
+                    1
+                ]
+                + 4,
+            ),
+            height,
+        )
+    )
+
+    im = ax.imshow(
+        lor.to_numpy(),
+        cmap="RdBu_r",
+        vmin=-lim,
+        vmax=lim,
+        aspect="auto",
+    )
+
+    ax.set_xticks(
+        range(
+            lor.shape[
+                1
+            ]
+        )
+    )
+
+    ax.set_xticklabels(
+        lor.columns,
+        fontsize=8,
+    )
+
+    if len(lor) <= 200:
+
+        ax.set_yticks(
+            range(
+                lor.shape[
+                    0
+                ]
+            )
+        )
+
+        ax.set_yticklabels(
+            lor.index,
+            fontsize=5,
+        )
+
+    else:
+
+        ax.set_yticks(
+            []
+        )
+
+    ax.set_xlabel(
+        (
+            "Cluster "
+            f"({results.cluster_key})"
+        )
+    )
+
+    # Avoid writing thousands of star text objects.
+    if (
+        lor.shape[
+            0
+        ]
+        <= 200
+    ):
+
+        for i in range(
+            lor.shape[
+                0
+            ]
+        ):
+
+            for j in range(
+                lor.shape[
+                    1
+                ]
+            ):
+
+                value = (
+                    fdr.iat[
+                        i,
+                        j
+                    ]
+                )
+
+                if (
+                    pd.notna(
+                        value
+                    )
+                    and value
+                    < ecfg.fdr_alpha
+                ):
+
+                    ax.text(
+                        j,
+                        i,
+                        "*",
+                        ha="center",
+                        va="center",
+                        fontsize=8,
+                    )
+
+    plt.colorbar(
+        im,
+        ax=ax,
+        shrink=0.6,
+        label="log2 odds ratio",
+    )
+
     ax.set_title(
-        f"Perturbation enrichment across clusters\n"
-        f"* FDR < {ecfg.fdr_alpha} vs {CONTROL_LABELS[results.primary_control]}",
+        "Perturbation enrichment across clusters",
         fontsize=10,
     )
+
     fig.tight_layout()
+
     reg.save(
         fig,
         "enrichment_heatmap",
         SECTION_ENRICHMENT,
         "Perturbation enrichment across clusters",
-        "Red means cells carrying that perturbation are over-represented in the "
-        "cluster, blue under-represented; asterisks mark significant pairs. Rows "
-        "are ordered by profile similarity, so perturbations with the same "
-        f"phenotype sit together ({n_marked} significant pair(s)).",
+        (
+            "Red indicates enrichment and blue depletion. "
+            f"{len(lor)} perturbations shown."
+        ),
     )
 
-    # --- 2. phenocopy similarity ----------------------------------------
-    sim = phenocopy_similarity(results)
-    if not sim.empty and sim.shape[0] >= 3:
-        sim_order = _order_by_similarity(sim)
-        sim = sim.loc[sim_order, sim_order]
-        size = max(5.0, 0.16 * len(sim) + 2)
-        fig, ax = plt.subplots(figsize=(size, size))
-        im = ax.imshow(sim.to_numpy(), cmap="RdBu_r", vmin=-1, vmax=1)
-        ax.set_xticks(range(len(sim)))
-        ax.set_xticklabels(sim.index, rotation=90, fontsize=5)
-        ax.set_yticks(range(len(sim)))
-        ax.set_yticklabels(sim.index, fontsize=5)
-        plt.colorbar(im, ax=ax, shrink=0.6, label="Pearson r")
-        ax.set_title("Do perturbations phenocopy each other?", fontsize=11)
+    # Phenocopy similarity.
+    sim = phenocopy_similarity(
+        results
+    )
+
+    if (
+        not sim.empty
+        and sim.shape[
+            0
+        ]
+        >= 3
+    ):
+
+        sim_order = _order_by_similarity(
+            sim
+        )
+
+        sim = sim.loc[
+            sim_order,
+            sim_order,
+        ]
+
+        size = max(
+            5.0,
+            min(
+                18.0,
+                0.10
+                * len(sim)
+                + 3,
+            ),
+        )
+
+        fig, ax = plt.subplots(
+            figsize=(
+                size,
+                size,
+            )
+        )
+
+        im = ax.imshow(
+            sim.to_numpy(),
+            cmap="RdBu_r",
+            vmin=-1,
+            vmax=1,
+        )
+
+        if len(sim) <= 100:
+
+            ax.set_xticks(
+                range(
+                    len(sim)
+                )
+            )
+
+            ax.set_xticklabels(
+                sim.index,
+                rotation=90,
+                fontsize=4,
+            )
+
+            ax.set_yticks(
+                range(
+                    len(sim)
+                )
+            )
+
+            ax.set_yticklabels(
+                sim.index,
+                fontsize=4,
+            )
+
+        else:
+
+            ax.set_xticks(
+                []
+            )
+
+            ax.set_yticks(
+                []
+            )
+
+        plt.colorbar(
+            im,
+            ax=ax,
+            shrink=0.6,
+            label="Pearson r",
+        )
+
+        ax.set_title(
+            "Perturbation phenocopy similarity",
+            fontsize=11,
+        )
+
         fig.tight_layout()
+
         reg.save(
             fig,
             "enrichment_phenocopy",
             SECTION_ENRICHMENT,
-            "Perturbation similarity (phenocopy map)",
-            "Correlation between targets of their cluster-composition profiles. "
-            "Red blocks are groups of perturbations producing the same cell-state "
-            "shift — subunits of one complex are expected to land together, which "
-            "is a check that needs no prior knowledge of the complexes.",
+            "Perturbation similarity",
+            (
+                f"Correlation of cluster-composition profiles "
+                f"for {len(sim)} perturbations."
+            ),
         )
 
-    # --- 3. composition stacked bars ------------------------------------
-    comp = results.composition
-    mag = results.effect_magnitude
-    top = list(mag["target_gene"].head(30))
-    ref = results.reference_composition[results.primary_control]
-    plot_df = pd.concat([ref.to_frame("REFERENCE").T, comp.loc[top]])
-    fig, ax = plt.subplots(figsize=(max(6, 0.32 * len(plot_df) + 2), 4.4))
-    bottom = np.zeros(len(plot_df))
-    palette = sns.color_palette("tab20", plot_df.shape[1])
-    for i, cl in enumerate(plot_df.columns):
-        ax.bar(range(len(plot_df)), plot_df[cl], bottom=bottom, color=palette[i], label=str(cl))
-        bottom += plot_df[cl].to_numpy()
-    ax.set_xticks(range(len(plot_df)))
-    ax.set_xticklabels(plot_df.index, rotation=90, fontsize=6)
-    ax.set_ylabel("% of cells")
-    ax.set_xlim(-0.6, len(plot_df) - 0.4)
-    ax.axvline(0.5, color="black", lw=1.2)
-    ax.legend(title="cluster", fontsize=6, title_fontsize=7, frameon=False,
-              bbox_to_anchor=(1.01, 1), loc="upper left", ncol=1)
-    ax.set_title("Cluster composition per perturbation (top 30 by shift)", fontsize=10)
-    sns.despine(ax=ax)
-    fig.tight_layout()
-    reg.save(
-        fig,
-        "enrichment_composition",
-        SECTION_ENRICHMENT,
-        "Cluster composition per perturbation",
-        "Each bar is one perturbation's distribution across clusters; the leftmost "
-        "bar (left of the black line) is the reference. Perturbations are sorted "
-        "by how far their composition sits from it.",
+    # Composition bars: top 30.
+    comp = (
+        results.composition
     )
 
-    # --- 4. volcano ------------------------------------------------------
-    sub = results.table[results.table["control"] == results.primary_control]
-    x = sub["log2_odds_ratio"].to_numpy(dtype=float)
-    with np.errstate(divide="ignore"):
-        y = -np.log10(np.clip(sub["fdr"].to_numpy(dtype=float), 1e-300, 1))
-    sig = sub["significant"].to_numpy(dtype=bool)
-    fig, ax = plt.subplots(figsize=(6.2, 4.8))
-    ax.scatter(x[~sig], y[~sig], s=12, color="#a0aec0", label="not significant")
-    ax.scatter(x[sig], y[sig], s=20, color="#c53030", label=f"FDR < {ecfg.fdr_alpha}")
-    ax.axhline(-np.log10(ecfg.fdr_alpha), color="#718096", ls="--", lw=1)
-    ax.axvline(0, color="#718096", ls="--", lw=1)
-    labelled = sub[sig].reindex(
-        sub[sig]["log2_odds_ratio"].abs().sort_values(ascending=False).index
-    ).head(10)
-    for _, row in labelled.iterrows():
-        ax.annotate(
-            f"{row['target_gene']}:{row['cluster']}",
-            (row["log2_odds_ratio"], -np.log10(max(row["fdr"], 1e-300))),
-            fontsize=6, xytext=(3, 3), textcoords="offset points",
+    magnitude = (
+        results.effect_magnitude
+    )
+
+    top = list(
+        magnitude[
+            "target_gene"
+        ]
+        .head(
+            30
         )
-    ax.set_xlabel("log2 odds ratio (enriched >0, depleted <0)")
-    ax.set_ylabel("-log10 FDR")
-    ax.set_title("Enrichment across all target x cluster pairs", fontsize=10)
-    ax.legend(fontsize=8, frameon=False)
-    sns.despine(ax=ax)
+    )
+
+    if top:
+
+        reference = (
+            results.reference_composition[
+                results.primary_control
+            ]
+        )
+
+        plot_df = pd.concat(
+            [
+                reference
+                .to_frame(
+                    "REFERENCE"
+                )
+                .T,
+                comp.loc[
+                    top
+                ],
+            ]
+        )
+
+        fig, ax = plt.subplots(
+            figsize=(
+                max(
+                    6,
+                    0.32
+                    * len(plot_df)
+                    + 2,
+                ),
+                4.4,
+            )
+        )
+
+        bottom = np.zeros(
+            len(plot_df)
+        )
+
+        palette = sns.color_palette(
+            "tab20",
+            plot_df.shape[
+                1
+            ],
+        )
+
+        for i, cluster in enumerate(
+            plot_df.columns
+        ):
+
+            ax.bar(
+                range(
+                    len(plot_df)
+                ),
+                plot_df[
+                    cluster
+                ],
+                bottom=bottom,
+                color=palette[
+                    i
+                ],
+                label=str(
+                    cluster
+                ),
+            )
+
+            bottom += (
+                plot_df[
+                    cluster
+                ]
+                .to_numpy()
+            )
+
+        ax.set_xticks(
+            range(
+                len(plot_df)
+            )
+        )
+
+        ax.set_xticklabels(
+            plot_df.index,
+            rotation=90,
+            fontsize=6,
+        )
+
+        ax.set_ylabel(
+            "% of cells"
+        )
+
+        ax.legend(
+            title="cluster",
+            fontsize=6,
+            title_fontsize=7,
+            frameon=False,
+            bbox_to_anchor=(
+                1.01,
+                1,
+            ),
+            loc="upper left",
+        )
+
+        ax.set_title(
+            (
+                "Cluster composition per perturbation "
+                "(top 30 by shift)"
+            ),
+            fontsize=10,
+        )
+
+        sns.despine(
+            ax=ax
+        )
+
+        fig.tight_layout()
+
+        reg.save(
+            fig,
+            "enrichment_composition",
+            SECTION_ENRICHMENT,
+            "Cluster composition per perturbation",
+            "Top composition-shifting perturbations compared with the reference.",
+        )
+
+    # Volcano.
+    sub = results.table[
+        results.table[
+            "control"
+        ]
+        == results.primary_control
+    ]
+
+    x = (
+        sub[
+            "log2_odds_ratio"
+        ]
+        .to_numpy(
+            dtype=float
+        )
+    )
+
+    with np.errstate(
+        divide="ignore"
+    ):
+
+        y = -np.log10(
+            np.clip(
+                sub[
+                    "fdr"
+                ]
+                .to_numpy(
+                    dtype=float
+                ),
+                1e-300,
+                1,
+            )
+        )
+
+    sig = (
+        sub[
+            "significant"
+        ]
+        .to_numpy(
+            dtype=bool
+        )
+    )
+
+    fig, ax = plt.subplots(
+        figsize=(
+            6.2,
+            4.8,
+        )
+    )
+
+    ax.scatter(
+        x[
+            ~sig
+        ],
+        y[
+            ~sig
+        ],
+        s=12,
+        alpha=0.5,
+        label="not significant",
+    )
+
+    ax.scatter(
+        x[
+            sig
+        ],
+        y[
+            sig
+        ],
+        s=20,
+        alpha=0.8,
+        label=(
+            f"FDR < "
+            f"{ecfg.fdr_alpha}"
+        ),
+    )
+
+    ax.axhline(
+        -np.log10(
+            ecfg.fdr_alpha
+        ),
+        ls="--",
+        lw=1,
+    )
+
+    ax.axvline(
+        0,
+        ls="--",
+        lw=1,
+    )
+
+    labelled = (
+        sub[
+            sig
+        ]
+        .reindex(
+            sub[
+                sig
+            ][
+                "log2_odds_ratio"
+            ]
+            .abs()
+            .sort_values(
+                ascending=False
+            )
+            .index
+        )
+        .head(
+            10
+        )
+    )
+
+    for _, row in (
+        labelled.iterrows()
+    ):
+
+        ax.annotate(
+            (
+                f"{row['target_gene']}:"
+                f"{row['cluster']}"
+            ),
+            (
+                row[
+                    "log2_odds_ratio"
+                ],
+                -np.log10(
+                    max(
+                        row[
+                            "fdr"
+                        ],
+                        1e-300,
+                    )
+                ),
+            ),
+            fontsize=6,
+            xytext=(
+                3,
+                3,
+            ),
+            textcoords="offset points",
+        )
+
+    ax.set_xlabel(
+        "log2 odds ratio"
+    )
+
+    ax.set_ylabel(
+        "-log10 FDR"
+    )
+
+    ax.set_title(
+        "Target × cluster enrichment",
+        fontsize=10,
+    )
+
+    ax.legend(
+        fontsize=8,
+        frameon=False,
+    )
+
+    sns.despine(
+        ax=ax
+    )
+
     fig.tight_layout()
+
     reg.save(
         fig,
         "enrichment_volcano",
         SECTION_ENRICHMENT,
         "Enrichment volcano",
-        "Every target/cluster pair. Points to the right are perturbations that "
-        "accumulate in a cluster; to the left, ones depleted from it.",
+        "All tested target × cluster associations.",
     )
 
-    # --- 5. effect magnitude ranking -------------------------------------
-    fig, ax = plt.subplots(figsize=(max(6, 0.16 * len(mag)), 3.8))
-    colors = ["#c53030" if n > 0 else "#a0aec0" for n in mag["n_significant_clusters"]]
-    ax.bar(range(len(mag)), mag["composition_shift_pct"], color=colors)
-    ax.set_xticks(range(len(mag)))
-    ax.set_xticklabels(mag["target_gene"], rotation=90, fontsize=6)
-    ax.set_ylabel("Composition shift (%)")
-    ax.set_title(
-        "How far each perturbation moves cells between clusters "
-        "(red = has a significant cluster)",
-        fontsize=10,
-    )
-    sns.despine(ax=ax)
-    fig.tight_layout()
-    reg.save(
-        fig,
-        "enrichment_effect_magnitude",
-        SECTION_ENRICHMENT,
-        "Composition shift per perturbation",
-        "Total variation distance between each perturbation's cluster composition "
-        "and the reference: 0% means indistinguishable, 100% means the cells sit "
-        "in entirely different clusters.",
+    # Effect magnitude ranking.
+    mag_plot = (
+        magnitude.copy()
     )
 
+    original_n = len(
+        mag_plot
+    )
 
-def plot_enrichment_per_target(expr, results, reg: FigureRegistry, cfg: Config) -> None:
-    """One composition + UMAP figure per target; top-N marked for the report."""
-    from .enrichment import OBS_TARGET as _T  # noqa: F401  (kept explicit below)
+    if (
+        original_n
+        > LARGE_PLOT_MAX_OVERVIEW_TARGETS
+    ):
+
+        mag_plot = (
+            mag_plot.head(
+                LARGE_PLOT_MAX_OVERVIEW_TARGETS
+            )
+        )
+
+    if not mag_plot.empty:
+
+        fig, ax = plt.subplots(
+            figsize=(
+                max(
+                    6,
+                    min(
+                        24,
+                        0.10
+                        * len(
+                            mag_plot
+                        )
+                        + 4,
+                    ),
+                ),
+                3.8,
+            )
+        )
+
+        ax.bar(
+            range(
+                len(
+                    mag_plot
+                )
+            ),
+            mag_plot[
+                "composition_shift_pct"
+            ],
+        )
+
+        ax.set_xticks(
+            range(
+                len(
+                    mag_plot
+                )
+            )
+        )
+
+        ax.set_xticklabels(
+            mag_plot[
+                "target_gene"
+            ],
+            rotation=90,
+            fontsize=5,
+        )
+
+        ax.set_ylabel(
+            "Composition shift (%)"
+        )
+
+        ax.set_title(
+            "Strongest cluster-composition shifts",
+            fontsize=10,
+        )
+
+        sns.despine(
+            ax=ax
+        )
+
+        fig.tight_layout()
+
+        reg.save(
+            fig,
+            "enrichment_effect_magnitude",
+            SECTION_ENRICHMENT,
+            "Composition shift per perturbation",
+            (
+                f"Top {len(mag_plot)} of {original_n} perturbations shown."
+                if original_n
+                > len(mag_plot)
+                else "Cluster-composition displacement by perturbation."
+            ),
+        )
+
+
+# ---------------------------------------------------------------------------
+# Per-target enrichment
+# ---------------------------------------------------------------------------
+
+
+def plot_enrichment_per_target(
+    expr,
+    results,
+    reg: FigureRegistry,
+    cfg: Config,
+) -> None:
+    """Target-specific enrichment figures."""
 
     if results.table.empty:
         return
-    obs = expr.obs
-    cluster_key = results.cluster_key
-    targets_col = obs[OBS_TARGET].astype(str).to_numpy()
-    klass = obs[OBS_CLASS].astype(str).to_numpy()
-    clusters_col = obs[cluster_key].astype(str).to_numpy()
-    coords = np.asarray(expr.obsm["X_umap"]) if "X_umap" in expr.obsm else None
-    ref = results.reference_composition[results.primary_control]
-    clusters = list(results.composition.columns)
 
-    # Report the strongest hits first; every target still gets a file.
-    ranked = list(results.effect_magnitude["target_gene"])
-    hit_targets = results.targets_with_hits()
-    ordered = [t for t in ranked if t in hit_targets] + [
-        t for t in ranked if t not in hit_targets
+    obs = (
+        expr.obs
+    )
+
+    cluster_key = (
+        results.cluster_key
+    )
+
+    targets_col = (
+        obs[
+            OBS_TARGET
+        ]
+        .astype(str)
+        .to_numpy()
+    )
+
+    klass = (
+        obs[
+            OBS_CLASS
+        ]
+        .astype(str)
+        .to_numpy()
+    )
+
+    clusters_col = (
+        obs[
+            cluster_key
+        ]
+        .astype(str)
+        .to_numpy()
+    )
+
+    coords = (
+        np.asarray(
+            expr.obsm[
+                "X_umap"
+            ]
+        )
+        if "X_umap"
+        in expr.obsm
+        else None
+    )
+
+    reference = (
+        results.reference_composition[
+            results.primary_control
+        ]
+    )
+
+    clusters = list(
+        results.composition.columns
+    )
+
+    ranked = list(
+        results.effect_magnitude[
+            "target_gene"
+        ]
+    )
+
+    hit_targets = set(
+        results.targets_with_hits()
+    )
+
+    ordered = [
+        target
+        for target
+        in ranked
+        if target
+        in hit_targets
+    ] + [
+        target
+        for target
+        in ranked
+        if target
+        not in hit_targets
     ]
-    top_n = cfg.enrichment.top_n_report
 
-    sub_tbl = results.table[results.table["control"] == results.primary_control]
-    for rank, gene in enumerate(ordered):
-        if gene not in results.composition.index:
+    large_plot = (
+        _is_large_plot_dataset(
+            expr,
+            len(
+                ordered
+            ),
+        )
+    )
+
+    if large_plot:
+
+        ordered = ordered[
+            :LARGE_PLOT_MAX_PER_TARGET
+        ]
+
+        logger.info(
+            "Large-data enrichment plotting: %d per-target figures",
+            len(
+                ordered
+            ),
+        )
+
+    top_n = (
+        cfg.enrichment.top_n_report
+    )
+
+    sub_table = results.table[
+        results.table[
+            "control"
+        ]
+        == results.primary_control
+    ]
+
+    for rank, gene in enumerate(
+        ordered
+    ):
+
+        if gene not in (
+            results.composition.index
+        ):
             continue
-        comp = results.composition.loc[gene]
-        rows = sub_tbl[sub_tbl["target_gene"] == gene].set_index("cluster")
 
-        n_panels = 2 if coords is None else 3
-        fig, axes = plt.subplots(1, n_panels, figsize=(4.7 * n_panels, 4.0))
+        comp = (
+            results.composition.loc[
+                gene
+            ]
+        )
 
-        ax = axes[0]
-        idx = np.arange(len(clusters))
-        ax.bar(idx - 0.2, ref[clusters], width=0.4, color="#a0aec0", label="reference")
-        ax.bar(idx + 0.2, comp[clusters], width=0.4, color="#2b6cb0", label=gene)
-        for i, cl in enumerate(clusters):
-            if cl in rows.index and bool(rows.at[cl, "significant"]):
-                ax.text(i, max(comp[cl], ref[cl]) + 1, "*", ha="center", fontsize=11)
-        ax.set_xticks(idx)
-        ax.set_xticklabels(clusters, fontsize=7)
-        ax.set_xlabel(f"Cluster ({cluster_key})")
-        ax.set_ylabel("% of cells")
-        ax.legend(fontsize=7, frameon=False)
-        ax.set_title(f"{gene} cluster composition", fontsize=10)
-        sns.despine(ax=ax)
-
-        ax = axes[1]
-        lor = rows["log2_odds_ratio"].reindex(clusters)
-        sig = rows["significant"].reindex(clusters).fillna(False).to_numpy(dtype=bool)
-        ax.bar(idx, lor.to_numpy(dtype=float),
-               color=["#c53030" if s else "#a0aec0" for s in sig])
-        ax.axhline(0, color="black", lw=0.8)
-        ax.set_xticks(idx)
-        ax.set_xticklabels(clusters, fontsize=7)
-        ax.set_xlabel(f"Cluster ({cluster_key})")
-        ax.set_ylabel("log2 odds ratio")
-        ax.set_title(f"{gene} enrichment (red = FDR < {cfg.enrichment.fdr_alpha})", fontsize=10)
-        sns.despine(ax=ax)
-
-        if coords is not None:
-            ax = axes[2]
-            pert = (targets_col == gene) & (klass == CLASS_TARGETING)
-            ax.scatter(coords[~pert, 0], coords[~pert, 1], s=2, color="#e2e8f0",
-                       linewidths=0, rasterized=True)
-            cl_of = clusters_col[pert]
-            palette = sns.color_palette("tab20", len(clusters))
-            cmap = {c: palette[i] for i, c in enumerate(clusters)}
-            ax.scatter(coords[pert, 0], coords[pert, 1], s=10,
-                       c=[cmap.get(c, (0.3, 0.3, 0.3)) for c in cl_of],
-                       linewidths=0.2, edgecolors="#2d3748", rasterized=True)
-            ax.set_title(f"{gene} cells by cluster (n={int(pert.sum()):,})", fontsize=10)
-            ax.set_xticks([])
-            ax.set_yticks([])
-            sns.despine(ax=ax, left=True, bottom=True)
-
-        best = rows["log2_odds_ratio"].abs().idxmax() if len(rows) else None
-        caption = f"Cluster distribution of cells perturbed for {gene}."
-        if best is not None and cl_has_hit(rows, best):
-            caption += (
-                f" Strongest association: cluster {best} "
-                f"({rows.at[best, 'pct_of_target']:.1f}% of {gene} cells vs "
-                f"{rows.at[best, 'pct_of_reference']:.1f}% of reference, "
-                f"FDR = {rows.at[best, 'fdr']:.2g})."
+        rows = (
+            sub_table[
+                sub_table[
+                    "target_gene"
+                ]
+                == gene
+            ]
+            .set_index(
+                "cluster"
             )
+        )
+
+        n_panels = (
+            3
+            if coords is not None
+            else 2
+        )
+
+        fig, axes = plt.subplots(
+            1,
+            n_panels,
+            figsize=(
+                4.7
+                * n_panels,
+                4.0,
+            ),
+        )
+
+        axes = np.atleast_1d(
+            axes
+        )
+
+        # Composition
+        ax = axes[
+            0
+        ]
+
+        idx = np.arange(
+            len(
+                clusters
+            )
+        )
+
+        ref_vals = (
+            reference.reindex(
+                clusters,
+                fill_value=0,
+            )
+            .to_numpy(
+                dtype=float
+            )
+        )
+
+        comp_vals = (
+            comp.reindex(
+                clusters,
+                fill_value=0,
+            )
+            .to_numpy(
+                dtype=float
+            )
+        )
+
+        ax.bar(
+            idx - 0.2,
+            ref_vals,
+            width=0.4,
+            label="reference",
+        )
+
+        ax.bar(
+            idx + 0.2,
+            comp_vals,
+            width=0.4,
+            label=gene,
+        )
+
+        for i, cluster in enumerate(
+            clusters
+        ):
+
+            if (
+                cluster in rows.index
+                and bool(
+                    rows.at[
+                        cluster,
+                        "significant",
+                    ]
+                )
+            ):
+
+                ax.text(
+                    i,
+                    max(
+                        comp_vals[
+                            i
+                        ],
+                        ref_vals[
+                            i
+                        ],
+                    )
+                    + 1,
+                    "*",
+                    ha="center",
+                    fontsize=11,
+                )
+
+        ax.set_xticks(
+            idx
+        )
+
+        ax.set_xticklabels(
+            clusters,
+            fontsize=7,
+        )
+
+        ax.set_xlabel(
+            f"Cluster ({cluster_key})"
+        )
+
+        ax.set_ylabel(
+            "% of cells"
+        )
+
+        ax.legend(
+            fontsize=7,
+            frameon=False,
+        )
+
+        ax.set_title(
+            f"{gene} cluster composition",
+            fontsize=10,
+        )
+
+        sns.despine(
+            ax=ax
+        )
+
+        # Odds ratios
+        ax = axes[
+            1
+        ]
+
+        lor = (
+            rows[
+                "log2_odds_ratio"
+            ]
+            .reindex(
+                clusters
+            )
+        )
+
+        sig = (
+            rows[
+                "significant"
+            ]
+            .reindex(
+                clusters
+            )
+            .fillna(
+                False
+            )
+            .to_numpy(
+                dtype=bool
+            )
+        )
+
+        ax.bar(
+            idx,
+            lor.to_numpy(
+                dtype=float
+            ),
+        )
+
+        ax.axhline(
+            0,
+            lw=0.8,
+        )
+
+        ax.set_xticks(
+            idx
+        )
+
+        ax.set_xticklabels(
+            clusters,
+            fontsize=7,
+        )
+
+        ax.set_xlabel(
+            f"Cluster ({cluster_key})"
+        )
+
+        ax.set_ylabel(
+            "log2 odds ratio"
+        )
+
+        ax.set_title(
+            (
+                f"{gene} enrichment "
+                f"({int(sig.sum())} significant cluster(s))"
+            ),
+            fontsize=10,
+        )
+
+        sns.despine(
+            ax=ax
+        )
+
+        # UMAP
+        if coords is not None:
+
+            ax = axes[
+                2
+            ]
+
+            pert_indices = np.flatnonzero(
+                (
+                    targets_col
+                    == gene
+                )
+                & (
+                    klass
+                    == CLASS_TARGETING
+                )
+            )
+
+            if large_plot:
+
+                bg_pool = np.flatnonzero(
+                    ~(
+                        (
+                            targets_col
+                            == gene
+                        )
+                        & (
+                            klass
+                            == CLASS_TARGETING
+                        )
+                    )
+                )
+
+                bg_indices = _sample_pool(
+                    bg_pool,
+                    LARGE_PLOT_BACKGROUND_CELLS,
+                    cfg.run.seed
+                    + rank,
+                )
+
+            else:
+
+                bg_indices = np.flatnonzero(
+                    ~(
+                        (
+                            targets_col
+                            == gene
+                        )
+                        & (
+                            klass
+                            == CLASS_TARGETING
+                        )
+                    )
+                )
+
+            ax.scatter(
+                coords[
+                    bg_indices,
+                    0,
+                ],
+                coords[
+                    bg_indices,
+                    1,
+                ],
+                s=2,
+                alpha=0.4,
+                linewidths=0,
+                rasterized=True,
+            )
+
+            cluster_of = (
+                clusters_col[
+                    pert_indices
+                ]
+            )
+
+            palette = sns.color_palette(
+                "tab20",
+                len(
+                    clusters
+                ),
+            )
+
+            color_map = {
+                cluster: palette[
+                    i
+                ]
+                for i, cluster
+                in enumerate(
+                    clusters
+                )
+            }
+
+            ax.scatter(
+                coords[
+                    pert_indices,
+                    0,
+                ],
+                coords[
+                    pert_indices,
+                    1,
+                ],
+                s=10,
+                c=[
+                    color_map.get(
+                        cluster,
+                        (
+                            0.3,
+                            0.3,
+                            0.3,
+                        ),
+                    )
+                    for cluster
+                    in cluster_of
+                ],
+                linewidths=0.2,
+                rasterized=True,
+            )
+
+            ax.set_title(
+                (
+                    f"{gene} cells by cluster "
+                    f"(n={len(pert_indices):,})"
+                ),
+                fontsize=10,
+            )
+
+            ax.set_xticks(
+                []
+            )
+
+            ax.set_yticks(
+                []
+            )
+
+            sns.despine(
+                ax=ax,
+                left=True,
+                bottom=True,
+            )
+
+        best = (
+            rows[
+                "log2_odds_ratio"
+            ]
+            .abs()
+            .idxmax()
+            if len(rows)
+            else None
+        )
+
+        caption = (
+            f"Cluster distribution of cells perturbed for {gene}."
+        )
+
+        if (
+            best is not None
+            and cl_has_hit(
+                rows,
+                best,
+            )
+        ):
+
+            caption += (
+                f" Strongest association: cluster {best}, "
+                f"FDR={rows.at[best, 'fdr']:.2g}."
+            )
+
         fig.tight_layout()
+
         reg.save(
             fig,
             f"enrichment_{gene}",
             SECTION_ENRICH_PER_TARGET,
             f"{gene} cluster enrichment",
             caption,
-            in_report=rank < top_n,
+            in_report=(
+                rank < top_n
+            ),
         )
-    logger.info(
-        "Wrote %d per-target enrichment figures (%d shown in the report)",
-        len(ordered),
-        min(top_n, len(ordered)),
-    )
 
 
-def cl_has_hit(rows: pd.DataFrame, cluster) -> bool:
-    """True when this target/cluster pair reached significance."""
+def cl_has_hit(
+    rows: pd.DataFrame,
+    cluster,
+) -> bool:
+    """True when target/cluster pair is significant."""
+
     try:
-        return bool(rows.at[cluster, "significant"])
-    except (KeyError, ValueError):
+
+        return bool(
+            rows.at[
+                cluster,
+                "significant",
+            ]
+        )
+
+    except (
+        KeyError,
+        ValueError,
+    ):
+
         return False
 
 
 # ---------------------------------------------------------------------------
-# Perturbation-score figures (pertps / PS_python)
+# PS overview
 # ---------------------------------------------------------------------------
 
 
-def plot_ps_scores(expr, results, perturbation_results, reg: FigureRegistry, cfg: Config) -> None:
-    """Quadrant scatters, a knockdown-efficiency ranking and a method check."""
+def plot_ps_scores(
+    expr,
+    results,
+    perturbation_results,
+    reg: FigureRegistry,
+    cfg: Config,
+) -> None:
+    """Perturbation-score overview and method comparison."""
+
     from .ps_score import (
-        QUADRANT_COLORS,
         QUADRANT_ESCAPER,
         QUADRANT_KD,
         compare_with_perturbation_strength,
     )
 
-    if results is None or results.summary.empty:
+    if (
+        results is None
+        or results.summary.empty
+    ):
         return
-    summary = results.summary
 
-    # --- 1. knockdown efficiency per target ------------------------------
-    fig, ax = plt.subplots(figsize=(max(6, 0.20 * len(summary)), 4.0))
-    bottom = np.zeros(len(summary))
-    for key, col in [
-        ("pct_successful_kd", QUADRANT_KD),
-        ("pct_escaper", QUADRANT_ESCAPER),
-        ("pct_non_responder", "non-responder"),
-        ("pct_low_signal", "low signal"),
+    summary = (
+        results.summary
+    )
+
+    summary_plot = (
+        summary.copy()
+    )
+
+    original_n = len(
+        summary_plot
+    )
+
+    if (
+        original_n
+        > LARGE_PLOT_MAX_OVERVIEW_TARGETS
+    ):
+
+        summary_plot = (
+            summary_plot.head(
+                LARGE_PLOT_MAX_OVERVIEW_TARGETS
+            )
+        )
+
+        logger.info(
+            "PS overview plot restricted to top %d/%d targets",
+            len(
+                summary_plot
+            ),
+            original_n,
+        )
+
+    # Outcome stacked bars.
+    fig, ax = plt.subplots(
+        figsize=(
+            max(
+                6,
+                min(
+                    24,
+                    0.10
+                    * len(
+                        summary_plot
+                    )
+                    + 4,
+                ),
+            ),
+            4.0,
+        )
+    )
+
+    bottom = np.zeros(
+        len(
+            summary_plot
+        )
+    )
+
+    for key, label in [
+        (
+            "pct_successful_kd",
+            QUADRANT_KD,
+        ),
+        (
+            "pct_escaper",
+            QUADRANT_ESCAPER,
+        ),
+        (
+            "pct_non_responder",
+            "non-responder",
+        ),
+        (
+            "pct_low_signal",
+            "low signal",
+        ),
     ]:
-        ax.bar(range(len(summary)), summary[key], bottom=bottom,
-               color=QUADRANT_COLORS.get(col, "#a0aec0"), label=col)
-        bottom += summary[key].to_numpy()
-    ax.set_xticks(range(len(summary)))
-    ax.set_xticklabels(summary["target_gene"], rotation=90, fontsize=6)
-    ax.set_ylabel("% of perturbed cells")
-    ax.set_title("Per-cell perturbation outcome by target", fontsize=11)
-    ax.legend(fontsize=7, frameon=False, bbox_to_anchor=(1.01, 1), loc="upper left")
-    sns.despine(ax=ax)
+
+        ax.bar(
+            range(
+                len(
+                    summary_plot
+                )
+            ),
+            summary_plot[
+                key
+            ],
+            bottom=bottom,
+            label=label,
+        )
+
+        bottom += (
+            summary_plot[
+                key
+            ]
+            .to_numpy()
+        )
+
+    ax.set_xticks(
+        range(
+            len(
+                summary_plot
+            )
+        )
+    )
+
+    ax.set_xticklabels(
+        summary_plot[
+            "target_gene"
+        ],
+        rotation=90,
+        fontsize=5,
+    )
+
+    ax.set_ylabel(
+        "% of perturbed cells"
+    )
+
+    ax.set_title(
+        "Per-cell perturbation outcome by target",
+        fontsize=11,
+    )
+
+    ax.legend(
+        fontsize=7,
+        frameon=False,
+        bbox_to_anchor=(
+            1.01,
+            1,
+        ),
+        loc="upper left",
+    )
+
+    sns.despine(
+        ax=ax
+    )
+
     fig.tight_layout()
+
     reg.save(
         fig,
         "ps_outcome_by_target",
         SECTION_PS,
         "Per-cell perturbation outcome",
-        "Each perturbed cell is classified by its perturbation score and the "
-        "target's own expression. Green is a confirmed knockdown; red are "
-        "escapers, which carry the guide and show the signature yet still "
-        "express the gene.",
+        (
+            f"Top {len(summary_plot)} of {original_n} targets shown."
+            if original_n
+            > len(summary_plot)
+            else "Per-target PS/expression outcome classification."
+        ),
     )
 
-    # --- 2. escaper fraction ---------------------------------------------
-    esc = summary.sort_values("pct_escaper", ascending=False)
-    fig, ax = plt.subplots(figsize=(max(6, 0.20 * len(esc)), 3.6))
-    ax.bar(range(len(esc)), esc["pct_escaper"], color="#c53030")
-    ax.set_xticks(range(len(esc)))
-    ax.set_xticklabels(esc["target_gene"], rotation=90, fontsize=6)
-    ax.set_ylabel("% escapers")
-    ax.set_title("Escaper fraction per target", fontsize=11)
-    sns.despine(ax=ax)
+    # Escaper ranking.
+    esc = (
+        summary.sort_values(
+            "pct_escaper",
+            ascending=False,
+        )
+    )
+
+    if (
+        len(esc)
+        > LARGE_PLOT_MAX_OVERVIEW_TARGETS
+    ):
+
+        esc = esc.head(
+            LARGE_PLOT_MAX_OVERVIEW_TARGETS
+        )
+
+    fig, ax = plt.subplots(
+        figsize=(
+            max(
+                6,
+                min(
+                    24,
+                    0.10
+                    * len(esc)
+                    + 4,
+                ),
+            ),
+            3.6,
+        )
+    )
+
+    ax.bar(
+        range(
+            len(esc)
+        ),
+        esc[
+            "pct_escaper"
+        ],
+    )
+
+    ax.set_xticks(
+        range(
+            len(esc)
+        )
+    )
+
+    ax.set_xticklabels(
+        esc[
+            "target_gene"
+        ],
+        rotation=90,
+        fontsize=5,
+    )
+
+    ax.set_ylabel(
+        "% escapers"
+    )
+
+    ax.set_title(
+        "Escaper fraction per target",
+        fontsize=11,
+    )
+
+    sns.despine(
+        ax=ax
+    )
+
     fig.tight_layout()
+
     reg.save(
         fig,
         "ps_escaper_fraction",
         SECTION_PS,
         "Escaper fraction per target",
-        "Cells carrying a guide whose target is nonetheless still expressed. A "
-        "high fraction means the population-level effect understates how well "
-        "the guide works in the cells where it does work.",
+        "Targets ranked by the fraction of PS-high cells retaining target expression.",
     )
 
-    # --- 3. agreement with the group-level test --------------------------
-    merged = compare_with_perturbation_strength(
-        results, perturbation_results.table, perturbation_results.primary_control
+    # Agreement with group-level perturbation strength.
+    merged = (
+        compare_with_perturbation_strength(
+            results,
+            perturbation_results.table,
+            perturbation_results.primary_control,
+        )
     )
-    lfc_col = f"log2fc_{perturbation_results.primary_control}"
-    if not merged.empty and lfc_col in merged.columns:
-        ok = merged[lfc_col].notna() & merged["pct_successful_kd"].notna()
+
+    lfc_col = (
+        f"log2fc_"
+        f"{perturbation_results.primary_control}"
+    )
+
+    if (
+        not merged.empty
+        and lfc_col
+        in merged.columns
+    ):
+
+        ok = (
+            merged[
+                lfc_col
+            ].notna()
+            & merged[
+                "pct_successful_kd"
+            ].notna()
+        )
+
         if ok.sum() > 2:
-            x = merged.loc[ok, lfc_col].to_numpy(dtype=float)
-            y = merged.loc[ok, "pct_successful_kd"].to_numpy(dtype=float)
-            r = float(np.corrcoef(x, y)[0, 1])
-            fig, ax = plt.subplots(figsize=(5.4, 4.6))
-            hit = merged.loc[ok].get(f"is_hit_{perturbation_results.primary_control}")
-            colors = (
-                ["#c53030" if h else "#a0aec0" for h in hit]
-                if hit is not None
-                else "#2b6cb0"
+
+            x = (
+                merged.loc[
+                    ok,
+                    lfc_col,
+                ]
+                .to_numpy(
+                    dtype=float
+                )
             )
-            ax.scatter(x, y, s=28, c=colors)
-            for xi, yi, name in zip(x, y, merged.loc[ok, "target_gene"]):
-                if yi > np.percentile(y, 85) or xi < np.percentile(x, 15):
-                    ax.annotate(name, (xi, yi), fontsize=6,
-                                xytext=(3, 3), textcoords="offset points")
-            ax.set_xlabel("log2FC of the target's own expression (group-level test)")
-            ax.set_ylabel("% cells with confirmed knockdown (per-cell score)")
-            ax.set_title(f"Per-cell score vs group-level knockdown (Pearson r = {r:.2f})", fontsize=10)
-            sns.despine(ax=ax)
+
+            y = (
+                merged.loc[
+                    ok,
+                    "pct_successful_kd",
+                ]
+                .to_numpy(
+                    dtype=float
+                )
+            )
+
+            r = float(
+                np.corrcoef(
+                    x,
+                    y,
+                )[
+                    0,
+                    1
+                ]
+            )
+
+            fig, ax = plt.subplots(
+                figsize=(
+                    5.4,
+                    4.6,
+                )
+            )
+
+            ax.scatter(
+                x,
+                y,
+                s=28,
+                alpha=0.8,
+            )
+
+            ax.set_xlabel(
+                (
+                    "Target expression log2FC "
+                    "(group-level)"
+                )
+            )
+
+            ax.set_ylabel(
+                "% successful knockdown (PS)"
+            )
+
+            ax.set_title(
+                (
+                    "PS vs group-level knockdown "
+                    f"(Pearson r={r:.2f})"
+                ),
+                fontsize=10,
+            )
+
+            sns.despine(
+                ax=ax
+            )
+
             fig.tight_layout()
+
             reg.save(
                 fig,
                 "ps_vs_perturbation_strength",
                 SECTION_PS,
-                "Per-cell scores vs the group-level test",
-                "The two axes measure different things: the group-level test uses "
-                "the target's own expression, while the per-cell score projects "
-                "cells onto the perturbation's whole downstream signature. A gene "
-                "can be strongly knocked down yet change little downstream, or the "
-                "reverse, so these need not track each other closely — the "
-                "correlation in the title is what these data actually show, not a "
-                "quantity expected to be large.",
+                "Per-cell PS vs group-level knockdown",
+                "Comparison between downstream perturbation-response scoring and direct target-expression reduction.",
             )
 
-    _plot_ps_quadrants(expr, results, reg, cfg)
+    _plot_ps_quadrants(
+        expr,
+        results,
+        reg,
+        cfg,
+    )
 
 
-def _plot_ps_quadrants(expr, results, reg: FigureRegistry, cfg: Config) -> None:
-    """Score-vs-expression quadrant scatter, one per scored target."""
-    from scipy import sparse
+# ---------------------------------------------------------------------------
+# PS quadrants
+# ---------------------------------------------------------------------------
+
+
+def _plot_ps_quadrants(
+    expr,
+    results,
+    reg: FigureRegistry,
+    cfg: Config,
+) -> None:
+    """Score-vs-expression quadrant scatter."""
 
     from .ps_score import (
-        QUADRANT_COLORS,
         QUADRANT_ESCAPER,
         QUADRANT_KD,
         QUADRANT_LOW,
         QUADRANT_NONRESPONDER,
     )
 
-    layer = expr.layers[LOGNORM_LAYER] if LOGNORM_LAYER in expr.layers else expr.X
-    targets = expr.obs[OBS_TARGET].astype(str)
-    klass = expr.obs[OBS_CLASS].astype(str)
-    top_n = cfg.ps_score.top_n_report
-    rng = np.random.default_rng(cfg.run.seed)
+    top_n = (
+        cfg.ps_score.top_n_report
+    )
 
-    for rank, gene in enumerate(results.summary["target_gene"]):
-        series = results.scores.get(gene)
-        if series is None or gene not in expr.var_names:
-            continue
-        col = layer[:, expr.var_names.get_loc(gene)]
-        if sparse.issparse(col):
-            col = col.toarray()
-        expression = pd.Series(np.asarray(col).ravel(), index=expr.obs_names)
-
-        cells = series.index.intersection(expr.obs_names)
-        ps = series.loc[cells]
-        ex = expression.loc[cells]
-        is_target = (targets.loc[cells] == gene) & (klass.loc[cells] == CLASS_TARGETING)
-        cut = results.expression_cut.get(gene, float(np.median(ex)))
-        thr = results.ps_threshold
-
-        fig, ax = plt.subplots(figsize=(6.4, 5.0))
-
-        ctrl_idx = cells[~is_target.to_numpy()]
-        if len(ctrl_idx) > 2000:
-            ctrl_idx = rng.choice(ctrl_idx, size=2000, replace=False)
-        ax.scatter(ps.loc[ctrl_idx], ex.loc[ctrl_idx], s=14, c="#cbd5e0", alpha=0.45,
-                   linewidths=0, label="control cells", rasterized=True)
-
-        tgt = cells[is_target.to_numpy()]
-        quad = results.quadrants.get(gene)
-        colors = (
-            [QUADRANT_COLORS.get(str(quad.get(c, QUADRANT_LOW)), "#a0aec0") for c in tgt]
-            if quad is not None
-            else "#e53e3e"
+    large_plot = (
+        bool(
+            getattr(
+                results,
+                "large_mode",
+                False,
+            )
         )
-        ax.scatter(ps.loc[tgt], ex.loc[tgt], s=26, c=colors, alpha=0.85,
-                   edgecolors="white", linewidths=0.4, label=f"{gene} cells",
-                   rasterized=True)
+        or _is_large_plot_dataset(
+            expr,
+            len(
+                results.summary
+            ),
+        )
+    )
 
-        ax.axvline(thr, color="black", ls="--", lw=1, alpha=0.6)
-        ax.axhline(cut, color="black", ls="--", lw=1, alpha=0.6)
+    if large_plot:
 
-        row = results.summary[results.summary["target_gene"] == gene].iloc[0]
-        xmax = float(max(ps.max(), thr * 2))
-        ymax = float(max(ex.max(), cut * 2)) or 1.0
-        ax.text(thr + (xmax - thr) * 0.5, ymax * 0.95,
-                f"ESCAPERS\n{row['pct_escaper']:.0f}%", fontsize=8, ha="center",
-                color=QUADRANT_COLORS[QUADRANT_ESCAPER], fontweight="bold")
-        ax.text(thr + (xmax - thr) * 0.5, ymax * 0.05,
-                f"KNOCKED DOWN\n{row['pct_successful_kd']:.0f}%", fontsize=8, ha="center",
-                color=QUADRANT_COLORS[QUADRANT_KD], fontweight="bold")
-        ax.text(thr * 0.5, ymax * 0.95, f"NON-RESPONDER\n{row['pct_non_responder']:.0f}%",
-                fontsize=8, ha="center", color=QUADRANT_COLORS[QUADRANT_NONRESPONDER],
-                fontweight="bold")
-        ax.text(thr * 0.5, ymax * 0.05, f"LOW SIGNAL\n{row['pct_low_signal']:.0f}%",
-                fontsize=8, ha="center", color="#718096", fontweight="bold")
+        n_plot = min(
+            LARGE_PLOT_MAX_PER_TARGET,
+            len(
+                results.summary
+            ),
+        )
 
-        ax.set_xlabel("Perturbation score (per cell)")
-        ax.set_ylabel(f"{gene} expression (log-normalized)")
-        ax.set_title(f"{gene}: per-cell perturbation outcome "
-                     f"(n={int(row['n_perturbed_cells']):,})", fontsize=10)
-        ax.legend(fontsize=7, frameon=False, loc="upper right")
-        sns.despine(ax=ax)
+        genes_to_plot = list(
+            results.summary[
+                "target_gene"
+            ]
+            .head(
+                n_plot
+            )
+        )
+
+    else:
+
+        genes_to_plot = list(
+            results.summary[
+                "target_gene"
+            ]
+        )
+
+    for rank, gene in enumerate(
+        genes_to_plot
+    ):
+
+        series = (
+            results.scores.get(
+                gene
+            )
+        )
+
+        if (
+            series is None
+            or gene
+            not in expr.var_names
+        ):
+            continue
+
+        cells = (
+            series.index
+            .intersection(
+                expr.obs_names
+            )
+        )
+
+        if not len(
+            cells
+        ):
+            continue
+
+        cell_indices = (
+            expr.obs_names
+            .get_indexer(
+                cells
+            )
+        )
+
+        valid = (
+            cell_indices >= 0
+        )
+
+        cells = cells[
+            valid
+        ]
+
+        cell_indices = (
+            cell_indices[
+                valid
+            ]
+        )
+
+        expression = pd.Series(
+            _gene_values(
+                expr,
+                gene,
+                cell_indices,
+            ),
+            index=cells,
+        )
+
+        ps = (
+            series.reindex(
+                cells
+            )
+        )
+
+        targets = (
+            expr.obs.loc[
+                cells,
+                OBS_TARGET,
+            ]
+            .astype(str)
+        )
+
+        klass = (
+            expr.obs.loc[
+                cells,
+                OBS_CLASS,
+            ]
+            .astype(str)
+        )
+
+        is_target = (
+            (
+                targets == gene
+            )
+            & (
+                klass
+                == CLASS_TARGETING
+            )
+        )
+
+        cut = (
+            results.expression_cut.get(
+                gene,
+                float(
+                    np.median(
+                        expression
+                    )
+                ),
+            )
+        )
+
+        threshold = (
+            results.ps_threshold
+        )
+
+        fig, ax = plt.subplots(
+            figsize=(
+                6.4,
+                5.0,
+            )
+        )
+
+        ctrl_idx = (
+            cells[
+                ~is_target.to_numpy()
+            ]
+        )
+
+        if len(
+            ctrl_idx
+        ) > 2000:
+
+            rng = np.random.default_rng(
+                cfg.run.seed
+                + rank
+            )
+
+            ctrl_idx = pd.Index(
+                rng.choice(
+                    ctrl_idx,
+                    size=2000,
+                    replace=False,
+                )
+            )
+
+        if len(
+            ctrl_idx
+        ):
+
+            ax.scatter(
+                ps.loc[
+                    ctrl_idx
+                ],
+                expression.loc[
+                    ctrl_idx
+                ],
+                s=14,
+                alpha=0.35,
+                linewidths=0,
+                label="control cells",
+                rasterized=True,
+            )
+
+        target_cells = (
+            cells[
+                is_target.to_numpy()
+            ]
+        )
+
+        quadrant = (
+            results.quadrants.get(
+                gene
+            )
+        )
+
+        if quadrant is not None:
+
+            quadrant_target = (
+                quadrant.reindex(
+                    target_cells
+                )
+                .fillna(
+                    QUADRANT_LOW
+                )
+                .astype(str)
+            )
+
+            category_to_code = {
+                QUADRANT_KD: 0,
+                QUADRANT_ESCAPER: 1,
+                QUADRANT_NONRESPONDER: 2,
+                QUADRANT_LOW: 3,
+            }
+
+            codes = np.array(
+                [
+                    category_to_code.get(
+                        q,
+                        3,
+                    )
+                    for q
+                    in quadrant_target
+                ]
+            )
+
+        else:
+
+            codes = np.zeros(
+                len(
+                    target_cells
+                ),
+                dtype=int,
+            )
+
+        scatter = ax.scatter(
+            ps.loc[
+                target_cells
+            ],
+            expression.loc[
+                target_cells
+            ],
+            s=26,
+            c=codes,
+            cmap="tab10",
+            alpha=0.85,
+            linewidths=0.3,
+            rasterized=True,
+            label=f"{gene} cells",
+        )
+
+        ax.axvline(
+            threshold,
+            ls="--",
+            lw=1,
+        )
+
+        ax.axhline(
+            cut,
+            ls="--",
+            lw=1,
+        )
+
+        row = (
+            results.summary[
+                results.summary[
+                    "target_gene"
+                ]
+                == gene
+            ]
+            .iloc[
+                0
+            ]
+        )
+
+        ax.set_xlabel(
+            "Perturbation score"
+        )
+
+        ax.set_ylabel(
+            (
+                f"{gene} expression "
+                "(log-normalized)"
+            )
+        )
+
+        ax.set_title(
+            (
+                f"{gene}: "
+                f"{row['pct_successful_kd']:.0f}% KD, "
+                f"{row['pct_escaper']:.0f}% escaper"
+            ),
+            fontsize=10,
+        )
+
+        ax.legend(
+            fontsize=7,
+            frameon=False,
+        )
+
+        sns.despine(
+            ax=ax
+        )
+
         fig.tight_layout()
+
         reg.save(
             fig,
             f"ps_quadrant_{gene}",
             SECTION_PS_PER_TARGET,
             f"{gene} perturbation score vs expression",
-            f"Cells carrying {gene} guides, split by perturbation score "
-            f"(vertical cut at {thr}) and by {gene} expression relative to the "
-            f"control median (horizontal cut). {row['pct_successful_kd']:.0f}% "
-            f"show a confirmed knockdown and {row['pct_escaper']:.0f}% escape it.",
-            in_report=rank < top_n,
+            (
+                f"PS threshold={threshold}; "
+                f"target-expression cut={cut:.3g}."
+            ),
+            in_report=(
+                rank < top_n
+            ),
         )
+
     logger.info(
-        "Wrote %d perturbation-score quadrant figures (%d shown in the report)",
-        len(results.summary),
-        min(top_n, len(results.summary)),
+        "Wrote %d PS quadrant figures",
+        len(
+            genes_to_plot
+        ),
     )
 
 
 # ---------------------------------------------------------------------------
-# Supervised LDA embedding (PS_python's fixed-LDA map)
+# PS LDA
 # ---------------------------------------------------------------------------
 
 
-def plot_ps_lda(expr, results, reg: FigureRegistry, cfg: Config) -> None:
-    """PS scores on the supervised LDA embedding.
+def plot_ps_lda(
+    expr,
+    results,
+    reg: FigureRegistry,
+    cfg: Config,
+) -> None:
+    """Plot supervised LDA representation when available."""
 
-    The section-2 UMAP is unsupervised and knows nothing about which guide a
-    cell carries, so a subtle phenotype can be invisible in it. This embedding
-    is trained on the perturbation labels, so its axes are chosen to separate
-    perturbations — the space in which the per-cell scores read most clearly.
-
-    One overview plus one figure per scored target, mirroring PS_python's
-    ``plots_fixed_lda/``.
-    """
-    from .ps_score import PS_PREFIX, QUADRANT_KD
-
-    if results is None or results.lda_umap is None or results.summary.empty:
+    if (
+        results is None
+        or results.lda_umap is None
+        or results.summary.empty
+    ):
         return
-    coords = np.asarray(results.lda_umap, dtype=float)
-    placed = np.isfinite(coords).all(axis=1)
+
+    coords = np.asarray(
+        results.lda_umap,
+        dtype=float,
+    )
+
+    placed = np.isfinite(
+        coords
+    ).all(
+        axis=1
+    )
+
     if placed.sum() < 10:
-        logger.warning("LDA embedding placed too few cells to plot")
+
+        logger.warning(
+            "LDA embedding placed too few cells to plot"
+        )
+
         return
 
     labels = (
-        results.lda_label.astype(str).to_numpy()
-        if results.lda_label is not None
-        else np.full(expr.n_obs, "?", dtype=object)
+        results.lda_label
+        .astype(str)
+        .to_numpy()
+        if results.lda_label
+        is not None
+        else np.full(
+            expr.n_obs,
+            "?",
+            dtype=object,
+        )
     )
-    targets = expr.obs[OBS_TARGET].astype(str).to_numpy()
-    n_targets = len(results.summary)
 
-    # --- overview: the whole map, coloured by perturbation ----------------
-    fig, ax = plt.subplots(figsize=(7.4, 5.6))
+    n_targets = len(
+        results.summary
+    )
+
+    fig, ax = plt.subplots(
+        figsize=(
+            7.4,
+            5.6,
+        )
+    )
+
     _scatter_umap(
         ax,
-        coords[placed],
-        labels[placed],
+        coords[
+            placed
+        ],
+        labels[
+            placed
+        ],
         True,
-        f"Supervised LDA embedding ({n_targets} targets + control)",
+        (
+            "Supervised LDA embedding "
+            f"({n_targets} targets)"
+        ),
         size=4,
         legend=n_targets <= 24,
+        max_points=LARGE_PLOT_MAX_CELLS,
+        seed=cfg.run.seed,
     )
-    ax.set_xlabel("LDA-UMAP1", fontsize=8)
-    ax.set_ylabel("LDA-UMAP2", fontsize=8)
+
+    ax.set_xlabel(
+        "LDA-UMAP1"
+    )
+
+    ax.set_ylabel(
+        "LDA-UMAP2"
+    )
+
     fig.tight_layout()
+
     reg.save(
         fig,
         "ps_lda_overview",
         SECTION_PS,
         "Supervised LDA embedding",
-        "Linear discriminant analysis trained on the perturbation labels, then "
-        "embedded with UMAP. Unlike the unsupervised embedding in section 2, the "
-        "axes here are chosen to separate perturbations, so groups that overlap "
-        "there can resolve."
-        + ("" if n_targets <= 24 else " Legend omitted (too many targets)."),
+        "PS_python supervised LDA/UMAP representation.",
     )
 
-    # --- global summary: high-confidence knockdown cells -------------------
-    own = expr.obs["ps_score"].to_numpy(dtype=float) if "ps_score" in expr.obs else None
-    if own is not None:
-        thr = cfg.ps_score.lda_highlight_threshold
-        strong = placed & np.isfinite(own) & (own >= thr)
-        fig, ax = plt.subplots(figsize=(6.6, 5.4))
-        ax.scatter(coords[placed, 0], coords[placed, 1], s=4, color="#e2e8f0",
-                   linewidths=0, rasterized=True, label="all cells")
-        sc_ = ax.scatter(coords[strong, 0], coords[strong, 1], s=12, c=own[strong],
-                         cmap="viridis", vmin=thr, vmax=1.0, linewidths=0.2,
-                         edgecolors="#2d3748", rasterized=True)
-        plt.colorbar(sc_, ax=ax, shrink=0.75, label="perturbation score")
+    if (
+        "ps_score"
+        in expr.obs
+    ):
+
+        own = (
+            expr.obs[
+                "ps_score"
+            ]
+            .to_numpy(
+                dtype=float
+            )
+        )
+
+        threshold = (
+            cfg.ps_score
+            .lda_highlight_threshold
+        )
+
+        strong = (
+            placed
+            & np.isfinite(
+                own
+            )
+            & (
+                own >= threshold
+            )
+        )
+
+        fig, ax = plt.subplots(
+            figsize=(
+                6.6,
+                5.4,
+            )
+        )
+
+        background_indices = np.flatnonzero(
+            placed
+        )
+
+        if (
+            len(
+                background_indices
+            )
+            > LARGE_PLOT_MAX_CELLS
+        ):
+
+            background_indices = _sample_pool(
+                background_indices,
+                LARGE_PLOT_MAX_CELLS,
+                cfg.run.seed,
+            )
+
+        ax.scatter(
+            coords[
+                background_indices,
+                0,
+            ],
+            coords[
+                background_indices,
+                1,
+            ],
+            s=4,
+            alpha=0.4,
+            linewidths=0,
+            rasterized=True,
+            label="background",
+        )
+
+        strong_indices = (
+            np.flatnonzero(
+                strong
+            )
+        )
+
+        scatter = ax.scatter(
+            coords[
+                strong_indices,
+                0,
+            ],
+            coords[
+                strong_indices,
+                1,
+            ],
+            s=12,
+            c=own[
+                strong_indices
+            ],
+            cmap="viridis",
+            vmin=threshold,
+            vmax=1.0,
+            linewidths=0.2,
+            rasterized=True,
+        )
+
+        plt.colorbar(
+            scatter,
+            ax=ax,
+            shrink=0.75,
+            label="perturbation score",
+        )
+
         ax.set_title(
-            f"High-confidence responders (score >= {thr}): "
-            f"{int(strong.sum()):,} of {int(placed.sum()):,} cells",
+            (
+                f"High-confidence responders "
+                f"(score >= {threshold})"
+            ),
             fontsize=10,
         )
-        ax.set_xticks([])
-        ax.set_yticks([])
-        ax.legend(fontsize=7, frameon=False, loc="best", markerscale=3)
-        sns.despine(ax=ax, left=True, bottom=True)
+
+        ax.set_xticks(
+            []
+        )
+
+        ax.set_yticks(
+            []
+        )
+
+        sns.despine(
+            ax=ax,
+            left=True,
+            bottom=True,
+        )
+
         fig.tight_layout()
+
         reg.save(
             fig,
             "ps_lda_high_confidence",
             SECTION_PS,
             "High-confidence responders on the LDA map",
-            f"Cells whose perturbation score reaches {thr}, coloured by score. "
-            "Where these concentrate is where the screen produced its clearest "
-            "phenotypes.",
+            "Cells above the configured PS threshold.",
         )
 
-    # --- one per target ----------------------------------------------------
-    top_n = cfg.ps_score.top_n_report
-    for rank, gene in enumerate(results.summary["target_gene"]):
-        col = f"{PS_PREFIX}{gene}"
+    # Per-target LDA plots are only supported where target-specific score
+    # columns exist. Large PS mode intentionally does not create them.
+    if bool(
+        getattr(
+            results,
+            "large_mode",
+            False,
+        )
+    ):
+
+        logger.info(
+            "Large PS mode: skipping target-specific LDA figures "
+            "because ps_<gene> columns are intentionally omitted."
+        )
+
+        return
+
+    targets = (
+        expr.obs[
+            OBS_TARGET
+        ]
+        .astype(str)
+        .to_numpy()
+    )
+
+    top_n = (
+        cfg.ps_score.top_n_report
+    )
+
+    for rank, gene in enumerate(
+        results.summary[
+            "target_gene"
+        ]
+    ):
+
+        col = (
+            f"ps_{gene}"
+        )
+
         if col not in expr.obs.columns:
             continue
-        score = expr.obs[col].to_numpy(dtype=float)
-        is_target = (targets == gene) & placed
+
+        score = (
+            expr.obs[
+                col
+            ]
+            .to_numpy(
+                dtype=float
+            )
+        )
+
+        is_target = (
+            (
+                targets == gene
+            )
+            & placed
+        )
+
         if is_target.sum() == 0:
             continue
 
-        fig, ax = plt.subplots(figsize=(6.4, 5.2))
-        bg = placed & ~is_target
-        ax.scatter(coords[bg, 0], coords[bg, 1], s=4, color="#e2e8f0", alpha=0.6,
-                   linewidths=0, rasterized=True, label="other cells")
-        order = np.argsort(np.nan_to_num(score[is_target]))
-        idx = np.where(is_target)[0][order]
-        sc_ = ax.scatter(coords[idx, 0], coords[idx, 1], s=18,
-                         c=np.nan_to_num(score[idx]), cmap="Blues", vmin=0, vmax=1,
-                         linewidths=0.3, edgecolors="#2d3748", rasterized=True)
-        plt.colorbar(sc_, ax=ax, shrink=0.75, label="perturbation score")
+        fig, ax = plt.subplots(
+            figsize=(
+                6.4,
+                5.2,
+            )
+        )
 
-        row = results.summary[results.summary["target_gene"] == gene].iloc[0]
+        bg_pool = np.flatnonzero(
+            placed
+            & ~is_target
+        )
+
+        bg_indices = _sample_pool(
+            bg_pool,
+            LARGE_PLOT_BACKGROUND_CELLS,
+            cfg.run.seed
+            + rank,
+        )
+
+        ax.scatter(
+            coords[
+                bg_indices,
+                0,
+            ],
+            coords[
+                bg_indices,
+                1,
+            ],
+            s=4,
+            alpha=0.4,
+            linewidths=0,
+            rasterized=True,
+        )
+
+        target_indices = np.flatnonzero(
+            is_target
+        )
+
+        scatter = ax.scatter(
+            coords[
+                target_indices,
+                0,
+            ],
+            coords[
+                target_indices,
+                1,
+            ],
+            s=18,
+            c=np.nan_to_num(
+                score[
+                    target_indices
+                ]
+            ),
+            cmap="Blues",
+            vmin=0,
+            vmax=1,
+            linewidths=0.3,
+            rasterized=True,
+        )
+
+        plt.colorbar(
+            scatter,
+            ax=ax,
+            shrink=0.75,
+            label="perturbation score",
+        )
+
         ax.set_title(
-            f"{gene} on the LDA map (n={int(row['n_perturbed_cells']):,}, "
-            f"{row['pct_successful_kd']:.0f}% knocked down)",
+            f"{gene} on the LDA map",
             fontsize=10,
         )
-        ax.set_xticks([])
-        ax.set_yticks([])
-        ax.legend(fontsize=7, frameon=False, loc="best", markerscale=3)
-        sns.despine(ax=ax, left=True, bottom=True)
+
+        ax.set_xticks(
+            []
+        )
+
+        ax.set_yticks(
+            []
+        )
+
+        sns.despine(
+            ax=ax,
+            left=True,
+            bottom=True,
+        )
+
         fig.tight_layout()
+
         reg.save(
             fig,
             f"ps_lda_{gene}",
             SECTION_PS_LDA,
             f"{gene} on the LDA embedding",
-            f"Cells carrying {gene} guides, shaded by perturbation score, against "
-            "all other cells in grey. Darker cells respond more strongly; a tight "
-            "darker cluster means the perturbation drives a consistent state.",
-            in_report=rank < top_n,
-        )
-    logger.info(
-        "Wrote %d per-target LDA figures (%d shown in the report)",
-        n_targets,
-        min(top_n, n_targets),
-    )
-
-
-# ---------------------------------------------------------------------------
-# lochNESS figures
-# ---------------------------------------------------------------------------
-
-
-def _lochness_norm(vmax: float):
-    """Colour scale for lochNESS: linear near 0, logarithmic in the tail.
-
-    The score is bounded below by -1 and unbounded above, so a symmetric linear
-    scale both wastes half its range and clips the extreme cells that matter.
-    """
-    import matplotlib.colors as mcolors
-
-    vmax = max(float(vmax), 1.0)
-    return mcolors.SymLogNorm(linthresh=1.0, linscale=1.0, vmin=-vmax, vmax=vmax, base=10)
-
-
-def _label_clusters(ax, expr, coords: np.ndarray, highlight: str = "") -> None:
-    """Write cluster labels at their centroids on an embedding panel."""
-    if CLUSTER_KEY not in expr.obs.columns:
-        return
-    clusters = expr.obs[CLUSTER_KEY].astype(str).to_numpy()
-    for cl in np.unique(clusters):
-        m = clusters == cl
-        if m.sum() == 0:
-            continue
-        cx, cy = np.median(coords[m, 0]), np.median(coords[m, 1])
-        is_top = str(cl) == str(highlight)
-        ax.text(
-            cx, cy, str(cl),
-            fontsize=8 if is_top else 6.5,
-            fontweight="bold" if is_top else "normal",
-            color="#1a202c" if is_top else "#4a5568",
-            ha="center", va="center",
-            bbox=dict(
-                boxstyle="round,pad=0.15",
-                facecolor="#fefcbf" if is_top else "white",
-                edgecolor="none",
-                alpha=0.85 if is_top else 0.6,
+            f"Cells carrying {gene}, coloured by PS.",
+            in_report=(
+                rank < top_n
             ),
         )
 
 
-def plot_lochness(expr, results, reg: FigureRegistry, cfg: Config) -> None:
-    """Overview figures plus one per-perturbation lochNESS map."""
-    if results is None or results.summary.empty:
-        return
-    lcfg = cfg.lochness
-    summary = results.summary
-    coords = np.asarray(expr.obsm["X_umap"]) if "X_umap" in expr.obsm else None
+# ---------------------------------------------------------------------------
+# lochNESS helpers
+# ---------------------------------------------------------------------------
 
-    # --- 1. self-enrichment ranking ---------------------------------------
-    fig, ax = plt.subplots(figsize=(max(6, 0.20 * len(summary)), 4.0))
-    vals = summary["mean_lochness_in_own_cells"].to_numpy(dtype=float)
-    ax.bar(range(len(summary)), vals,
-           color=["#c53030" if v > lcfg.enrichment_cut else "#a0aec0" for v in vals])
-    ax.axhline(0, color="black", lw=0.8)
-    ax.axhline(lcfg.enrichment_cut, color="#718096", ls="--", lw=1)
-    ax.set_xticks(range(len(summary)))
-    ax.set_xticklabels(summary["target_gene"], rotation=90, fontsize=6)
-    ax.set_ylabel("mean lochNESS in its own cells")
+
+def _lochness_norm(
+    vmax: float,
+):
+    """Symlog colour scale for lochNESS."""
+
+    import matplotlib.colors as mcolors
+
+    vmax = max(
+        float(
+            vmax
+        ),
+        1.0,
+    )
+
+    return mcolors.SymLogNorm(
+        linthresh=1.0,
+        linscale=1.0,
+        vmin=-vmax,
+        vmax=vmax,
+        base=10,
+    )
+
+
+def _label_clusters(
+    ax,
+    expr,
+    coords: np.ndarray,
+    highlight: str = "",
+) -> None:
+    """Place cluster labels at embedding centroids."""
+
+    if CLUSTER_KEY not in expr.obs.columns:
+        return
+
+    clusters = (
+        expr.obs[
+            CLUSTER_KEY
+        ]
+        .astype(str)
+        .to_numpy()
+    )
+
+    for cluster in np.unique(
+        clusters
+    ):
+
+        mask = (
+            clusters
+            == cluster
+        )
+
+        if not mask.sum():
+            continue
+
+        cx = np.median(
+            coords[
+                mask,
+                0,
+            ]
+        )
+
+        cy = np.median(
+            coords[
+                mask,
+                1,
+            ]
+        )
+
+        is_top = (
+            str(
+                cluster
+            )
+            == str(
+                highlight
+            )
+        )
+
+        ax.text(
+            cx,
+            cy,
+            str(
+                cluster
+            ),
+            fontsize=(
+                8
+                if is_top
+                else 6.5
+            ),
+            fontweight=(
+                "bold"
+                if is_top
+                else "normal"
+            ),
+            ha="center",
+            va="center",
+            bbox=dict(
+                boxstyle="round,pad=0.15",
+                facecolor=(
+                    "#fefcbf"
+                    if is_top
+                    else "white"
+                ),
+                edgecolor="none",
+                alpha=0.75,
+            ),
+        )
+
+
+# ---------------------------------------------------------------------------
+# lochNESS
+# ---------------------------------------------------------------------------
+
+
+def plot_lochness(
+    expr,
+    results,
+    reg: FigureRegistry,
+    cfg: Config,
+) -> None:
+    """Plot lochNESS summaries.
+
+    Standard mode retains full per-target score plots.
+
+    Large mode consumes ``self_score`` and summary outputs because the full
+    cell × perturbation score representation is intentionally not materialized.
+    """
+
+    if (
+        results is None
+        or results.summary.empty
+    ):
+        return
+
+    lcfg = (
+        cfg.lochness
+    )
+
+    summary = (
+        results.summary
+    )
+
+    large_mode = bool(
+        getattr(
+            results,
+            "self_only",
+            False,
+        )
+    )
+
+    coords = (
+        np.asarray(
+            expr.obsm[
+                "X_umap"
+            ]
+        )
+        if "X_umap"
+        in expr.obsm
+        else None
+    )
+
+    # --------------------------------------------------------------
+    # 1. self-enrichment target ranking
+    # --------------------------------------------------------------
+
+    summary_plot = (
+        summary.copy()
+    )
+
+    original_n = len(
+        summary_plot
+    )
+
+    if (
+        original_n
+        > LARGE_PLOT_MAX_OVERVIEW_TARGETS
+    ):
+
+        summary_plot = (
+            summary_plot.head(
+                LARGE_PLOT_MAX_OVERVIEW_TARGETS
+            )
+        )
+
+    fig, ax = plt.subplots(
+        figsize=(
+            max(
+                6,
+                min(
+                    24,
+                    0.10
+                    * len(
+                        summary_plot
+                    )
+                    + 4,
+                ),
+            ),
+            4.0,
+        )
+    )
+
+    values = (
+        summary_plot[
+            "mean_lochness_in_own_cells"
+        ]
+        .to_numpy(
+            dtype=float
+        )
+    )
+
+    ax.bar(
+        range(
+            len(
+                summary_plot
+            )
+        ),
+        values,
+    )
+
+    ax.axhline(
+        0,
+        lw=0.8,
+    )
+
+    ax.axhline(
+        lcfg.enrichment_cut,
+        ls="--",
+        lw=1,
+    )
+
+    ax.set_xticks(
+        range(
+            len(
+                summary_plot
+            )
+        )
+    )
+
+    ax.set_xticklabels(
+        summary_plot[
+            "target_gene"
+        ],
+        rotation=90,
+        fontsize=5,
+    )
+
+    ax.set_ylabel(
+        "mean lochNESS in own cells"
+    )
+
     ax.set_title(
-        f"How strongly each perturbation clusters with itself "
-        f"(k = {results.n_neighbors} neighbours)",
+        (
+            "Self-enrichment by perturbation "
+            f"(k={results.n_neighbors})"
+        ),
         fontsize=10,
     )
-    sns.despine(ax=ax)
+
+    sns.despine(
+        ax=ax
+    )
+
     fig.tight_layout()
+
     reg.save(
         fig,
         "lochness_self_enrichment",
         SECTION_LOCHNESS,
         "Self-enrichment per perturbation",
-        "Average lochNESS of each perturbation's own cells. 0 means its cells sit "
-        "among neighbours at the background rate; a positive value means cells "
-        "sharing the perturbation are neighbours far more often than chance, i.e. "
-        "the perturbation drives a distinct state.",
+        (
+            f"Top {len(summary_plot)} of {original_n} perturbations shown."
+            if original_n
+            > len(summary_plot)
+            else "Mean lochNESS in each perturbation's own cells."
+        ),
     )
 
-    # --- 2. score distribution per target ---------------------------------
-    top = list(summary["target_gene"].head(30))
-    long = pd.DataFrame(
-        {
-            "lochNESS": np.concatenate([results.scores[g] for g in top]),
-            "target": np.concatenate([[g] * expr.n_obs for g in top]),
-        }
-    )
-    fig, ax = plt.subplots(figsize=(max(6, 0.34 * len(top)), 4.2))
-    sns.violinplot(data=long, x="target", y="lochNESS", ax=ax, cut=0,
-                   inner=None, linewidth=0.5, order=top)
-    ax.axhline(0, color="black", lw=0.8)
-    ax.tick_params(axis="x", rotation=90, labelsize=6)
-    ax.set_xlabel("")
-    ax.set_title("lochNESS across all cells, per perturbation (top 30)", fontsize=10)
-    sns.despine(ax=ax)
-    fig.tight_layout()
-    reg.save(
-        fig,
-        "lochness_distributions",
-        SECTION_LOCHNESS,
-        "lochNESS distribution per perturbation",
-        "Each violin is one perturbation's score across every cell. A long upper "
-        "tail means a subset of the manifold is strongly enriched for it, even "
-        "when most cells sit at background.",
-    )
+    # --------------------------------------------------------------
+    # 2. score distribution per target (standard mode only)
+    # --------------------------------------------------------------
 
-    # --- 3. target x cluster heatmap --------------------------------------
-    if not results.by_cluster.empty:
-        mat = results.by_cluster
-        try:
-            mat = mat[sorted(mat.columns, key=lambda c: (float(c), c))]
-        except ValueError:
-            mat = mat[sorted(mat.columns)]
-        order = _order_by_similarity(mat)
-        mat = mat.loc[order]
-        lim = float(np.nanpercentile(np.abs(mat.to_numpy()), 98)) or 1.0
-        fig, ax = plt.subplots(
-            figsize=(max(6, 0.55 * mat.shape[1] + 4), max(4, 0.20 * len(mat) + 1.5))
+    if not large_mode and results.scores:
+
+        top = list(
+            summary[
+                "target_gene"
+            ].head(
+                30
+            )
         )
-        im = ax.imshow(mat.to_numpy(), cmap="RdBu_r", vmin=-lim, vmax=lim, aspect="auto")
-        ax.set_xticks(range(mat.shape[1]))
-        ax.set_xticklabels(mat.columns, fontsize=8)
-        ax.set_yticks(range(len(mat)))
-        ax.set_yticklabels(mat.index, fontsize=6)
-        ax.set_xlabel(f"Cluster ({CLUSTER_KEY})")
-        plt.colorbar(im, ax=ax, shrink=0.6, label="mean lochNESS")
-        ax.set_title("Mean lochNESS per cluster", fontsize=11)
+
+        top_available = [
+            g
+            for g
+            in top
+            if g
+            in results.scores
+        ]
+
+        if top_available:
+
+            long_df = pd.DataFrame(
+                {
+                    "lochNESS": np.concatenate(
+                        [
+                            results.scores[
+                                g
+                            ]
+                            for g
+                            in top_available
+                        ]
+                    ),
+                    "target": np.concatenate(
+                        [
+                            [g]
+                            * len(
+                                results.scores[
+                                    g
+                                ]
+                            )
+                            for g
+                            in top_available
+                        ]
+                    ),
+                }
+            )
+
+            fig, ax = plt.subplots(
+                figsize=(
+                    max(
+                        6,
+                        0.34
+                        * len(
+                            top_available
+                        ),
+                    ),
+                    4.2,
+                )
+            )
+
+            sns.violinplot(
+                data=long_df,
+                x="target",
+                y="lochNESS",
+                ax=ax,
+                cut=0,
+                inner=None,
+                linewidth=0.5,
+                order=top_available,
+            )
+
+            ax.axhline(
+                0,
+                color="black",
+                lw=0.8,
+            )
+
+            ax.tick_params(
+                axis="x",
+                rotation=90,
+                labelsize=6,
+            )
+
+            ax.set_xlabel(
+                ""
+            )
+
+            ax.set_title(
+                "lochNESS across all cells, per perturbation (top 30)",
+                fontsize=10,
+            )
+
+            sns.despine(
+                ax=ax
+            )
+
+            fig.tight_layout()
+
+            reg.save(
+                fig,
+                "lochness_distributions",
+                SECTION_LOCHNESS,
+                "lochNESS distribution per perturbation",
+                (
+                    "Each violin is one perturbation's score across every cell. "
+                    "A long upper tail means a subset of the manifold is strongly "
+                    "enriched for it, even when most cells sit at background."
+                ),
+            )
+
+    # --------------------------------------------------------------
+    # 3. target × cluster heatmap
+    # --------------------------------------------------------------
+
+    if not results.by_cluster.empty:
+
+        matrix = (
+            results.by_cluster.copy()
+        )
+
+        if (
+            len(matrix)
+            > LARGE_PLOT_MAX_HEATMAP_TARGETS
+        ):
+
+            keep = list(
+                summary[
+                    "target_gene"
+                ]
+                .head(
+                    LARGE_PLOT_MAX_HEATMAP_TARGETS
+                )
+            )
+
+            matrix = matrix.loc[
+                matrix.index
+                .intersection(
+                    keep
+                )
+            ]
+
+        try:
+
+            matrix = matrix[
+                sorted(
+                    matrix.columns,
+                    key=lambda col: (
+                        float(
+                            col
+                        ),
+                        col,
+                    ),
+                )
+            ]
+
+        except ValueError:
+
+            matrix = matrix[
+                sorted(
+                    matrix.columns
+                )
+            ]
+
+        order = _order_by_similarity(
+            matrix
+        )
+
+        matrix = matrix.loc[
+            order
+        ]
+
+        limit = (
+            float(
+                np.nanpercentile(
+                    np.abs(
+                        matrix.to_numpy()
+                    ),
+                    98,
+                )
+            )
+            or 1.0
+        )
+
+        fig, ax = plt.subplots(
+            figsize=(
+                max(
+                    6,
+                    0.55
+                    * matrix.shape[
+                        1
+                    ]
+                    + 4,
+                ),
+                max(
+                    4,
+                    min(
+                        20,
+                        0.10
+                        * len(
+                            matrix
+                        )
+                        + 2,
+                    ),
+                ),
+            )
+        )
+
+        im = ax.imshow(
+            matrix.to_numpy(),
+            cmap="RdBu_r",
+            vmin=-limit,
+            vmax=limit,
+            aspect="auto",
+        )
+
+        ax.set_xticks(
+            range(
+                matrix.shape[
+                    1
+                ]
+            )
+        )
+
+        ax.set_xticklabels(
+            matrix.columns,
+            fontsize=8,
+        )
+
+        if len(
+            matrix
+        ) <= 200:
+
+            ax.set_yticks(
+                range(
+                    len(
+                        matrix
+                    )
+                )
+            )
+
+            ax.set_yticklabels(
+                matrix.index,
+                fontsize=5,
+            )
+
+        else:
+
+            ax.set_yticks(
+                []
+            )
+
+        ax.set_xlabel(
+            f"Cluster ({CLUSTER_KEY})"
+        )
+
+        plt.colorbar(
+            im,
+            ax=ax,
+            shrink=0.6,
+            label="mean lochNESS",
+        )
+
+        ax.set_title(
+            "Mean lochNESS per cluster",
+            fontsize=11,
+        )
+
         fig.tight_layout()
+
         reg.save(
             fig,
             "lochness_by_cluster",
             SECTION_LOCHNESS,
             "lochNESS by cluster",
-            "Average score of each perturbation within each cluster, rows ordered "
-            "by similarity. This is the continuous counterpart of the enrichment "
-            "test in section 4 — agreement between the two is a good sign, and "
-            "structure here that the cluster test missed is worth a look.",
+            (
+                f"{len(matrix)} perturbations shown."
+            ),
         )
 
-    # --- 4. self score on the embedding -----------------------------------
-    if coords is not None and results.self_score is not None:
-        vals = np.asarray(results.self_score, dtype=float)
-        ok = np.isfinite(vals)
-        fig, ax = plt.subplots(figsize=(6.4, 5.2))
-        ax.scatter(coords[~ok, 0], coords[~ok, 1], s=3, color="#edf2f7",
-                   linewidths=0, rasterized=True, label="unassigned / ambiguous")
-        lim = float(np.nanpercentile(np.abs(vals[ok]), 98)) or 1.0
-        sc_ = ax.scatter(coords[ok, 0], coords[ok, 1], s=5, c=vals[ok],
-                         cmap="RdBu_r", vmin=-lim, vmax=lim, linewidths=0,
-                         rasterized=True)
-        plt.colorbar(sc_, ax=ax, shrink=0.75, label="lochNESS (own perturbation)")
-        ax.set_title("Each cell scored for its own perturbation", fontsize=10)
-        ax.set_xticks([])
-        ax.set_yticks([])
-        ax.legend(fontsize=7, frameon=False, loc="best", markerscale=3)
-        sns.despine(ax=ax, left=True, bottom=True)
-        fig.tight_layout()
-        reg.save(
-            fig,
-            "lochness_self_umap",
-            SECTION_LOCHNESS,
-            "Self lochNESS on the embedding",
-            "Red regions are where cells sit among others sharing their own "
-            "perturbation more often than chance — the parts of the manifold that "
-            "perturbation identity actually organises.",
+    # --------------------------------------------------------------
+    # 3. self score on UMAP
+    # --------------------------------------------------------------
+
+    if (
+        coords is not None
+        and results.self_score
+        is not None
+    ):
+
+        self_values = np.asarray(
+            results.self_score,
+            dtype=float,
         )
 
-    # --- 5. one map per perturbation --------------------------------------
-    if coords is None:
+        valid_indices = np.flatnonzero(
+            np.isfinite(
+                self_values
+            )
+        )
+
+        if (
+            len(
+                valid_indices
+            )
+            > LARGE_PLOT_MAX_CELLS
+        ):
+
+            selected = _sample_pool(
+                valid_indices,
+                LARGE_PLOT_MAX_CELLS,
+                cfg.run.seed,
+            )
+
+        else:
+
+            selected = (
+                valid_indices
+            )
+
+        if len(
+            selected
+        ):
+
+            plot_values = (
+                self_values[
+                    selected
+                ]
+            )
+
+            limit = (
+                float(
+                    np.nanpercentile(
+                        np.abs(
+                            plot_values
+                        ),
+                        98,
+                    )
+                )
+                or 1.0
+            )
+
+            fig, ax = plt.subplots(
+                figsize=(
+                    6.4,
+                    5.2,
+                )
+            )
+
+            scatter = ax.scatter(
+                coords[
+                    selected,
+                    0,
+                ],
+                coords[
+                    selected,
+                    1,
+                ],
+                s=4,
+                c=plot_values,
+                cmap="RdBu_r",
+                vmin=-limit,
+                vmax=limit,
+                linewidths=0,
+                rasterized=True,
+            )
+
+            plt.colorbar(
+                scatter,
+                ax=ax,
+                shrink=0.75,
+                label="lochNESS (own perturbation)",
+            )
+
+            ax.set_title(
+                "Self-lochNESS on the embedding",
+                fontsize=10,
+            )
+
+            ax.set_xticks(
+                []
+            )
+
+            ax.set_yticks(
+                []
+            )
+
+            sns.despine(
+                ax=ax,
+                left=True,
+                bottom=True,
+            )
+
+            fig.tight_layout()
+
+            reg.save(
+                fig,
+                "lochness_self_umap",
+                SECTION_LOCHNESS,
+                "Self lochNESS on the embedding",
+                (
+                    f"{len(selected):,} representative scored cells shown."
+                ),
+            )
+
+    # --------------------------------------------------------------
+    # Large mode intentionally stops here.
+    # --------------------------------------------------------------
+
+    if large_mode:
+
+        logger.info(
+            "Large-data lochNESS plotting: skipping per-target all-cell maps "
+            "because full score vectors were intentionally not materialized."
+        )
+
         return
-    top_n = lcfg.top_n_report
-    for rank, gene in enumerate(summary["target_gene"]):
-        score = np.asarray(results.scores[gene], dtype=float)
-        ok = np.isfinite(score)
-        own = expr.obs[cfg.lochness.genotype_key].astype(str).to_numpy() == gene
 
-        row = summary[summary["target_gene"] == gene].iloc[0]
-        fig, axes = plt.subplots(1, 2, figsize=(11.2, 4.8))
+    if (
+        coords is None
+        or not results.scores
+    ):
+        return
 
-        ax = axes[0]
-        srt = np.argsort(np.nan_to_num(score))
-        # lochNESS is bounded below by -1 (a neighbourhood with none of the
-        # perturbation) but unbounded above, and the informative values are a
-        # long thin tail: on the demo lane SALL4 runs to +47 while the 99th
-        # percentile is 4.5. A symmetric linear scale would therefore saturate
-        # the very cells the figure exists to show — half of SALL4's own cells
-        # sat above the cap. A symlog scale keeps the whole range visible.
-        vmax = float(np.nanmax(score[ok])) if ok.any() else 1.0
-        norm = _lochness_norm(vmax)
-        sc_ = ax.scatter(coords[srt, 0], coords[srt, 1], s=4,
-                         c=np.nan_to_num(score[srt]), cmap="RdBu_r",
-                         norm=norm, linewidths=0, rasterized=True)
-        cbar = plt.colorbar(sc_, ax=ax, shrink=0.78, label="lochNESS (symlog)")
-        cbar.ax.tick_params(labelsize=7)
-        ax.set_title(f"{gene}: neighbourhood enrichment", fontsize=10)
-        ax.set_xticks([])
-        ax.set_yticks([])
-        sns.despine(ax=ax, left=True, bottom=True)
+    top_n = (
+        lcfg.top_n_report
+    )
 
-        ax = axes[1]
-        ax.scatter(coords[~own, 0], coords[~own, 1], s=3, color="#e2e8f0",
-                   linewidths=0, rasterized=True, label="other cells")
-        ax.scatter(coords[own, 0], coords[own, 1], s=14, color="#c53030",
-                   linewidths=0.3, edgecolors="#2d3748", rasterized=True,
-                   label=f"{gene} cells")
-        # Label the clusters, so a reader can tell which blob the summary table
-        # means by "top cluster" instead of having to guess.
-        _label_clusters(ax, expr, coords, highlight=str(row.get("top_cluster", "")))
+    for rank, gene in enumerate(
+        summary[
+            "target_gene"
+        ]
+    ):
+
+        if gene not in results.scores:
+            continue
+
+        score = np.asarray(
+            results.scores[
+                gene
+            ],
+            dtype=float,
+        )
+
+        own = (
+            expr.obs[
+                cfg.lochness.genotype_key
+            ]
+            .astype(str)
+            .to_numpy()
+            == gene
+        )
+
+        row = (
+            summary[
+                summary[
+                    "target_gene"
+                ]
+                == gene
+            ]
+            .iloc[
+                0
+            ]
+        )
+
+        fig, axes = plt.subplots(
+            1,
+            2,
+            figsize=(
+                11.2,
+                4.8,
+            ),
+        )
+
+        # Score map.
+        ax = axes[
+            0
+        ]
+
+        finite = np.isfinite(
+            score
+        )
+
+        vmax = (
+            float(
+                np.nanmax(
+                    score[
+                        finite
+                    ]
+                )
+            )
+            if finite.any()
+            else 1.0
+        )
+
+        norm = _lochness_norm(
+            vmax
+        )
+
+        scatter = ax.scatter(
+            coords[
+                :,
+                0,
+            ],
+            coords[
+                :,
+                1,
+            ],
+            s=4,
+            c=np.nan_to_num(
+                score
+            ),
+            cmap="RdBu_r",
+            norm=norm,
+            linewidths=0,
+            rasterized=True,
+        )
+
+        plt.colorbar(
+            scatter,
+            ax=ax,
+            shrink=0.78,
+            label="lochNESS",
+        )
+
         ax.set_title(
-            f"where the {int(own.sum()):,} {gene} cells actually are "
-            f"(top cluster {row.get('top_cluster', '?')} highlighted)",
+            f"{gene}: neighbourhood enrichment",
             fontsize=10,
         )
-        ax.set_xticks([])
-        ax.set_yticks([])
-        ax.legend(fontsize=7, frameon=False, loc="best", markerscale=2)
-        sns.despine(ax=ax, left=True, bottom=True)
+
+        ax.set_xticks(
+            []
+        )
+
+        ax.set_yticks(
+            []
+        )
+
+        sns.despine(
+            ax=ax,
+            left=True,
+            bottom=True,
+        )
+
+        # Location map.
+        ax = axes[
+            1
+        ]
+
+        background_pool = np.flatnonzero(
+            ~own
+        )
+
+        if (
+            _is_large_plot_dataset(
+                expr
+            )
+        ):
+
+            background_pool = _sample_pool(
+                background_pool,
+                LARGE_PLOT_BACKGROUND_CELLS,
+                cfg.run.seed
+                + rank,
+            )
+
+        ax.scatter(
+            coords[
+                background_pool,
+                0,
+            ],
+            coords[
+                background_pool,
+                1,
+            ],
+            s=3,
+            alpha=0.4,
+            linewidths=0,
+            rasterized=True,
+        )
+
+        own_indices = np.flatnonzero(
+            own
+        )
+
+        ax.scatter(
+            coords[
+                own_indices,
+                0,
+            ],
+            coords[
+                own_indices,
+                1,
+            ],
+            s=14,
+            linewidths=0.3,
+            rasterized=True,
+            label=f"{gene} cells",
+        )
+
+        _label_clusters(
+            ax,
+            expr,
+            coords,
+            highlight=str(
+                row.get(
+                    "top_cluster",
+                    "",
+                )
+            ),
+        )
+
+        ax.set_title(
+            (
+                f"{gene} cells "
+                f"(n={len(own_indices):,})"
+            ),
+            fontsize=10,
+        )
+
+        ax.set_xticks(
+            []
+        )
+
+        ax.set_yticks(
+            []
+        )
+
+        ax.legend(
+            fontsize=7,
+            frameon=False,
+        )
+
+        sns.despine(
+            ax=ax,
+            left=True,
+            bottom=True,
+        )
 
         fig.tight_layout()
+
         reg.save(
             fig,
             f"lochness_{gene}",
             SECTION_LOCHNESS_PER_TARGET,
             f"{gene} lochNESS map",
-            f"Left: every cell scored for how enriched {gene} is among its "
-            f"neighbours (red = enriched, blue = depleted). Right: the cells "
-            f"actually carrying {gene}, for comparison. Mean score in its own "
-            f"cells {row['mean_lochness_in_own_cells']:.2f}; "
-            f"{row['pct_cells_enriched']:.1f}% of all cells score above "
-            f"{lcfg.enrichment_cut}.",
-            in_report=rank < top_n,
+            (
+                "Mean lochNESS in own cells = "
+                f"{row['mean_lochness_in_own_cells']:.2f}."
+            ),
+            in_report=(
+                rank < top_n
+            ),
         )
-    logger.info(
-        "Wrote %d per-perturbation lochNESS maps (%d shown in the report)",
-        len(summary),
-        min(top_n, len(summary)),
+
+
+# ---------------------------------------------------------------------------
+# Module/program helpers
+# ---------------------------------------------------------------------------
+
+
+def _label_colors(
+    labels: List[str],
+) -> dict:
+
+    unique = list(
+        dict.fromkeys(
+            labels
+        )
     )
 
+    palette = sns.color_palette(
+        "tab20",
+        max(
+            len(unique),
+            3,
+        ),
+    )
 
-# ---------------------------------------------------------------------------
-# Co-functional modules & gene programs
-# ---------------------------------------------------------------------------
+    return {
+        label: tuple(
+            palette[
+                i
+                % len(
+                    palette
+                )
+            ]
+        )
+        for i, label
+        in enumerate(
+            unique
+        )
+    }
 
 
-def _label_colors(labels: List[str]) -> dict:
-    uniq = list(dict.fromkeys(labels))
-    pal = sns.color_palette("tab20", max(len(uniq), 3))
-    return {lab: tuple(pal[i % len(pal)]) for i, lab in enumerate(uniq)}
+def _block_spans(
+    seq: List[str],
+):
+    """Return contiguous label spans."""
 
-
-def _block_spans(seq: List[str]):
-    """(label, start, stop) for each contiguous run of equal labels."""
     spans = []
-    if not len(seq):
+
+    if not len(
+        seq
+    ):
+
         return spans
+
     start = 0
-    for i in range(1, len(seq) + 1):
-        if i == len(seq) or seq[i] != seq[start]:
-            spans.append((seq[start], start, i))
+
+    for i in range(
+        1,
+        len(seq)
+        + 1,
+    ):
+
+        if (
+            i == len(seq)
+            or seq[
+                i
+            ]
+            != seq[
+                start
+            ]
+        ):
+
+            spans.append(
+                (
+                    seq[
+                        start
+                    ],
+                    start,
+                    i,
+                )
+            )
+
             start = i
+
     return spans
 
 
-def _display_order(items, label_of, label_rank, item_rank):
-    """Group items so each cluster is a contiguous block (leaf order within)."""
-    return sorted(items, key=lambda x: (label_rank[label_of[x]], item_rank[x]))
+def _display_order(
+    items,
+    label_of,
+    label_rank,
+    item_rank,
+):
 
-
-def _plot_effect_heatmap(results, reg, cfg) -> None:
-    """The core Fig-1c-style clustered heatmap: genes x perturbations."""
-    prog = results.gene_programs.set_index("gene")["program"]
-    mod = results.modules.set_index("target_gene")["module"]
-    prog_rank = {l: i for i, l in enumerate(results.program_labels)}
-    mod_rank = {l: i for i, l in enumerate(results.module_labels)}
-    g_rank = {g: i for i, g in enumerate(results.gene_order)}
-    p_rank = {p: i for i, p in enumerate(results.perturbation_order)}
-
-    genes = _display_order(results.gene_order, prog, prog_rank, g_rank)
-    perts = _display_order(results.perturbation_order, mod, mod_rank, p_rank)
-    D = results.effect_matrix.loc[perts, genes].T  # genes x perturbations
-    row_lab = [prog[g] for g in genes]
-    col_lab = [mod[t] for t in perts]
-
-    prog_colors = _label_colors(results.program_labels)
-    mod_colors = _label_colors(results.module_labels)
-    lim = float(np.nanpercentile(np.abs(D.to_numpy()), 98)) or 1.0
-
-    w = max(7.0, 0.06 * len(perts) + 3)
-    h = max(6.0, 0.02 * len(genes) + 3)
-    fig = plt.figure(figsize=(w, h))
-    gs = fig.add_gridspec(
-        2, 3, width_ratios=[0.02, 1, 0.04], height_ratios=[0.03, 1],
-        wspace=0.02, hspace=0.02,
+    return sorted(
+        items,
+        key=lambda item: (
+            label_rank[
+                label_of[
+                    item
+                ]
+            ],
+            item_rank[
+                item
+            ],
+        ),
     )
-    ax_top = fig.add_subplot(gs[0, 1])
-    ax_left = fig.add_subplot(gs[1, 0])
-    ax = fig.add_subplot(gs[1, 1])
-    cax = fig.add_subplot(gs[1, 2])
 
-    im = ax.imshow(D.to_numpy(), cmap="RdBu_r", vmin=-lim, vmax=lim, aspect="auto")
-    ax.set_yticks([])
-    if len(perts) <= 60:
-        ax.set_xticks(range(len(perts)))
-        ax.set_xticklabels(perts, rotation=90, fontsize=5)
+
+# ---------------------------------------------------------------------------
+# Modules: effect heatmap
+# ---------------------------------------------------------------------------
+
+
+def _plot_effect_heatmap(
+    results,
+    reg,
+    cfg,
+) -> None:
+
+    prog = (
+        results.gene_programs
+        .set_index(
+            "gene"
+        )[
+            "program"
+        ]
+    )
+
+    mod = (
+        results.modules
+        .set_index(
+            "target_gene"
+        )[
+            "module"
+        ]
+    )
+
+    prog_rank = {
+        label: i
+        for i, label
+        in enumerate(
+            results.program_labels
+        )
+    }
+
+    mod_rank = {
+        label: i
+        for i, label
+        in enumerate(
+            results.module_labels
+        )
+    }
+
+    gene_rank = {
+        gene: i
+        for i, gene
+        in enumerate(
+            results.gene_order
+        )
+    }
+
+    pert_rank = {
+        pert: i
+        for i, pert
+        in enumerate(
+            results.perturbation_order
+        )
+    }
+
+    genes = _display_order(
+        results.gene_order,
+        prog,
+        prog_rank,
+        gene_rank,
+    )
+
+    perts = _display_order(
+        results.perturbation_order,
+        mod,
+        mod_rank,
+        pert_rank,
+    )
+
+    # Guard gigantic module heatmaps too.
+    if len(
+        perts
+    ) > LARGE_PLOT_MAX_HEATMAP_TARGETS:
+
+        perts = perts[
+            :LARGE_PLOT_MAX_HEATMAP_TARGETS
+        ]
+
+        logger.info(
+            "Module heatmap restricted to %d perturbations",
+            len(
+                perts
+            ),
+        )
+
+    matrix = (
+        results.effect_matrix.loc[
+            perts,
+            genes,
+        ]
+        .T
+    )
+
+    row_labels = [
+        prog[
+            gene
+        ]
+        for gene
+        in genes
+    ]
+
+    col_labels = [
+        mod[
+            target
+        ]
+        for target
+        in perts
+    ]
+
+    prog_colors = _label_colors(
+        results.program_labels
+    )
+
+    mod_colors = _label_colors(
+        results.module_labels
+    )
+
+    limit = (
+        float(
+            np.nanpercentile(
+                np.abs(
+                    matrix.to_numpy()
+                ),
+                98,
+            )
+        )
+        or 1.0
+    )
+
+    width = max(
+        7.0,
+        min(
+            24.0,
+            0.04
+            * len(
+                perts
+            )
+            + 4,
+        ),
+    )
+
+    height = max(
+        6.0,
+        min(
+            24.0,
+            0.015
+            * len(
+                genes
+            )
+            + 4,
+        ),
+    )
+
+    fig = plt.figure(
+        figsize=(
+            width,
+            height,
+        )
+    )
+
+    grid = fig.add_gridspec(
+        2,
+        3,
+        width_ratios=[
+            0.02,
+            1,
+            0.04,
+        ],
+        height_ratios=[
+            0.03,
+            1,
+        ],
+        wspace=0.02,
+        hspace=0.02,
+    )
+
+    ax_top = fig.add_subplot(
+        grid[
+            0,
+            1,
+        ]
+    )
+
+    ax_left = fig.add_subplot(
+        grid[
+            1,
+            0,
+        ]
+    )
+
+    ax = fig.add_subplot(
+        grid[
+            1,
+            1,
+        ]
+    )
+
+    cax = fig.add_subplot(
+        grid[
+            1,
+            2,
+        ]
+    )
+
+    image = ax.imshow(
+        matrix.to_numpy(),
+        cmap="RdBu_r",
+        vmin=-limit,
+        vmax=limit,
+        aspect="auto",
+    )
+
+    ax.set_yticks(
+        []
+    )
+
+    if len(
+        perts
+    ) <= 60:
+
+        ax.set_xticks(
+            range(
+                len(
+                    perts
+                )
+            )
+        )
+
+        ax.set_xticklabels(
+            perts,
+            rotation=90,
+            fontsize=5,
+        )
+
     else:
-        ax.set_xticks([])
-    ax.set_xlabel(f"{len(perts)} perturbations (grouped into {results.n_modules} modules)")
-    ax.set_ylabel(f"{len(genes)} genes (grouped into {results.n_programs} programs)")
+
+        ax.set_xticks(
+            []
+        )
+
+    ax.set_xlabel(
+        (
+            f"{len(perts)} perturbations "
+            f"({results.n_modules} modules)"
+        )
+    )
+
+    ax.set_ylabel(
+        (
+            f"{len(genes)} genes "
+            f"({results.n_programs} programs)"
+        )
+    )
 
     ax_top.imshow(
-        np.array([[mod_colors[l] for l in col_lab]]), aspect="auto"
+        np.array(
+            [
+                [
+                    mod_colors[
+                        label
+                    ]
+                    for label
+                    in col_labels
+                ]
+            ]
+        ),
+        aspect="auto",
     )
-    ax_top.set_xticks([]); ax_top.set_yticks([])
-    for lab, s, e in _block_spans(col_lab):
-        ax_top.text((s + e - 1) / 2, 0, lab, ha="center", va="center",
-                    fontsize=7, fontweight="bold")
+
+    ax_top.set_xticks(
+        []
+    )
+
+    ax_top.set_yticks(
+        []
+    )
+
     ax_left.imshow(
-        np.array([[prog_colors[l]] for l in row_lab]), aspect="auto"
+        np.array(
+            [
+                [
+                    prog_colors[
+                        label
+                    ]
+                ]
+                for label
+                in row_labels
+            ]
+        ),
+        aspect="auto",
     )
-    ax_left.set_xticks([]); ax_left.set_yticks([])
-    for lab, s, e in _block_spans(row_lab):
-        ax_left.text(0, (s + e - 1) / 2, lab, ha="center", va="center",
-                     rotation=90, fontsize=7, fontweight="bold")
-    # thin separators between blocks on the main heatmap
-    for _, _, e in _block_spans(col_lab)[:-1]:
-        ax.axvline(e - 0.5, color="white", lw=0.6)
-    for _, _, e in _block_spans(row_lab)[:-1]:
-        ax.axhline(e - 0.5, color="white", lw=0.6)
 
-    plt.colorbar(im, cax=cax, label="log2FC vs control")
+    ax_left.set_xticks(
+        []
+    )
+
+    ax_left.set_yticks(
+        []
+    )
+
+    for _, _, end in (
+        _block_spans(
+            col_labels
+        )[
+            :-1
+        ]
+    ):
+
+        ax.axvline(
+            end - 0.5,
+            lw=0.6,
+        )
+
+    for _, _, end in (
+        _block_spans(
+            row_labels
+        )[
+            :-1
+        ]
+    ):
+
+        ax.axhline(
+            end - 0.5,
+            lw=0.6,
+        )
+
+    plt.colorbar(
+        image,
+        cax=cax,
+        label="log2FC vs control",
+    )
+
     ax_top.set_title(
-        f"Regulome map: {results.n_modules} co-functional modules x "
-        f"{results.n_programs} gene programs",
-        fontsize=11, pad=14,
+        (
+            f"Regulome map: "
+            f"{results.n_modules} modules × "
+            f"{results.n_programs} programs"
+        ),
+        fontsize=11,
+        pad=14,
     )
+
     reg.save(
-        fig, "regulome_heatmap", SECTION_MODULES,
+        fig,
+        "regulome_heatmap",
+        SECTION_MODULES,
         "Co-functional modules and gene programs",
-        f"Perturbation x gene log2FC vs {CONTROL_LABELS.get(results.control, results.control)}. "
-        f"Columns are {len(perts)} perturbations grouped into {results.n_modules} co-functional "
-        f"modules ({results.module_correlation}-correlation clustering); rows are {len(genes)} "
-        f"downstream genes grouped into {results.n_programs} programs "
-        f"({results.program_correlation}-correlation clustering). Red = up, blue = down after "
-        "perturbation. Module (M) and program (P) labels are arbitrary cluster ids.",
+        "Perturbation × downstream-gene effect matrix.",
     )
 
 
-def _plot_module_program(results, reg, cfg) -> None:
-    mp = results.module_program
-    if mp.empty:
+def _plot_module_program(
+    results,
+    reg,
+    cfg,
+) -> None:
+
+    matrix = (
+        results.module_program
+    )
+
+    if matrix.empty:
         return
-    lim = float(np.nanmax(np.abs(mp.to_numpy()))) or 1.0
-    fig, ax = plt.subplots(figsize=(max(4, 0.7 * mp.shape[1] + 2), max(3, 0.5 * mp.shape[0] + 1.5)))
-    im = ax.imshow(mp.to_numpy(), cmap="RdBu_r", vmin=-lim, vmax=lim, aspect="auto")
-    ax.set_xticks(range(mp.shape[1])); ax.set_xticklabels(mp.columns)
-    ax.set_yticks(range(mp.shape[0])); ax.set_yticklabels(mp.index)
-    ax.set_xlabel("Gene program"); ax.set_ylabel("Co-functional module")
-    for i in range(mp.shape[0]):
-        for j in range(mp.shape[1]):
-            v = mp.to_numpy()[i, j]
-            if np.isfinite(v):
-                ax.text(j, i, f"{v:+.2f}", ha="center", va="center", fontsize=7,
-                        color="white" if abs(v) > 0.6 * lim else "black")
-    plt.colorbar(im, ax=ax, shrink=0.7, label="mean log2FC")
-    ax.set_title("Module -> program regulatory strength", fontsize=11)
+
+    limit = (
+        float(
+            np.nanmax(
+                np.abs(
+                    matrix.to_numpy()
+                )
+            )
+        )
+        or 1.0
+    )
+
+    fig, ax = plt.subplots(
+        figsize=(
+            max(
+                4,
+                0.7
+                * matrix.shape[
+                    1
+                ]
+                + 2,
+            ),
+            max(
+                3,
+                0.5
+                * matrix.shape[
+                    0
+                ]
+                + 1.5,
+            ),
+        )
+    )
+
+    image = ax.imshow(
+        matrix.to_numpy(),
+        cmap="RdBu_r",
+        vmin=-limit,
+        vmax=limit,
+        aspect="auto",
+    )
+
+    ax.set_xticks(
+        range(
+            matrix.shape[
+                1
+            ]
+        )
+    )
+
+    display_labels = getattr(results, "program_display_labels", {})
+    xticklabels = [display_labels.get(col, col) for col in matrix.columns]
+    ax.set_xticklabels(
+        xticklabels,
+        rotation=30,
+        ha="right",
+        rotation_mode="anchor",
+    )
+
+    ax.set_yticks(
+        range(
+            matrix.shape[
+                0
+            ]
+        )
+    )
+
+    ax.set_yticklabels(
+        matrix.index
+    )
+
+    ax.set_xlabel(
+        "Gene program"
+    )
+
+    ax.set_ylabel(
+        "Co-functional module"
+    )
+
+    for i in range(
+        matrix.shape[
+            0
+        ]
+    ):
+
+        for j in range(
+            matrix.shape[
+                1
+            ]
+        ):
+
+            value = (
+                matrix.to_numpy()[
+                    i,
+                    j,
+                ]
+            )
+
+            if np.isfinite(
+                value
+            ):
+
+                ax.text(
+                    j,
+                    i,
+                    f"{value:+.2f}",
+                    ha="center",
+                    va="center",
+                    fontsize=7,
+                )
+
+    plt.colorbar(
+        image,
+        ax=ax,
+        shrink=0.7,
+        label="mean log2FC",
+    )
+
+    ax.set_title(
+        "Module → program regulatory strength",
+        fontsize=11,
+    )
+
     fig.tight_layout()
+
     reg.save(
-        fig, "module_program_strength", SECTION_MODULES,
-        "Module x program strength",
-        "Signed strength of each module's regulation of each program: the mean "
-        "program-gene log2FC per perturbation, averaged over the module's "
-        "perturbations. Red = net activation, blue = net repression.",
+        fig,
+        "module_program_strength",
+        SECTION_MODULES,
+        "Module × program strength",
+        "Average signed effect of each module on each gene program.",
     )
 
 
-def _plot_alluvial(results, reg, cfg) -> None:
-    mp = results.module_program
-    if mp.empty or mp.shape[0] < 1 or mp.shape[1] < 1:
+def _plot_alluvial(
+    results,
+    reg,
+    cfg,
+) -> None:
+
+    matrix = (
+        results.module_program
+    )
+
+    if (
+        matrix.empty
+        or matrix.shape[
+            0
+        ] < 1
+        or matrix.shape[
+            1
+        ] < 1
+    ):
+
         return
-    mod_colors = _label_colors(results.module_labels)
-    mag = mp.abs().fillna(0.0)
-    mod_tot = mag.sum(axis=1)
-    prog_tot = mag.sum(axis=0)
-    total = float(mag.to_numpy().sum())
+
+    magnitude = (
+        matrix.abs()
+        .fillna(
+            0.0
+        )
+    )
+
+    module_totals = (
+        magnitude.sum(
+            axis=1
+        )
+    )
+
+    program_totals = (
+        magnitude.sum(
+            axis=0
+        )
+    )
+
+    total = float(
+        magnitude.to_numpy()
+        .sum()
+    )
+
     if total <= 0:
         return
+
     gap = 0.02
 
-    def _stack(totals):
-        pos, y = {}, 1.0
-        n = len(totals)
-        usable = 1.0 - gap * (n - 1)
-        for name, t in totals.items():
-            hgt = usable * (t / total) if total else 0.0
-            pos[name] = (y - hgt, y)  # (low, high)
-            y -= hgt + gap
-        return pos
+    def _stack(
+        totals,
+    ):
 
-    left = _stack(mod_tot)
-    right = _stack(prog_tot)
-    fig, ax = plt.subplots(figsize=(7, max(4, 0.5 * mp.shape[0] + 2)))
+        positions = {}
 
-    left_cursor = {m: left[m][1] for m in mp.index}
-    right_cursor = {p: right[p][1] for p in mp.columns}
-    xs = np.linspace(0, 1, 40)
-    sm = xs * xs * (3 - 2 * xs)
-    for m in mp.index:
-        for p in mp.columns:
-            v = mp.loc[m, p]
-            if not np.isfinite(v) or v == 0:
+        y = 1.0
+
+        n = len(
+            totals
+        )
+
+        usable = (
+            1.0
+            - gap
+            * (
+                n - 1
+            )
+        )
+
+        for name, value in (
+            totals.items()
+        ):
+
+            height = (
+                usable
+                * (
+                    value
+                    / total
+                )
+            )
+
+            positions[
+                name
+            ] = (
+                y - height,
+                y,
+            )
+
+            y -= (
+                height
+                + gap
+            )
+
+        return positions
+
+    left = _stack(
+        module_totals
+    )
+
+    right = _stack(
+        program_totals
+    )
+
+    fig, ax = plt.subplots(
+        figsize=(
+            7,
+            max(
+                4,
+                0.5
+                * matrix.shape[
+                    0
+                ]
+                + 2,
+            ),
+        )
+    )
+
+    left_cursor = {
+        module: left[
+            module
+        ][
+            1
+        ]
+        for module
+        in matrix.index
+    }
+
+    right_cursor = {
+        program: right[
+            program
+        ][
+            1
+        ]
+        for program
+        in matrix.columns
+    }
+
+    xs = np.linspace(
+        0,
+        1,
+        40,
+    )
+
+    smooth = (
+        xs
+        * xs
+        * (
+            3
+            - 2
+            * xs
+        )
+    )
+
+    for module in (
+        matrix.index
+    ):
+
+        for program in (
+            matrix.columns
+        ):
+
+            value = (
+                matrix.loc[
+                    module,
+                    program,
+                ]
+            )
+
+            if (
+                not np.isfinite(
+                    value
+                )
+                or value == 0
+            ):
+
                 continue
-            thick = (1.0 - gap * (max(len(mp.index), len(mp.columns)) - 1)) * (abs(v) / total)
-            l_hi = left_cursor[m]; l_lo = l_hi - thick; left_cursor[m] = l_lo
-            r_hi = right_cursor[p]; r_lo = r_hi - thick; right_cursor[p] = r_lo
-            X = 0.08 + 0.84 * xs
-            lo = l_lo + (r_lo - l_lo) * sm
-            hi = l_hi + (r_hi - l_hi) * sm
-            ax.fill_between(X, lo, hi, color=("#c0392b" if v > 0 else "#2c6fbb"),
-                            alpha=0.55, lw=0)
-    for m, (lo, hi) in left.items():
-        ax.add_patch(plt.Rectangle((0.04, lo), 0.04, hi - lo, color=mod_colors[m]))
-        ax.text(0.02, (lo + hi) / 2, m, ha="right", va="center", fontsize=8, fontweight="bold")
-    for p, (lo, hi) in right.items():
-        ax.add_patch(plt.Rectangle((0.92, lo), 0.04, hi - lo, color="#666666"))
-        ax.text(0.98, (lo + hi) / 2, p, ha="left", va="center", fontsize=8, fontweight="bold")
-    ax.set_xlim(0, 1); ax.set_ylim(0, 1.02); ax.axis("off")
-    ax.set_title("Module -> program regulation (alluvial)\nred = activation, blue = repression",
-                 fontsize=11)
+
+            thickness = (
+                abs(
+                    value
+                )
+                / total
+            )
+
+            left_high = (
+                left_cursor[
+                    module
+                ]
+            )
+
+            left_low = (
+                left_high
+                - thickness
+            )
+
+            left_cursor[
+                module
+            ] = (
+                left_low
+            )
+
+            right_high = (
+                right_cursor[
+                    program
+                ]
+            )
+
+            right_low = (
+                right_high
+                - thickness
+            )
+
+            right_cursor[
+                program
+            ] = (
+                right_low
+            )
+
+            X = (
+                0.08
+                + 0.84
+                * xs
+            )
+
+            low = (
+                left_low
+                + (
+                    right_low
+                    - left_low
+                )
+                * smooth
+            )
+
+            high = (
+                left_high
+                + (
+                    right_high
+                    - left_high
+                )
+                * smooth
+            )
+
+            ax.fill_between(
+                X,
+                low,
+                high,
+                alpha=0.45,
+                lw=0,
+            )
+
+    for module, (
+        low,
+        high,
+    ) in left.items():
+
+        ax.add_patch(
+            plt.Rectangle(
+                (
+                    0.04,
+                    low,
+                ),
+                0.04,
+                high - low,
+            )
+        )
+
+        ax.text(
+            0.02,
+            (
+                low + high
+            )
+            / 2,
+            module,
+            ha="right",
+            va="center",
+            fontsize=8,
+        )
+
+    for program, (
+        low,
+        high,
+    ) in right.items():
+
+        ax.add_patch(
+            plt.Rectangle(
+                (
+                    0.92,
+                    low,
+                ),
+                0.04,
+                high - low,
+            )
+        )
+
+        display_labels = getattr(results, "program_display_labels", {})
+        label_text = display_labels.get(program, program)
+
+        ax.text(
+            0.98,
+            (
+                low + high
+            )
+            / 2,
+            label_text,
+            ha="left",
+            va="center",
+            fontsize=8,
+        )
+
+    ax.set_xlim(
+        0,
+        1,
+    )
+
+    ax.set_ylim(
+        0,
+        1.02,
+    )
+
+    ax.axis(
+        "off"
+    )
+
+    ax.set_title(
+        "Module → program regulation",
+        fontsize=11,
+    )
+
     reg.save(
-        fig, "module_program_alluvial", SECTION_MODULES,
-        "Module -> program alluvial",
-        "Regulatory flow from co-functional modules (left) to gene programs "
-        "(right). Ribbon width is the magnitude of the mean effect; red = "
-        "activation, blue = repression. Bar heights show each module/program's "
-        "total regulatory strength.",
+        fig,
+        "module_program_alluvial",
+        SECTION_MODULES,
+        "Module → program alluvial",
+        "Regulatory flow from perturbation modules to gene programs.",
     )
 
 
-def _plot_module_correlation(results, reg, cfg) -> None:
-    perts = results.perturbation_order
-    if len(perts) < 3:
+def _plot_module_correlation(
+    results,
+    reg,
+    cfg,
+) -> None:
+
+    perts = list(
+        results.perturbation_order
+    )
+
+    if len(
+        perts
+    ) < 3:
+
         return
-    mod = results.modules.set_index("target_gene")["module"]
-    mod_rank = {l: i for i, l in enumerate(results.module_labels)}
-    p_rank = {p: i for i, p in enumerate(perts)}
-    order = _display_order(perts, mod, mod_rank, p_rank)
-    corr = results.effect_matrix.loc[order].T.corr(method=results.module_correlation)
-    fig, ax = plt.subplots(figsize=(max(5, 0.14 * len(order) + 2),) * 2)
-    im = ax.imshow(corr.to_numpy(), cmap="RdBu_r", vmin=-1, vmax=1)
-    show = len(order) <= 70
-    ax.set_xticks(range(len(order)) if show else [])
-    if show:
-        ax.set_xticklabels(order, rotation=90, fontsize=4)
-        ax.set_yticks(range(len(order))); ax.set_yticklabels(order, fontsize=4)
+
+    if (
+        len(perts)
+        > LARGE_PLOT_MAX_HEATMAP_TARGETS
+    ):
+
+        perts = perts[
+            :LARGE_PLOT_MAX_HEATMAP_TARGETS
+        ]
+
+    module = (
+        results.modules
+        .set_index(
+            "target_gene"
+        )[
+            "module"
+        ]
+    )
+
+    module_rank = {
+        label: i
+        for i, label
+        in enumerate(
+            results.module_labels
+        )
+    }
+
+    perturbation_rank = {
+        perturbation: i
+        for i, perturbation
+        in enumerate(
+            perts
+        )
+    }
+
+    order = _display_order(
+        perts,
+        module,
+        module_rank,
+        perturbation_rank,
+    )
+
+    corr = (
+        results.effect_matrix.loc[
+            order
+        ]
+        .T
+        .corr(
+            method=results.module_correlation
+        )
+    )
+
+    size = max(
+        5,
+        min(
+            18,
+            0.10
+            * len(
+                order
+            )
+            + 3,
+        ),
+    )
+
+    fig, ax = plt.subplots(
+        figsize=(
+            size,
+            size,
+        )
+    )
+
+    image = ax.imshow(
+        corr.to_numpy(),
+        cmap="RdBu_r",
+        vmin=-1,
+        vmax=1,
+    )
+
+    if len(
+        order
+    ) <= 70:
+
+        ax.set_xticks(
+            range(
+                len(
+                    order
+                )
+            )
+        )
+
+        ax.set_xticklabels(
+            order,
+            rotation=90,
+            fontsize=4,
+        )
+
+        ax.set_yticks(
+            range(
+                len(
+                    order
+                )
+            )
+        )
+
+        ax.set_yticklabels(
+            order,
+            fontsize=4,
+        )
+
     else:
-        ax.set_yticks([])
-    for _, _, e in _block_spans([mod[t] for t in order])[:-1]:
-        ax.axvline(e - 0.5, color="black", lw=0.5); ax.axhline(e - 0.5, color="black", lw=0.5)
-    plt.colorbar(im, ax=ax, shrink=0.6, label=f"{results.module_correlation} r")
-    ax.set_title("Perturbation similarity (co-functional modules)", fontsize=11)
+
+        ax.set_xticks(
+            []
+        )
+
+        ax.set_yticks(
+            []
+        )
+
+    plt.colorbar(
+        image,
+        ax=ax,
+        shrink=0.6,
+        label=(
+            f"{results.module_correlation} r"
+        ),
+    )
+
+    ax.set_title(
+        "Perturbation similarity",
+        fontsize=11,
+    )
+
     fig.tight_layout()
+
     reg.save(
-        fig, "module_correlation", SECTION_MODULES,
-        "Perturbation correlation (modules)",
-        f"{results.module_correlation.title()} correlation between perturbations "
-        "of their transcriptome-wide effect profiles. Black lines separate the "
-        "co-functional modules; red blocks are perturbations acting together.",
+        fig,
+        "module_correlation",
+        SECTION_MODULES,
+        "Perturbation correlation",
+        "Correlation of transcriptome-wide perturbation effects.",
     )
 
 
-def _plot_program_activity(results, reg, cfg) -> None:
-    act = results.program_activity
-    if act.empty:
+def _plot_program_activity(
+    results,
+    reg,
+    cfg,
+) -> None:
+
+    activity = (
+        results.program_activity
+    )
+
+    if activity.empty:
         return
-    lim = float(np.nanmax(np.abs(act.to_numpy()))) or 1.0
-    fig, ax = plt.subplots(figsize=(max(4, 0.5 * act.shape[1] + 2), max(2.5, 0.5 * act.shape[0] + 1.5)))
-    im = ax.imshow(act.to_numpy(), cmap="RdBu_r", vmin=-lim, vmax=lim, aspect="auto")
-    ax.set_xticks(range(act.shape[1])); ax.set_xticklabels(act.columns, fontsize=7)
-    ax.set_yticks(range(act.shape[0])); ax.set_yticklabels(act.index)
-    ax.set_xlabel(f"Cluster ({cfg.modules.cluster_key})"); ax.set_ylabel("Gene program")
-    plt.colorbar(im, ax=ax, shrink=0.7, label="mean program score")
-    ax.set_title("Gene-program activity by cluster", fontsize=11)
+
+    limit = (
+        float(
+            np.nanmax(
+                np.abs(
+                    activity.to_numpy()
+                )
+            )
+        )
+        or 1.0
+    )
+
+    fig, ax = plt.subplots(
+        figsize=(
+            max(
+                4,
+                0.5
+                * activity.shape[
+                    1
+                ]
+                + 2,
+            ),
+            max(
+                2.5,
+                0.5
+                * activity.shape[
+                    0
+                ]
+                + 1.5,
+            ),
+        )
+    )
+
+    image = ax.imshow(
+        activity.to_numpy(),
+        cmap="RdBu_r",
+        vmin=-limit,
+        vmax=limit,
+        aspect="auto",
+    )
+
+    ax.set_xticks(
+        range(
+            activity.shape[
+                1
+            ]
+        )
+    )
+
+    ax.set_xticklabels(
+        activity.columns,
+        fontsize=7,
+    )
+
+    ax.set_yticks(
+        range(
+            activity.shape[
+                0
+            ]
+        )
+    )
+
+    ax.set_yticklabels(
+        activity.index
+    )
+
+    ax.set_xlabel(
+        (
+            "Cluster "
+            f"({cfg.modules.cluster_key})"
+        )
+    )
+
+    ax.set_ylabel(
+        "Gene program"
+    )
+
+    plt.colorbar(
+        image,
+        ax=ax,
+        shrink=0.7,
+        label="mean program score",
+    )
+
+    ax.set_title(
+        "Gene-program activity by cluster",
+        fontsize=11,
+    )
+
     fig.tight_layout()
+
     reg.save(
-        fig, "program_activity_by_cluster", SECTION_MODULES,
+        fig,
+        "program_activity_by_cluster",
+        SECTION_MODULES,
         "Program activity by cluster",
-        "Mean per-cell program score (sc.tl.score_genes) in each cell-state "
-        "cluster — which transcriptional states each program marks.",
+        "Mean gene-program activity within each cell-state cluster.",
     )
 
 
-def _plot_program_umaps(expr, results, reg, cfg) -> None:
-    if "X_umap" not in expr.obsm or not results.score_columns:
+def _plot_program_umaps(
+    expr,
+    results,
+    reg,
+    cfg,
+) -> None:
+
+    if (
+        "X_umap"
+        not in expr.obsm
+        or not results.score_columns
+    ):
+
         return
-    coords = np.asarray(expr.obsm["X_umap"])
-    top_n = cfg.modules.top_n_report
-    for rank, (label, col) in enumerate(zip(results.program_labels, results.score_columns)):
-        if col not in expr.obs:
+
+    coords = np.asarray(
+        expr.obsm[
+            "X_umap"
+        ]
+    )
+
+    top_n = (
+        cfg.modules.top_n_report
+    )
+
+    large_plot = _is_large_plot_dataset(
+        expr
+    )
+
+    for rank, (
+        label,
+        column,
+    ) in enumerate(
+        zip(
+            results.program_labels,
+            results.score_columns,
+        )
+    ):
+
+        if column not in expr.obs:
             continue
-        fig, ax = plt.subplots(figsize=(5, 4.2))
-        _scatter_umap(ax, coords, expr.obs[col].to_numpy(), False,
-                      f"Program {label} activity", size=4, cmap="RdBu_r")
+
+        fig, ax = plt.subplots(
+            figsize=(
+                5,
+                4.2,
+            )
+        )
+
+        _scatter_umap(
+            ax,
+            coords,
+            expr.obs[
+                column
+            ]
+            .to_numpy(),
+            False,
+            (
+                f"Program {label} activity"
+            ),
+            size=4,
+            cmap="RdBu_r",
+            max_points=(
+                LARGE_PLOT_MAX_CELLS
+                if large_plot
+                else None
+            ),
+            seed=cfg.run.seed
+            + rank,
+        )
+
         fig.tight_layout()
+
         reg.save(
-            fig, f"program_{label}_umap", SECTION_MODULES,
+            fig,
+            f"program_{label}_umap",
+            SECTION_MODULES,
             f"Program {label} activity (UMAP)",
-            f"Per-cell score for program {label} "
-            f"({len(results.program_genes.get(label, []))} genes) on the embedding.",
-            in_report=rank < top_n,
+            (
+                f"Per-cell activity score for program {label}."
+            ),
+            in_report=(
+                rank < top_n
+            ),
         )
 
 
-def _plot_networks(results, reg, cfg) -> None:
-    conn = results.module_connectivity
-    if conn.shape[0] >= 2:
-        fig, ax = plt.subplots(figsize=(max(4, 0.5 * conn.shape[0] + 2),) * 2)
-        im = ax.imshow(conn.to_numpy(), cmap="magma", aspect="auto")
-        ax.set_xticks(range(conn.shape[1])); ax.set_xticklabels(conn.columns, fontsize=7)
-        ax.set_yticks(range(conn.shape[0])); ax.set_yticklabels(conn.index, fontsize=7)
-        plt.colorbar(im, ax=ax, shrink=0.7, label="TF-TF edges / (size_i x size_j)")
-        ax.set_title("Module-module connectivity", fontsize=11)
-        fig.tight_layout()
-        reg.save(
-            fig, "module_connectivity", SECTION_MODULES,
+def _plot_networks(
+    results,
+    reg,
+    cfg,
+) -> None:
+
+    connectivity = (
+        results.module_connectivity
+    )
+
+    if (
+        connectivity.shape[
+            0
+        ]
+        >= 2
+    ):
+
+        fig, ax = plt.subplots(
+            figsize=(
+                max(
+                    4,
+                    0.5
+                    * connectivity.shape[
+                        0
+                    ]
+                    + 2,
+                ),
+                max(
+                    4,
+                    0.5
+                    * connectivity.shape[
+                        0
+                    ]
+                    + 2,
+                ),
+            )
+        )
+
+        image = ax.imshow(
+            connectivity.to_numpy(),
+            cmap="magma",
+            aspect="auto",
+        )
+
+        ax.set_xticks(
+            range(
+                connectivity.shape[
+                    1
+                ]
+            )
+        )
+
+        ax.set_xticklabels(
+            connectivity.columns,
+            fontsize=7,
+        )
+
+        ax.set_yticks(
+            range(
+                connectivity.shape[
+                    0
+                ]
+            )
+        )
+
+        ax.set_yticklabels(
+            connectivity.index,
+            fontsize=7,
+        )
+
+        plt.colorbar(
+            image,
+            ax=ax,
+            shrink=0.7,
+            label="normalized connectivity",
+        )
+
+        ax.set_title(
             "Module-module connectivity",
-            "Regulatory connectivity between modules: TF->TF edges spanning two "
-            "modules, normalised by the product of their sizes.",
+            fontsize=11,
         )
+
+        fig.tight_layout()
+
+        reg.save(
+            fig,
+            "module_connectivity",
+            SECTION_MODULES,
+            "Module-module connectivity",
+            "Regulatory connectivity between co-functional perturbation modules.",
+        )
+
     if not cfg.modules.draw_networks:
         return
+
     try:
+
         import networkx as nx
+
     except ImportError:
+
         logger.warning(
-            "modules.draw_networks is on but networkx is not installed; skipping "
-            "the network graphs (pip install -e '.[networks]'). Heatmaps still drawn."
+            "networkx is not installed; skipping network graphs"
         )
+
         return
 
-    mod_colors = _label_colors(results.module_labels)
-    # Module graph: nodes = modules (size by membership), edges = connectivity.
-    if conn.shape[0] >= 2:
-        G = nx.Graph()
-        sizes = results.modules["module"].value_counts()
-        for m in conn.index:
-            G.add_node(m, size=int(sizes.get(m, 1)))
-        for i, a in enumerate(conn.index):
-            for b in conn.columns[i + 1:]:
-                w = conn.loc[a, b] + conn.loc[b, a]
-                if w > 0:
-                    G.add_edge(a, b, weight=w)
-        pos = nx.spring_layout(G, seed=0, weight="weight")
-        fig, ax = plt.subplots(figsize=(6, 5))
+    if (
+        connectivity.shape[
+            0
+        ]
+        >= 2
+    ):
+
+        graph = nx.Graph()
+
+        sizes = (
+            results.modules[
+                "module"
+            ]
+            .value_counts()
+        )
+
+        for module in (
+            connectivity.index
+        ):
+
+            graph.add_node(
+                module,
+                size=int(
+                    sizes.get(
+                        module,
+                        1,
+                    )
+                ),
+            )
+
+        for i, left in enumerate(
+            connectivity.index
+        ):
+
+            for right in (
+                connectivity.columns[
+                    i + 1:
+                ]
+            ):
+
+                weight = (
+                    connectivity.loc[
+                        left,
+                        right,
+                    ]
+                    + connectivity.loc[
+                        right,
+                        left,
+                    ]
+                )
+
+                if weight > 0:
+
+                    graph.add_edge(
+                        left,
+                        right,
+                        weight=weight,
+                    )
+
+        position = nx.spring_layout(
+            graph,
+            seed=0,
+            weight="weight",
+        )
+
+        fig, ax = plt.subplots(
+            figsize=(
+                6,
+                5,
+            )
+        )
+
         nx.draw_networkx_edges(
-            G, pos, ax=ax, width=[2 + 8 * G[u][v]["weight"] for u, v in G.edges],
-            edge_color="#b0b0b0",
+            graph,
+            position,
+            ax=ax,
         )
+
         nx.draw_networkx_nodes(
-            G, pos, ax=ax, node_size=[80 + 40 * G.nodes[n]["size"] for n in G.nodes],
-            node_color=[mod_colors[n] for n in G.nodes],
+            graph,
+            position,
+            ax=ax,
+            node_size=[
+                (
+                    80
+                    + 40
+                    * graph.nodes[
+                        node
+                    ][
+                        "size"
+                    ]
+                )
+                for node
+                in graph.nodes
+            ],
         )
-        nx.draw_networkx_labels(G, pos, ax=ax, font_size=9, font_weight="bold")
-        ax.axis("off"); ax.set_title("Module interaction network", fontsize=11)
+
+        nx.draw_networkx_labels(
+            graph,
+            position,
+            ax=ax,
+            font_size=9,
+            font_weight="bold",
+        )
+
+        ax.axis(
+            "off"
+        )
+
+        ax.set_title(
+            "Module interaction network",
+            fontsize=11,
+        )
+
         reg.save(
-            fig, "module_network", SECTION_MODULES, "Module interaction network",
-            "Modules (nodes, sized by number of member TFs) linked by their "
-            "TF-TF regulatory connectivity (edge width).",
+            fig,
+            "module_network",
+            SECTION_MODULES,
+            "Module interaction network",
+            "Network representation of module connectivity.",
         )
 
-    # TF-hub network: top hubs, coloured by module.
-    edges = results.tf_edges
-    hubs = results.hubs
-    if not edges.empty and not hubs.empty:
-        top_hubs = set(hubs.head(40)["target_gene"])
-        H = nx.DiGraph()
-        mod_of = results.modules.set_index("target_gene")["module"].to_dict()
-        hub_size = hubs.set_index("target_gene")["n_de_genes"].to_dict()
-        for _, e in edges.iterrows():
-            if e["source"] in top_hubs and e["target"] in top_hubs:
-                H.add_edge(e["source"], e["target"], sign=e["sign"])
-        if H.number_of_nodes() >= 2:
-            pos = nx.spring_layout(H, seed=0)
-            fig, ax = plt.subplots(figsize=(7, 6))
-            ecolors = ["#c0392b" if H[u][v]["sign"] == "positive" else "#2c6fbb"
-                       for u, v in H.edges]
-            nx.draw_networkx_edges(H, pos, ax=ax, edge_color=ecolors, alpha=0.5,
-                                   arrowsize=8, width=0.8)
-            nx.draw_networkx_nodes(
-                H, pos, ax=ax,
-                node_size=[40 + 12 * hub_size.get(n, 1) for n in H.nodes],
-                node_color=[mod_colors.get(mod_of.get(n, ""), "#999999") for n in H.nodes],
-            )
-            nx.draw_networkx_labels(H, pos, ax=ax, font_size=6)
-            ax.axis("off")
-            ax.set_title("TF regulatory network (hubs)\nred = activation, blue = repression",
-                         fontsize=11)
-            reg.save(
-                fig, "tf_hub_network", SECTION_MODULES, "TF hub network",
-                "Regulatory edges between the top hub TFs (node size = number of "
-                "DE genes it perturbs; colour = its module). Red = activating, "
-                "blue = repressing edge.",
-            )
 
-
-def plot_modules(expr, results, reg: FigureRegistry, cfg: Config) -> None:
-    """All co-functional-module / gene-program figures."""
-    if results is None or results.effect_matrix.empty:
+def _plot_program_enrichment(
+    results,
+    reg: FigureRegistry,
+    cfg: Config,
+) -> None:
+    """Compact program x pathway enrichment dot plot."""
+    enr = getattr(results, "program_enrichment", None)
+    if enr is None or enr.empty:
         return
-    _plot_effect_heatmap(results, reg, cfg)
-    _plot_module_program(results, reg, cfg)
-    _plot_alluvial(results, reg, cfg)
-    _plot_module_correlation(results, reg, cfg)
-    _plot_program_activity(results, reg, cfg)
-    _plot_program_umaps(expr, results, reg, cfg)
-    _plot_networks(results, reg, cfg)
-    logger.info(
-        "Wrote module/program figures (%d modules, %d programs)",
-        results.n_modules, results.n_programs,
+
+    pe_cfg = getattr(cfg.modules, "program_enrichment", None)
+    fdr_alpha = float(getattr(pe_cfg, "fdr_alpha", 0.05)) if pe_cfg else 0.05
+    top_n = int(getattr(pe_cfg, "top_terms_per_program", 5)) if pe_cfg else 5
+
+    # Filter to significant hits or fallback to top terms
+    sig = enr[enr["fdr"] <= fdr_alpha]
+    if sig.empty:
+        sig = enr.groupby("program_id", group_keys=False).head(2)
+
+    if sig.empty:
+        return
+
+    # Select top terms per program
+    selected = (
+        sig.sort_values(["program_id", "fdr", "p_value"])
+        .groupby("program_id", as_index=False)
+        .head(top_n)
     )
+
+    terms = selected["clean_term"].unique().tolist()
+    if not terms:
+        return
+
+    # Limit total terms so figure is readable and compact
+    if len(terms) > 30:
+        terms = terms[:30]
+        selected = selected[selected["clean_term"].isin(terms)]
+
+    progs = list(results.program_labels) if getattr(results, "program_labels", None) else sorted(selected["program_id"].unique())
+    display_labels = getattr(results, "program_display_labels", {})
+    prog_labels = [display_labels.get(p, p) for p in progs]
+
+    term_to_y = {t: i for i, t in enumerate(terms)}
+    prog_to_x = {p: i for i, p in enumerate(progs)}
+
+    valid_mask = selected["program_id"].isin(prog_to_x) & selected["clean_term"].isin(term_to_y)
+    sel_valid = selected[valid_mask]
+    if sel_valid.empty:
+        return
+
+    xs = [prog_to_x[p] for p in sel_valid["program_id"]]
+    ys = [term_to_y[t] for t in sel_valid["clean_term"]]
+    fdrs = np.clip(sel_valid["fdr"].to_numpy(dtype=float), 1e-30, 1.0)
+    neg_log_fdr = -np.log10(fdrs)
+    overlaps = sel_valid["overlap_count"].to_numpy(dtype=float)
+
+    sizes = np.clip(overlaps * 18 + 25, 25, 350)
+
+    fig, ax = plt.subplots(
+        figsize=(
+            max(5, 0.9 * len(progs) + 2.5),
+            max(3.5, 0.35 * len(terms) + 1.8),
+        )
+    )
+
+    scatter = ax.scatter(
+        xs,
+        ys,
+        s=sizes,
+        c=neg_log_fdr,
+        cmap="YlOrRd",
+        edgecolors="black",
+        linewidths=0.5,
+        alpha=0.9,
+    )
+
+    ax.set_xticks(range(len(progs)))
+    ax.set_xticklabels(prog_labels, rotation=35, ha="right", rotation_mode="anchor", fontsize=8)
+    ax.set_yticks(range(len(terms)))
+    ax.set_yticklabels(terms, fontsize=8)
+    ax.set_title("Gene Program Pathway Enrichment", fontsize=11)
+    ax.grid(True, linestyle="--", alpha=0.3)
+
+    plt.colorbar(scatter, ax=ax, shrink=0.7, label="-log10(FDR)")
+    fig.tight_layout()
+
+    reg.save(
+        fig,
+        "program_enrichment",
+        SECTION_MODULES,
+        "Program pathway enrichment",
+        "Over-representation analysis of Stage 7 gene programs across biological pathway databases.",
+    )
+
+
+def plot_modules(
+    expr,
+    results,
+    reg: FigureRegistry,
+    cfg: Config,
+) -> None:
+    """All co-functional-module / gene-program figures."""
+
+    if (
+        results is None
+        or results.effect_matrix.empty
+    ):
+
+        return
+
+    _plot_effect_heatmap(
+        results,
+        reg,
+        cfg,
+    )
+
+    _plot_module_program(
+        results,
+        reg,
+        cfg,
+    )
+
+    _plot_alluvial(
+        results,
+        reg,
+        cfg,
+    )
+
+    _plot_program_enrichment(
+        results,
+        reg,
+        cfg,
+    )
+
+    _plot_module_correlation(
+        results,
+        reg,
+        cfg,
+    )
+
+    _plot_program_activity(
+        results,
+        reg,
+        cfg,
+    )
+
+    _plot_program_umaps(
+        expr,
+        results,
+        reg,
+        cfg,
+    )
+
+    _plot_networks(
+        results,
+        reg,
+        cfg,
+    )
+
+    logger.info(
+        "Wrote module/program figures "
+        "(%d modules, %d programs)",
+        results.n_modules,
+        results.n_programs,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Perturbation Distance & Phenotype Space Plots
+# ---------------------------------------------------------------------------
+
+
+def _significance_stars(fdr: float) -> str:
+    """Format FDR significance stars for heatmap annotations."""
+    if pd.isna(fdr):
+        return ""
+    if fdr < 0.001:
+        return "***"
+    if fdr < 0.01:
+        return "**"
+    if fdr < 0.05:
+        return "*"
+    return ""
+
+
+def plot_perturbation_atlas(
+    meta_table: pd.DataFrame,
+    reg: FigureRegistry,
+    cfg: Config,
+) -> None:
+    """Perturbation Atlas: Multi-dimensional heatmap of efficacy, penetrance, topology, and phenotype magnitude.
+
+    Rows: Targets (sorted by Energy distance)
+    Columns:
+      1. Efficacy (KD Strength = -target_log2fc)
+      2. Penetrance (PS Median / Responder Fraction)
+      3. Topology (lochNESS mean)
+      4. Phenotype Magnitude (Energy Distance)
+    Columns are Z-scored for visualization; significance stars indicate FDR.
+    Side annotations show co-functional and phenotype module memberships.
+    """
+    if meta_table is None or meta_table.empty:
+        return
+
+    df = meta_table.copy()
+    if "target_gene" not in df.columns:
+        return
+
+    # Select top targets by energy distance (or another available metric)
+    sort_col = "energy_distance" if "energy_distance" in df.columns and df["energy_distance"].notna().any() else (
+        "ps_median" if "ps_median" in df.columns else "target_gene"
+    )
+    df = df.sort_values(sort_col, ascending=(sort_col == "target_gene")).reset_index(drop=True)
+
+    max_n = getattr(cfg.visualization, "atlas_top_n", 50)
+    if len(df) > max_n:
+        df = df.iloc[:max_n].copy()
+
+    # Identify candidate heatmap feature columns
+    col_specs = [
+        ("target_log2fc", "Efficacy\n(KD Strength)", True, "target_fdr"),
+        ("ps_median", "Penetrance\n(PS Median)", False, None),
+        ("lochness_mean", "Topology\n(lochNESS)", False, None),
+        ("energy_distance", "Phenotype\n(Energy Dist)", False, "distance_fdr"),
+    ]
+
+    active_cols = []
+    col_labels = []
+    fdr_cols = []
+    matrix_data = []
+
+    for col_name, label, invert, fdr_col in col_specs:
+        if col_name in df.columns and df[col_name].notna().any():
+            vals = df[col_name].to_numpy(dtype=float, na_value=np.nan)
+            if invert:
+                # Invert KD so higher = stronger depletion
+                vals = -vals
+            active_cols.append(col_name)
+            col_labels.append(label)
+            fdr_cols.append(fdr_col if fdr_col in df.columns else None)
+            matrix_data.append(vals)
+
+    if len(active_cols) < 2:
+        return
+
+    M = np.column_stack(matrix_data)
+    # Column-wise Z-scoring
+    M_z = np.zeros_like(M)
+    for j in range(M.shape[1]):
+        col_vals = M[:, j]
+        valid = ~np.isnan(col_vals)
+        if valid.sum() > 1:
+            mean = np.mean(col_vals[valid])
+            std = np.std(col_vals[valid])
+            std = std if std > 1e-8 else 1.0
+            M_z[valid, j] = (col_vals[valid] - mean) / std
+        else:
+            M_z[:, j] = 0.0
+
+    targets = df["target_gene"].tolist()
+    n_targets = len(targets)
+
+    # Side annotations
+    has_cofunc = "cofunctional_module" in df.columns and df["cofunctional_module"].notna().any()
+    has_pheno = "phenotype_module" in df.columns and df["phenotype_module"].notna().any()
+
+    n_side = int(has_cofunc) + int(has_pheno)
+    fig_height = max(6.0, 0.28 * n_targets + 2.0)
+    fig_width = 8.0 + (1.2 * n_side)
+
+    fig = plt.figure(figsize=(fig_width, fig_height))
+    gs = fig.add_gridspec(1, 1 + n_side + 1, width_ratios=[0.4] * n_side + [4.0, 0.2], wspace=0.15)
+
+    col_idx = 0
+    # 1. Co-functional module annotation
+    if has_cofunc:
+        ax_co = fig.add_subplot(gs[0, col_idx])
+        col_idx += 1
+        modules = df["cofunctional_module"].fillna("None").astype(str).tolist()
+        unique_m = sorted(set(modules))
+        cmap_co = plt.cm.tab20(np.linspace(0, 1, len(unique_m)))
+        m_map = {m: cmap_co[i] for i, m in enumerate(unique_m)}
+        colors_co = np.array([m_map[m] for m in modules])[:, :3]
+        ax_co.imshow(colors_co[:, None, :], aspect="auto", interpolation="nearest")
+        ax_co.set_xticks([0])
+        ax_co.set_xticklabels(["Co-func\nModule"], rotation=90, fontsize=8)
+        ax_co.set_yticks([])
+        for spine in ax_co.spines.values():
+            spine.set_visible(False)
+
+    # 2. Phenotype module annotation
+    if has_pheno:
+        ax_ph = fig.add_subplot(gs[0, col_idx])
+        col_idx += 1
+        pmodules = df["phenotype_module"].fillna("None").astype(str).tolist()
+        unique_pm = sorted(set(pmodules))
+        cmap_ph = plt.cm.Set2(np.linspace(0, 1, max(len(unique_pm), 1)))
+        pm_map = {m: cmap_ph[i % len(cmap_ph)] for i, m in enumerate(unique_pm)}
+        colors_ph = np.array([pm_map[m] for m in pmodules])[:, :3]
+        ax_ph.imshow(colors_ph[:, None, :], aspect="auto", interpolation="nearest")
+        ax_ph.set_xticks([0])
+        ax_ph.set_xticklabels(["Pheno\nModule"], rotation=90, fontsize=8)
+        ax_ph.set_yticks([])
+        for spine in ax_ph.spines.values():
+            spine.set_visible(False)
+
+    # 3. Main heatmap
+    ax_main = fig.add_subplot(gs[0, col_idx])
+    cbar_ax = fig.add_subplot(gs[0, col_idx + 1])
+
+    vmax = max(2.5, float(np.nanmax(np.abs(M_z))))
+    im = ax_main.imshow(M_z, aspect="auto", cmap="vlag", vmin=-vmax, vmax=vmax, interpolation="nearest")
+    fig.colorbar(im, cax=cbar_ax, label="Column Z-score")
+
+    ax_main.set_xticks(range(len(col_labels)))
+    ax_main.set_xticklabels(col_labels, rotation=0, fontsize=9, fontweight="bold")
+    ax_main.set_yticks(range(n_targets))
+    ax_main.set_yticklabels(targets, fontsize=8)
+
+    # Significance stars overlay
+    for i in range(n_targets):
+        for j in range(len(active_cols)):
+            f_col = fdr_cols[j]
+            if f_col and f_col in df.columns:
+                f_val = df.iloc[i][f_col]
+                stars = _significance_stars(f_val)
+                if stars:
+                    text_color = "black" if abs(M_z[i, j]) < 1.2 else "white"
+                    ax_main.text(j, i, stars, ha="center", va="center", color=text_color, fontsize=9, fontweight="bold")
+
+    ax_main.set_title("Perturbation Atlas", fontsize=12, fontweight="bold", pad=12)
+
+    reg.save(
+        fig,
+        "perturbation_atlas",
+        SECTION_DISTANCE,
+        "Perturbation Atlas",
+        "Multi-dimensional overview of perturbation efficacy, penetrance (PS score), "
+        "manifold topology (lochNESS), and phenotype magnitude (Energy distance). "
+        "Columns are Z-scored for visual comparison; asterisks indicate statistical significance (* FDR < 0.05, ** FDR < 0.01, *** FDR < 0.001).",
+    )
+
+
+def plot_ps_vs_distance(
+    meta_table: pd.DataFrame,
+    reg: FigureRegistry,
+    cfg: Config,
+) -> None:
+    """PS × Perturbation Distance map: penetrance vs phenotype distance."""
+    if meta_table is None or meta_table.empty:
+        return
+
+    df = meta_table.copy()
+    if "energy_distance" not in df.columns:
+        return
+
+    y_col = "ps_median" if "ps_median" in df.columns else (
+        "ps_responder_fraction" if "ps_responder_fraction" in df.columns else None
+    )
+    if y_col is None:
+        return
+
+    valid_mask = df["energy_distance"].notna() & df[y_col].notna()
+    if valid_mask.sum() < 3:
+        return
+
+    sub = df[valid_mask].copy()
+
+    fig, ax = plt.subplots(figsize=(8.0, 6.0))
+
+    # Point size by lochNESS
+    if "lochness_mean" in sub.columns and sub["lochness_mean"].notna().any():
+        l_vals = sub["lochness_mean"].fillna(0).to_numpy(dtype=float)
+        l_min, l_max = np.min(l_vals), np.max(l_vals)
+        norm_l = (l_vals - l_min) / (l_max - l_min + 1e-6)
+        sizes = 40.0 + 160.0 * norm_l
+    else:
+        sizes = np.full(len(sub), 60.0)
+
+    # Color by phenotype or cofunctional module
+    color_col = "phenotype_module" if "phenotype_module" in sub.columns and sub["phenotype_module"].notna().any() else (
+        "cofunctional_module" if "cofunctional_module" in sub.columns and sub["cofunctional_module"].notna().any() else None
+    )
+
+    if color_col:
+        cats = sub[color_col].fillna("None").astype(str)
+        unique_cats = sorted(set(cats))
+        palette = sns.color_palette("tab10", n_colors=len(unique_cats))
+        color_map = {c: palette[i % len(palette)] for i, c in enumerate(unique_cats)}
+        point_colors = [color_map[c] for c in cats]
+    else:
+        point_colors = "#2b6cb0"
+
+    # Significance styling
+    sig_col = "distance_significant" if "distance_significant" in sub.columns else (
+        "distance_fdr" if "distance_fdr" in sub.columns else None
+    )
+    if sig_col == "distance_significant":
+        is_sig = sub[sig_col].fillna(False).to_numpy(dtype=bool)
+    elif sig_col == "distance_fdr":
+        is_sig = (sub[sig_col].fillna(1.0) < cfg.distance.fdr_threshold).to_numpy(dtype=bool)
+    else:
+        is_sig = np.ones(len(sub), dtype=bool)
+
+    # Scatter points
+    ax.scatter(
+        sub.loc[is_sig, "energy_distance"],
+        sub.loc[is_sig, y_col],
+        s=sizes[is_sig],
+        c=[point_colors[i] for i in np.where(is_sig)[0]] if isinstance(point_colors, list) else point_colors,
+        alpha=0.85,
+        edgecolors="#1a202c",
+        linewidths=1.2,
+        label=f"Significant (FDR < {cfg.distance.fdr_threshold})",
+    )
+
+    if (~is_sig).sum() > 0:
+        ax.scatter(
+            sub.loc[~is_sig, "energy_distance"],
+            sub.loc[~is_sig, y_col],
+            s=sizes[~is_sig] * 0.7,
+            c=[point_colors[i] for i in np.where(~is_sig)[0]] if isinstance(point_colors, list) else point_colors,
+            alpha=0.35,
+            edgecolors="gray",
+            linewidths=0.8,
+            label="Not significant",
+        )
+
+    # Annotate top targets by distance
+    top_dist = sub.nlargest(min(12, len(sub)), "energy_distance")
+    for _, row in top_dist.iterrows():
+        ax.annotate(
+            str(row["target_gene"]),
+            (row["energy_distance"], row[y_col]),
+            xytext=(5, 5),
+            textcoords="offset points",
+            fontsize=8,
+            fontweight="bold",
+            alpha=0.9,
+        )
+
+    ax.set_xlabel("Phenotype Magnitude (Energy Distance from Control)", fontsize=10, fontweight="bold")
+    ax.set_ylabel(f"Penetrance ({y_col.replace('_', ' ').title()})", fontsize=10, fontweight="bold")
+    ax.set_title("Perturbation Penetrance vs Phenotype Distance Map", fontsize=11, fontweight="bold")
+
+    if color_col and isinstance(point_colors, list) and len(unique_cats) <= 10:
+        handles = [
+            plt.Line2D([0], [0], marker="o", color="w", markerfacecolor=color_map[c], markersize=8, label=c)
+            for c in unique_cats
+        ]
+        ax.legend(handles=handles, title=color_col.replace("_", " ").title(), loc="best", fontsize=8)
+
+    sns.despine(ax=ax)
+    reg.save(
+        fig,
+        "ps_vs_distance_map",
+        SECTION_DISTANCE,
+        "PS vs Perturbation Distance Map",
+        "Single-cell perturbation penetrance (PS score) plotted against global phenotype magnitude (Energy distance). "
+        "Point size reflects continuous manifold enrichment (lochNESS).",
+    )
+
+
+def plot_perturbation_space(
+    dist_space_res,
+    meta_table: Optional[pd.DataFrame],
+    reg: FigureRegistry,
+    cfg: Config,
+) -> None:
+    """Perturbation Phenotype Space: PCoA projections of pairwise distance manifold."""
+    if dist_space_res is None or dist_space_res.coordinates.empty:
+        return
+
+    coords = dist_space_res.coordinates.copy()
+    if "PCoA1" not in coords.columns or "PCoA2" not in coords.columns:
+        return
+
+    if meta_table is not None and not meta_table.empty:
+        coords = pd.merge(coords, meta_table, on="target_gene", how="left")
+
+    fig, axes = plt.subplots(1, 2, figsize=(13.0, 5.5))
+
+    # Panel 1: Colored by phenotype module
+    ax1 = axes[0]
+    if "phenotype_module" in coords.columns and coords["phenotype_module"].notna().any():
+        cats = coords["phenotype_module"].fillna("None").astype(str)
+        unique_cats = sorted(set(cats))
+        palette = sns.color_palette("tab10", n_colors=len(unique_cats))
+        c_map = {c: palette[i % len(palette)] for i, c in enumerate(unique_cats)}
+        for c in unique_cats:
+            sub = coords[cats == c]
+            ax1.scatter(sub["PCoA1"], sub["PCoA2"], c=[c_map[c]], label=c, s=50, alpha=0.85, edgecolors="none")
+        if len(unique_cats) <= 12:
+            ax1.legend(title="Phenotype Module", fontsize=8, loc="best")
+    else:
+        ax1.scatter(coords["PCoA1"], coords["PCoA2"], c="#2b6cb0", s=50, alpha=0.85)
+
+    ax1.set_xlabel("PCoA 1", fontsize=10, fontweight="bold")
+    ax1.set_ylabel("PCoA 2", fontsize=10, fontweight="bold")
+    ax1.set_title("Perturbation Phenotype Space (Modules)", fontsize=11, fontweight="bold")
+    sns.despine(ax=ax1)
+
+    # Panel 2: Colored by Energy distance from control (or PS score)
+    ax2 = axes[1]
+    color_metric = "energy_distance" if "energy_distance" in coords.columns and coords["energy_distance"].notna().any() else (
+        "ps_median" if "ps_median" in coords.columns and coords["ps_median"].notna().any() else None
+    )
+
+    if color_metric:
+        c_vals = coords[color_metric].to_numpy(dtype=float)
+        sc = ax2.scatter(coords["PCoA1"], coords["PCoA2"], c=c_vals, cmap="viridis", s=50, alpha=0.85, edgecolors="none")
+        fig.colorbar(sc, ax=ax2, label=color_metric.replace("_", " ").title())
+    else:
+        ax2.scatter(coords["PCoA1"], coords["PCoA2"], c="#4a5568", s=50, alpha=0.85)
+
+    ax2.set_xlabel("PCoA 1", fontsize=10, fontweight="bold")
+    ax2.set_ylabel("PCoA 2", fontsize=10, fontweight="bold")
+    ax2.set_title(f"Phenotype Space ({color_metric.replace('_', ' ').title() if color_metric else 'PCoA'})", fontsize=11, fontweight="bold")
+    sns.despine(ax=ax2)
+
+    reg.save(
+        fig,
+        "perturbation_phenotype_space",
+        SECTION_DISTANCE_SPACE,
+        "Perturbation Phenotype Space (PCoA)",
+        "Low-dimensional projection of pairwise perturbation Energy Distances via classical Multidimensional Scaling (PCoA).",
+    )
+
+
+def plot_module_concordance(
+    meta_table: pd.DataFrame,
+    reg: FigureRegistry,
+    cfg: Config,
+) -> None:
+    """Module concordance heatmap: Co-functional modules vs Phenotype modules."""
+    if meta_table is None or meta_table.empty:
+        return
+
+    df = meta_table
+    if "cofunctional_module" not in df.columns or "phenotype_module" not in df.columns:
+        return
+
+    valid = df["cofunctional_module"].notna() & df["phenotype_module"].notna()
+    if valid.sum() < 4:
+        return
+
+    sub = df[valid]
+    co_mods = sub["cofunctional_module"].astype(str)
+    ph_mods = sub["phenotype_module"].astype(str)
+
+    if co_mods.nunique() < 2 or ph_mods.nunique() < 2:
+        return
+
+    ct = pd.crosstab(co_mods, ph_mods)
+
+    # Compute ARI/NMI if sklearn available
+    metric_str = ""
+    try:
+        from sklearn.metrics import adjusted_rand_score, normalized_mutual_info_score
+        ari = adjusted_rand_score(co_mods, ph_mods)
+        nmi = normalized_mutual_info_score(co_mods, ph_mods)
+        metric_str = f" (ARI = {ari:.3f}, NMI = {nmi:.3f})"
+    except Exception:
+        pass
+
+    fig, ax = plt.subplots(figsize=(max(5.0, 0.6 * ct.shape[1] + 2.0), max(4.5, 0.5 * ct.shape[0] + 1.5)))
+    sns.heatmap(
+        ct,
+        annot=True,
+        fmt="d",
+        cmap="Blues",
+        cbar_kws={"label": "Target Count"},
+        ax=ax,
+        linewidths=0.5,
+    )
+
+    ax.set_xlabel("Phenotype Modules (Distance Space)", fontsize=10, fontweight="bold")
+    ax.set_ylabel("Co-functional Modules (Gene Programs)", fontsize=10, fontweight="bold")
+    ax.set_title(f"Module Concordance{metric_str}", fontsize=11, fontweight="bold", pad=12)
+
+    reg.save(
+        fig,
+        "module_concordance",
+        SECTION_DISTANCE_SPACE,
+        "Module Concordance Heatmap",
+        f"Cross-tabulation comparing gene-effect co-functional modules with cell-state phenotype distance modules{metric_str}.",
+    )
+
+
+def plot_distance_overview(
+    dist_res,
+    reg: FigureRegistry,
+    cfg: Config,
+) -> None:
+    """Distance overview: Ranked bar plot of Energy Distance vs Control."""
+    if dist_res is None or dist_res.table.empty:
+        return
+
+    tbl = dist_res.table.copy()
+    if "energy_distance" not in tbl.columns:
+        return
+
+    tbl = tbl.sort_values("energy_distance", ascending=False).reset_index(drop=True)
+    max_bars = min(40, len(tbl))
+    sub = tbl.iloc[:max_bars]
+
+    fig, ax = plt.subplots(figsize=(max(6.0, 0.25 * max_bars + 1.5), 4.5))
+
+    is_sig = sub["significant"] if "significant" in sub.columns else pd.Series([True] * len(sub))
+    colors = ["#dd6b20" if s else "#a0aec0" for s in is_sig]
+
+    ax.bar(range(len(sub)), sub["energy_distance"], color=colors, edgecolor="none", width=0.8)
+    ax.set_xticks(range(len(sub)))
+    ax.set_xticklabels(sub["target_gene"], rotation=90, fontsize=8)
+    ax.set_ylabel("Energy Distance vs Control", fontsize=10, fontweight="bold")
+    ax.set_title("Perturbation Distance vs Control Ranking", fontsize=11, fontweight="bold")
+
+    handles = [
+        plt.Rectangle((0, 0), 1, 1, color="#dd6b20", label=f"FDR < {cfg.distance.fdr_threshold}"),
+        plt.Rectangle((0, 0), 1, 1, color="#a0aec0", label="Not significant"),
+    ]
+    ax.legend(handles=handles, fontsize=8, loc="upper right")
+
+    sns.despine(ax=ax)
+    fig.tight_layout()
+
+    reg.save(
+        fig,
+        "perturbation_distance_ranking",
+        SECTION_DISTANCE,
+        "Perturbation Distance vs Control Ranking",
+        "Ranked Energy Distance from unperturbed control cells across perturbation targets.",
+    )
+
+
+def plot_distance_figures(
+    dist_res,
+    meta_table: Optional[pd.DataFrame],
+    reg: FigureRegistry,
+    cfg: Config,
+) -> None:
+    """Generate all figures for Perturbation Distance and Perturbation Atlas."""
+    if dist_res is not None and not dist_res.table.empty:
+        plot_distance_overview(dist_res, reg, cfg)
+
+    if meta_table is not None and not meta_table.empty:
+        if cfg.visualization.perturbation_atlas:
+            plot_perturbation_atlas(meta_table, reg, cfg)
+        if cfg.visualization.ps_distance_map:
+            plot_ps_vs_distance(meta_table, reg, cfg)
+
+
+def plot_distance_space_figures(
+    dist_space_res,
+    meta_table: Optional[pd.DataFrame],
+    reg: FigureRegistry,
+    cfg: Config,
+) -> None:
+    """Generate all figures for Perturbation Distance Space and Phenotype Modules."""
+    if dist_space_res is not None and not dist_space_res.coordinates.empty:
+        if cfg.visualization.perturbation_space:
+            plot_perturbation_space(dist_space_res, meta_table, reg, cfg)
+
+    if meta_table is not None and not meta_table.empty:
+        if cfg.visualization.module_concordance:
+            plot_module_concordance(meta_table, reg, cfg)

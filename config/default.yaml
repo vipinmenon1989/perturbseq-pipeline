@@ -2,6 +2,7 @@ run:
   name: perturbseq_run
   outdir: results
   seed: 0
+  stop_after: null
 input:
   mode: auto
   mtx_dirs: null
@@ -16,6 +17,7 @@ input:
   - CRISPR Guide Capture
   var_names: gene_symbols
   cache_mtx: true
+  cell_id_format: suffix
   counts_layer: null
   normalized_layer: null
   guide_table: null
@@ -40,25 +42,126 @@ qc:
   - RPS
   - RPL
   hb_pattern: ^HB[^(P)]
+  thresholds:
+    method: mad
+    n_mads: 3.0
+    log_transform: true
+    mad_metrics:
+    - total_counts
+    - n_genes_by_counts
+    flag_low: true
+    flag_high: true
+    min_genes_floor: 200
+    min_counts_floor: 500
+    max_genes_ceiling: null
+    max_counts_ceiling: null
+    max_pct_mt: 20.0
+    max_pct_mt_mad: false
+    max_pct_mt_by_condition: {}
+    condition_key: condition_code
+    max_pct_hb: null
+    per_sample: {}
+  doublets:
+    enabled: true
+    method: scrublet
+    expected_doublet_rate: null
+    threshold: null
+    sim_doublet_ratio: 2.0
+    n_prin_comps: 30
+    stdev_doublet_rate: 0.02
+    min_gene_counts: 3
 guides:
   min_umi: 3
   dominance_ratio: 2.0
+  dominance_pseudocount: 1.0
   max_second_umi: -1
   detection_threshold: 3
+  target_feature_column: null
+  ignored_target_values:
+  - Ignore
   target_regex: null
   target_split_delims:
   - _
   - '-'
   - .
   ntc_patterns:
-  - ^non[-_.]?targeting
+  - ^non[-_. ]?targeting
   - ^non$
   - ^ntc
   - scramble
-  - ^safe[-_.]?harbor
+  - ^safe[-_. ]?harbor
+  - ^no[-_. ]?target
   unassigned_label: unassigned
   ambiguous_label: ambiguous
   ntc_label: non-targeting
+  assignment_mode: single_guide
+  pair_reference: null
+  pair_assignment_primary: true
+  require_complete_pair: true
+  unresolved_pair_policy: exclude
+  single_guide_diagnostic: false
+  sequence_column: auto
+  pair_map_file: null
+  scaffold_column: scaffold
+  pair_id_column: pair_id
+  scaffold_classes:
+  - A
+  - C
+  ntc_partner_policy: ambiguous
+  pair_id_delimiter: ;
+  designed_targeting_plus_ntc_primary: true
+  source: auto
+  design:
+    path: null
+    sheet: null
+    protospacer_column: null
+    target_column: null
+    guide_id_column: null
+    scaffold_column: null
+    scaffold_table: null
+    control_patterns: null
+    id_format: '{target}_{n}'
+    uppercase: true
+  fastq:
+    read_pattern: '*_R1_*.fastq.gz'
+    barcode_length: 16
+    umi_length: 12
+    protospacer_length: 20
+    scaffolds:
+      A: GTTTAAGAGCTA
+      C: GTTTCAGAGCTA
+    anchor_search_start: 40
+    position_shift: 1
+    max_mismatches: 0
+    tso: TTTCTTATATGGG
+    restrict_to_gex_barcodes: true
+    barcode_suffix_regex: -\d+$
+    max_reads: null
+    n_workers: null
+    chunk_size: 2000000
+    unmatched_sample_rate: 50
+    unmatched_top_n: 50
+    scaffold_specific_features: false
+  multiplet:
+    detection_threshold: null
+    detection_min_fraction_of_top: null
+    sensitivity_thresholds:
+    - 3
+    - 5
+    - 10
+    - 20
+    - 50
+    sensitivity_fractions:
+    - 0.0
+    - 0.02
+    - 0.05
+    - 0.1
+    - 0.2
+    max_guides_per_scaffold: 1
+    expected_guides_per_scaffold: 1
+    expected_guides_per_cell: 1
+    scaffold_purity_min: 0.9
+    scaffold_min_reads: 20
 cluster:
   target_sum: null
   n_top_genes: 3000
@@ -100,7 +203,7 @@ enrichment:
   permutations: 1000
   top_n_report: 12
 modules:
-  enabled: true
+  enabled: false
   cluster_key: leiden
   gene_selection: cluster_markers
   n_marker_genes_per_cluster: 100
@@ -120,8 +223,22 @@ modules:
   min_perturbations: 5
   min_genes: 10
   top_n_report: 12
+  program_enrichment:
+    enabled: true
+    method: ora
+    species: human
+    sources:
+    - hallmark
+    - reactome
+    - go_bp
+    custom_gmt_files: {}
+    fdr_alpha: 0.05
+    min_overlap: 2
+    min_genes: 5
+    max_genes: 1500
+    top_terms_per_program: 5
 ps_score:
-  enabled: true
+  enabled: false
   require: false
   top_n_biomarkers: 100
   scale_factor: 3.0
@@ -135,8 +252,10 @@ ps_score:
   lda_n_pcs: 40
   lda_max_genes: 5000
   lda_highlight_threshold: 0.8
+  lda_large_max_cells: 200000
+  lda_large_stratified: true
 lochness:
-  enabled: true
+  enabled: false
   genotype_key: target_gene
   n_neighbors: 300
   n_pcs: 20
@@ -146,6 +265,74 @@ lochness:
   enrichment_cut: 0.5
   noise_delta: 0.0
   top_n_report: 12
+  target_chunk_size: 128
+  store_all_target_scores: true
+  max_targets_in_obs: 500
+distance:
+  enabled: false
+  representation: X_pca
+  primary_metric: edistance
+  secondary_metric: mmd
+  min_cells: 30
+  max_cells_per_target: 2000
+  max_control_cells: 5000
+  n_permutations: 1000
+  random_seed: 123
+  fdr_threshold: 0.05
+  stratify_by: null
+distance_space:
+  enabled: false
+  metric: edistance
+  representation: X_pca
+  n_components: 10
+  nearest_neighbors: 10
+  clustering: true
+  n_modules: null
+  cluster_distance_threshold: null
+  linkage_method: average
+  min_cells: 30
+  max_cells_per_target: 2000
+  random_seed: 123
+meta_analysis:
+  enabled: true
+visualization:
+  perturbation_atlas: true
+  ps_distance_map: true
+  perturbation_space: true
+  module_concordance: true
+  atlas_top_n: 50
+scaling:
+  mode: auto
+  large_n_cells: 1000000
+  large_n_perturbations: 5000
+  marker_max_cells: 200000
+  effect_gene_chunk: 256
+  guide_chunk_size: 20000
+  guide_max_dense_elements: 20000000
+  collect_between_stages: true
+  log_memory: true
+  report_preview_rows: 500
+compute:
+  backend: auto
+  n_jobs: 16
+  gpu_device: 0
+  gpu_min_cells: 200000
+  gpu_min_dense_elements: 50000000
+  gpu_memory_fraction: 0.8
+  cpu_parallel_backend: loky
+  blas_threads_per_worker: 1
+  distance_n_jobs: null
+  perturbation_n_jobs: null
+  enrichment_n_jobs: null
+  modules_n_jobs: null
+  lochness_n_jobs: null
+  log_backend_decisions: true
+storage:
+  mode: auto
+  backed_threshold_cells: 1000000
+  prefer_backed_h5ad: true
+  keep_embeddings_in_memory: true
+  shared_worker_arrays: true
 report:
   title: Perturb-seq analysis report
   embed_figures: true
@@ -155,6 +342,7 @@ report:
 output:
   h5ad_name: processed.h5ad
   report_name: report.html
+  report_markdown_name: report.md
   write_unfiltered_h5ad: true
   unfiltered_h5ad_name: null
   large_file_dir: null
@@ -173,3 +361,4 @@ output:
   write_guide_table: true
   guide_table_name: null
   guide_table_min_umi: 3
+samples: {}

@@ -1,0 +1,43 @@
+# Basic QC checkpoint over several 10x GEM wells, then stop. Nothing is
+# normalized and no doublet or guide multiplet is removed: they are flagged.
+# Guides are quantified from FASTQ, taken from a precomputed matrix, or absent.
+#
+#   perturbseq-pipeline run --config config/examples/basic_qc_samples.yaml
+
+run:
+  name: my_screen_qc
+  outdir: results/my_screen_qc
+  stop_after: qc
+
+samples:
+  W1:
+    gex_h5: /path/W1/filtered_feature_bc_matrix.h5
+    guide_fastq_dir: /path/W1_guides/fastq
+    condition_code: COND1          # neutral labels, not interpreted
+    gem_well: A
+  W2:
+    gex_mtx_dir: /path/W2/filtered_feature_bc_matrix
+    guide_matrix: /path/W2/guide_counts
+
+qc:
+  thresholds:
+    method: mad                    # mad | fixed
+    n_mads: 3.0
+    min_genes_floor: 200
+    min_counts_floor: 500
+    max_pct_mt: 20.0
+    max_pct_mt_by_condition: {COND1: 10.0}
+  doublets:
+    enabled: true                  # Scrublet per well; scores and calls stored, cells kept
+
+guides:
+  source: auto                     # auto | fastq | matrix | none
+  design:
+    path: /path/guide_design.xlsx  # all designed guides are kept in the reference
+  fastq:
+    scaffolds: {A: GTTTAAGAGCTA, C: GTTTCAGAGCTA}
+    position_shift: 1
+    max_mismatches: 0
+  multiplet:
+    max_guides_per_scaffold: 1
+    detection_min_fraction_of_top: null

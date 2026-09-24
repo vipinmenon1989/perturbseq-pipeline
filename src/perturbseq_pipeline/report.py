@@ -15,6 +15,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional
 
+import numpy as np
 import pandas as pd
 from jinja2 import Environment, FileSystemLoader, select_autoescape
 from markupsafe import Markup
@@ -36,6 +37,8 @@ from .plots import (
     SECTION_PS_LDA,
     SECTION_PS_PER_TARGET,
     SECTION_QC,
+    SECTION_DISTANCE,
+    SECTION_DISTANCE_SPACE,
     FigureRecord,
     FigureRegistry,
 )
@@ -56,6 +59,9 @@ class ReportInputs:
     modules: object = None
     ps: object = None
     lochness: object = None
+    distance: object = None
+    distance_space: object = None
+    meta_table: Optional[pd.DataFrame] = None
     tables: Dict[str, pd.DataFrame] = field(default_factory=dict)
     warnings: List[str] = field(default_factory=list)
     summary_cards: List[tuple] = field(default_factory=list)
@@ -65,6 +71,10 @@ class ReportInputs:
     metadata_source: str = ""
     guide_source_text: str = ""
     outputs: Dict[str, str] = field(default_factory=dict)
+    #: One row per stage: module, status (completed / skipped / disabled), note.
+    module_status: Optional[pd.DataFrame] = None
+    #: ``(label, value)`` pairs from the run manifest (git commit, command, seed, ...).
+    provenance_rows: List[tuple] = field(default_factory=list)
 
 
 def _df_to_html(df: Optional[pd.DataFrame], max_rows: int = 200) -> str:
@@ -128,9 +138,13 @@ def build_report(inputs: ReportInputs, path: Path) -> Path:
         "lochness": reg.by_section(SECTION_LOCHNESS),
         "lochness_per_target": reg.by_section(SECTION_LOCHNESS_PER_TARGET),
         "modules": reg.by_section(SECTION_MODULES),
+        "distance": reg.by_section(SECTION_DISTANCE),
+        "distance_space": reg.by_section(SECTION_DISTANCE_SPACE),
     }
     extras = reg.extras(SECTION_PER_GENE)
     enrich_extras = reg.extras(SECTION_ENRICH_PER_TARGET)
+    distance_extras = reg.extras(SECTION_DISTANCE)
+    distance_space_extras = reg.extras(SECTION_DISTANCE_SPACE)
 
     tables_html = {
         key: _df_to_html(inputs.tables.get(key), cfg.report.max_table_rows)
@@ -138,6 +152,12 @@ def build_report(inputs: ReportInputs, path: Path) -> Path:
             "qc_steps",
             "qc_summary",
             "guide_qc",
+            "pair_assignment_per_lane",
+            "pair_guide_qc_per_lane",
+            "cell_counts_before_after",
+            "pair_perturbation_hit_counts_per_lane",
+            "single_guide_diagnostic_vs_pair",
+            "cluster_sizes",
             "clusters",
             "perturbation",
             "skipped",
@@ -147,10 +167,18 @@ def build_report(inputs: ReportInputs, path: Path) -> Path:
             "lochness",
             "cofunctional_modules",
             "gene_programs",
+            "program_summary",
+            "program_enrichment",
             "module_program_strength",
             "tf_hubs",
+            "perturbation_distance",
+            "phenotype_modules",
+            "perturbation_neighbors",
+            "perturbation_meta",
+            "perturbation_space_coordinates",
         )
     }
+    tables_html["module_status"] = _df_to_html(inputs.module_status, 50)
     tables_html["outputs"] = _df_to_html(
         pd.DataFrame(
             [{"deliverable": k, "path": v} for k, v in inputs.outputs.items()]
@@ -193,6 +221,82 @@ def build_report(inputs: ReportInputs, path: Path) -> Path:
     modules_ctx = None
     if mods is not None and not mods.effect_matrix.empty:
         top_hub = mods.hubs.iloc[0].to_dict() if not mods.hubs.empty else {}
+
+        # Program biological annotations & pathways
+        prog_annotations = getattr(mods, "program_annotations", {})
+        display_labels = getattr(mods, "program_display_labels", {})
+        enr_df = getattr(mods, "program_enrichment", None)
+
+        program_details = []
+        for p in mods.program_labels:
+            p_genes = mods.program_genes.get(p, [])
+            ann = prog_annotations.get(p, "unannotated")
+            disp = display_labels.get(p, p)
+
+            top_pathways = []
+            if enr_df is not None and not enr_df.empty and "program_id" in enr_df.columns:
+                p_enr = enr_df[enr_df["program_id"] == p].sort_values(["fdr", "p_value"]).head(5)
+                for _, r in p_enr.iterrows():
+                    fdr_val = r.get("fdr", float("nan"))
+                    fdr_str = (
+                        f"{fdr_val:.2e}"
+                        if pd.notna(fdr_val) and fdr_val < 0.001
+                        else (f"{fdr_val:.3f}" if pd.notna(fdr_val) else "N/A")
+                    )
+                    top_pathways.append(
+                        {
+                            "term": r.get("term", ""),
+                            "clean_term": r.get("clean_term", r.get("term", "")),
+                            "source": r.get("gene_set_source", ""),
+                            "fdr": fdr_str,
+                            "fdr_num": fdr_val,
+                            "overlap_count": int(r.get("overlap_count", 0)),
+                            "overlap_genes": r.get("overlap_genes", ""),
+                        }
+                    )
+
+            program_details.append(
+                {
+                    "program_id": p,
+                    "annotation": ann,
+                    "display_label": disp,
+                    "top_genes": p_genes[:10],
+                    "all_genes_count": len(p_genes),
+                    "top_pathways": top_pathways,
+                }
+            )
+
+        # Module-program biological interpretations
+        mp_mat = getattr(mods, "module_program", None)
+        module_details = []
+        for m in mods.module_labels:
+            m_members = mods.module_members.get(m, [])
+            pos_progs = []
+            neg_progs = []
+            if mp_mat is not None and not mp_mat.empty and m in mp_mat.index:
+                row = mp_mat.loc[m]
+                for p_col, val in row.items():
+                    if np.isfinite(val):
+                        disp = display_labels.get(p_col, p_col)
+                        if val > 0.05:
+                            pos_progs.append((disp, float(val)))
+                        elif val < -0.05:
+                            neg_progs.append((disp, float(val)))
+                pos_progs.sort(key=lambda x: -x[1])
+                neg_progs.sort(key=lambda x: x[1])
+
+            module_details.append(
+                {
+                    "module_id": m,
+                    "members": m_members,
+                    "n_targets": len(m_members),
+                    "positive_programs": pos_progs[:3],
+                    "negative_programs": neg_progs[:3],
+                }
+            )
+
+        has_enrichment = bool(enr_df is not None and not enr_df.empty)
+
         modules_ctx = {
             "n_modules": mods.n_modules,
             "n_programs": mods.n_programs,
@@ -209,6 +313,11 @@ def build_report(inputs: ReportInputs, path: Path) -> Path:
             "program_genes": {
                 p: mods.program_genes.get(p, [])[:10] for p in mods.program_labels
             },
+            "program_annotations": prog_annotations,
+            "program_display_labels": display_labels,
+            "programs": program_details,
+            "modules_list": module_details,
+            "has_enrichment": has_enrichment,
         }
     modules_extras = reg.extras(SECTION_MODULES)
 
@@ -248,6 +357,32 @@ def build_report(inputs: ReportInputs, path: Path) -> Path:
             "genotype_key": cfg.lochness.genotype_key,
         }
     loch_extras = reg.extras(SECTION_LOCHNESS_PER_TARGET)
+
+    dist = inputs.distance
+    distance_ctx = None
+    if dist is not None and not dist.table.empty:
+        distance_ctx = {
+            "n_targets": int(len(dist.table)),
+            "n_hits": int(dist.table["significant"].sum()) if "significant" in dist.table.columns else 0,
+            "primary_metric": dist.primary_metric,
+            "secondary_metric": dist.secondary_metric,
+            "control_used": dist.control_used,
+            "fdr_threshold": cfg.distance.fdr_threshold,
+            "n_skipped": len(dist.skipped) if dist.skipped is not None else 0,
+            "top_target": dist.table.iloc[0]["target_gene"] if len(dist.table) > 0 else "",
+            "top_distance": f"{dist.table.iloc[0]['energy_distance']:.3f}" if len(dist.table) > 0 else "",
+        }
+
+    dist_space = inputs.distance_space
+    distance_space_ctx = None
+    if dist_space is not None and not dist_space.distance_matrix.empty:
+        distance_space_ctx = {
+            "n_targets": int(len(dist_space.distance_matrix)),
+            "n_components": dist_space.n_components,
+            "n_modules": int(dist_space.phenotype_modules["phenotype_module"].nunique()) if not dist_space.phenotype_modules.empty else 0,
+            "metric": dist_space.metric,
+            "linkage": dist_space.linkage_method,
+        }
 
     controls_described = " and ".join(CONTROL_LABELS[c] for c in res.controls_used)
     primary_fallback = res.primary_control != cfg.perturbation.primary_control
@@ -308,6 +443,18 @@ def build_report(inputs: ReportInputs, path: Path) -> Path:
             f"{r.name}.{cfg.report.figure_format}" for r in modules_extras
         ],
         modules_dir=str(reg.figdir / SECTION_MODULES),
+        distance=distance_ctx,
+        distance_extras=distance_extras,
+        distance_extra_names=[
+            f"{r.name}.{cfg.report.figure_format}" for r in distance_extras
+        ],
+        distance_dir=str(reg.figdir / SECTION_DISTANCE),
+        distance_space=distance_space_ctx,
+        distance_space_extras=distance_space_extras,
+        distance_space_extra_names=[
+            f"{r.name}.{cfg.report.figure_format}" for r in distance_space_extras
+        ],
+        distance_space_dir=str(reg.figdir / SECTION_DISTANCE_SPACE),
         enrichment=enrichment_ctx,
         enrichment_extras=enrich_extras,
         enrichment_extra_names=[
@@ -318,6 +465,7 @@ def build_report(inputs: ReportInputs, path: Path) -> Path:
         n_figures=len(reg.records),
         config_yaml=_config_yaml(cfg),
         versions=_versions(),
+        provenance_rows=inputs.provenance_rows,
     )
 
     path = Path(path)
@@ -340,3 +488,70 @@ def _config_yaml(cfg: Config) -> str:
     import yaml
 
     return yaml.safe_dump(cfg.to_dict(), sort_keys=False, default_flow_style=False)
+
+
+# ---------------------------------------------------------------------------
+# Basic QC stage report
+# ---------------------------------------------------------------------------
+
+
+def build_qc_report(
+    cfg: Config,
+    registry: FigureRegistry,
+    path: Path,
+    *,
+    tables: Dict[str, pd.DataFrame],
+    cards: List[tuple],
+    outputs: Dict[str, str],
+    warnings: List[str],
+    provenance_text: str,
+) -> Path:
+    """Render the QC-only HTML report (no perturbation results required)."""
+    import datetime as _dt
+
+    from . import __version__
+    from .qc_plots import SECTION_DOUBLETS, SECTION_QC_SAMPLES
+
+    embed = cfg.report.embed_figures
+    env = Environment(loader=FileSystemLoader(str(TEMPLATE_DIR)), autoescape=select_autoescape(["html"]))
+    template = env.get_template("qc_report.html")
+
+    def _figs(section):
+        out = []
+        for rec in registry.by_section(section):
+            if embed:
+                src = rec.data_uri()
+            else:
+                try:
+                    src = str(Path(rec.path).relative_to(Path(path).parent))
+                except ValueError:
+                    src = str(rec.path)
+            out.append({"src": src, "title": rec.title, "caption": rec.caption})
+        return out
+
+    figures = {
+        "qc": _figs(SECTION_QC),
+        "qc_samples": _figs(SECTION_QC_SAMPLES),
+        "doublets": _figs(SECTION_DOUBLETS),
+        "guides": _figs(SECTION_GUIDES),
+    }
+    max_rows = cfg.report.max_table_rows
+    tables_html = {k: _df_to_html(v, max_rows) for k, v in tables.items()}
+    html = template.render(
+        title=cfg.report.title,
+        run_name=cfg.run.name,
+        timestamp=_dt.datetime.now().strftime("%Y-%m-%d %H:%M"),
+        version=__version__,
+        cards=cards,
+        tables=tables_html,
+        figures=figures,
+        outputs=outputs,
+        warnings=warnings,
+        provenance=provenance_text,
+        versions=_versions(),
+        config_yaml=_config_yaml(cfg),
+    )
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(html)
+    return path

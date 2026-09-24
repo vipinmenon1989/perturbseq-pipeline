@@ -1,0 +1,51 @@
+# Single-guide run from an existing .h5ad, with the optional stages chosen
+# explicitly. Every key not listed here keeps its config/default.yaml value.
+#
+#   perturbseq-pipeline run --config config/examples/h5ad.yaml
+
+run:
+  name: my_screen_h5ad
+  outdir: results/my_screen_h5ad
+  seed: 0
+
+input:
+  mode: h5ad
+  h5ad: /path/to/my_data.h5ad
+  # Guide information is detected in this order: guide features in var,
+  # a companion guide matrix, a pre-computed label column, a barcode table.
+  guide_h5ad: null
+  guide_obs_column: null
+  guide_table: null
+  counts_layer: null            # e.g. counts, when X holds normalized values
+  normalized_layer: null
+
+guides:
+  assignment_mode: single_guide
+  min_umi: 3
+  dominance_ratio: 2.0
+  max_second_umi: -1
+  # Set when guide ids do not encode the target (10x Flex CRISPRi libraries):
+  target_feature_column: null   # e.g. target_gene_name
+
+cluster:
+  batch_key: null               # lane_id + the harmony extra for multi-lane runs
+
+# Optional stages. Each one reads obs['target_gene'] / obs['perturbation_class']
+# written by the guide-assignment stage.
+enrichment:
+  enabled: true
+modules:
+  enabled: true
+ps_score:
+  enabled: true                 # needs the ps extra; skipped with a note otherwise
+lochness:
+  enabled: true
+distance:
+  enabled: true
+distance_space:
+  enabled: false                # all-vs-all; enable for moderate target counts
+meta_analysis:
+  enabled: true
+
+output:
+  archive: true

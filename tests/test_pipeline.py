@@ -51,6 +51,10 @@ def _base_config(synthetic, outdir: Path, **overrides) -> Config:
         "qc": {"min_genes_per_cell": 10, "min_genes_final": 50, "max_pct_mt": 100},
         "cluster": {"n_top_genes": 80, "n_pcs": 10},
         "perturbation": {"min_cells_per_target": 5, "top_n_report": 2},
+        # The optional stages are off by default; this suite asserts on their outputs.
+        "modules": {"enabled": True},
+        "ps_score": {"enabled": True},
+        "lochness": {"enabled": True},
     }
     for key, value in overrides.items():
         data.setdefault(key, {}).update(value)
@@ -1455,3 +1459,21 @@ def test_benjamini_hochberg_tolerates_nan():
 
     q = benjamini_hochberg([0.01, np.nan, 0.5])
     assert np.isnan(q[1]) and not np.isnan(q[0])
+
+
+def test_all_cells_checkpoint_is_written_before_qc_for_default_runs(mtx_run, synthetic):
+    """output.write_unfiltered_h5ad (default true) must produce a pre-QC object
+    holding every loaded cell, not only in the assigned_only branch."""
+    import anndata as ad
+
+    assert mtx_run.unfiltered_h5ad is not None and Path(mtx_run.unfiltered_h5ad).is_file()
+    allc = ad.read_h5ad(mtx_run.unfiltered_h5ad)
+    n_input = sum(
+        len(pd.read_csv(Path(p) / "barcodes.tsv.gz", header=None)) for p in synthetic["lanes"].values()
+    )
+    assert allc.n_obs == n_input
+    assert allc.n_obs >= mtx_run.n_cells
+    for col in ("total_counts", "n_genes_by_counts", "pct_counts_mt", "lane_id"):
+        assert col in allc.obs.columns
+    assert "guide_counts" in allc.obsm
+    assert "lognorm" not in allc.layers

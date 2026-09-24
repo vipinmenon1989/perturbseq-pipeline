@@ -1,0 +1,46 @@
+# Every optional stage switched on. Each stage reads the standardized labels
+# written by guide assignment (obs['target_gene'], obs['perturbation_class']).
+# Suitable for a full multi-lane screen; on a single small lane the modules
+# stage skips itself and says so in the module status table.
+#
+#   perturbseq-pipeline run --config config/examples/all_modules.yaml
+
+run:
+  name: my_screen_full
+  outdir: results/my_screen_full
+  seed: 0
+
+input:
+  mode: auto                    # follows mtx_dirs / h5ad, whichever is set
+  h5ad: data/my_screen/processed_counts.h5ad
+
+guides:
+  assignment_mode: single_guide # or dual_guide_pair, see paired_guide.yaml
+
+enrichment:
+  enabled: true                 # cluster enrichment (Fisher / CMH)
+modules:
+  enabled: true                 # co-functional modules, gene programs, TF-hub and module networks
+  draw_networks: true
+  program_enrichment:
+    enabled: true
+ps_score:
+  enabled: true                 # per-cell perturbation scores; needs the ps extra
+  require: false                # true makes a missing pertps a hard failure
+  compute_lda_umap: true
+lochness:
+  enabled: true                 # neighbourhood enrichment, k = 300
+distance:
+  enabled: true                 # energy distance (primary) and MMD versus control, permutation FDR
+  n_permutations: 1000
+distance_space:
+  enabled: true                 # all-vs-all perturbation distances, PCoA, phenotype modules
+meta_analysis:
+  enabled: true                 # tables/perturbation_meta.csv and the atlas figures
+
+compute:
+  backend: auto
+  n_jobs: 8
+
+output:
+  archive: true

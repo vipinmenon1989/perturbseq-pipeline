@@ -1,0 +1,66 @@
+# Large screen (hundreds of thousands to millions of cells) on an HPC node.
+# scaling.mode: auto switches to the LARGE execution paths above
+# large_n_cells / large_n_perturbations; the statistics are the same, only the
+# memory strategy changes. Submit through the scheduler, never on a login node.
+#
+#   sbatch --cpus-per-task=16 --mem=180G --time=12:00:00 \
+#     --wrap "perturbseq-pipeline run --config config/examples/large_hpc.yaml"
+
+run:
+  name: my_large_screen
+  outdir: results/my_large_screen
+  seed: 0
+
+input:
+  mode: h5ad
+  h5ad: /path/to/large_screen.h5ad
+  guide_obs_column: null          # set when the object carries per-cell labels
+  counts_layer: null
+
+guides:
+  assignment_mode: single_guide
+  target_feature_column: null
+
+scaling:
+  mode: auto                      # auto | standard | large
+  large_n_cells: 1000000
+  large_n_perturbations: 5000
+  marker_max_cells: 200000        # HVG / marker discovery sample in LARGE mode
+  effect_gene_chunk: 256
+  guide_chunk_size: 20000
+  collect_between_stages: true
+  log_memory: true
+
+compute:
+  backend: auto                   # auto | cpu | gpu; auto uses the GPU only when one is present
+  n_jobs: 16                      # capped by SLURM_CPUS_PER_TASK when set
+  blas_threads_per_worker: 1
+  gpu_min_cells: 200000
+
+storage:
+  mode: auto                      # auto | in_memory | backed
+  backed_threshold_cells: 1000000
+
+cluster:
+  regress_out: []                 # not supported in LARGE mode
+
+modules:
+  enabled: true
+  draw_networks: false
+ps_score:
+  enabled: true
+  compute_lda_umap: false
+lochness:
+  enabled: true
+  target_chunk_size: 256
+distance:
+  enabled: true
+  max_cells_per_target: 2000
+  max_control_cells: 5000
+distance_space:
+  enabled: false                  # O(P^2) pairs; enable deliberately
+meta_analysis:
+  enabled: true
+
+output:
+  archive: false
