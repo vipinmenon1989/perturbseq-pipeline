@@ -108,7 +108,10 @@ PS_python LDA/UMAP embedding is not computed in this mode (it needs one label
 per cell).
 
 **Knockdown filter on membership** (when enabled). Each target's member cells go
-through the unchanged per-(target, context) machinery; the per-cell results are
+through the unchanged per-(target, context) machinery. The baseline is, by
+default, the target's non-carriers (`knockdown_filter.control: non_carriers`:
+targeting cells of the context not carrying the target), not the few NTC-only
+cells; `control: ntc` restores the NTC baseline. The per-cell results are
 stored for every (cell, carried target) pair in `obsm['kd_ratio_membership']` and
 `obsm['kd_status_membership']` (status codes in `uns['kd_status_codes']`,
 columns in `uns['kd_membership_targets']`), and `obs['kd_status']` /

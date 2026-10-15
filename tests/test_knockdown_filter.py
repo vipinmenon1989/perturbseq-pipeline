@@ -358,3 +358,25 @@ def test_count_model_fails_a_group_that_is_mostly_escapers(counts_adata):
     assert row["group_status"] == "failed_group"
     _, table = _run(counts_adata.copy(), method="count_model", max_escaper_fraction=1.0)
     assert table.set_index("target_gene").loc["MOSTESC", "group_status"] == "pass"
+
+
+def test_one_gene_shrinkage_equals_the_full_control_fit():
+    """With control: non_carriers each target's dispersion is shrunk on its own,
+    against a trend fitted once per context. On the same cells that is the same
+    estimate as the all-gene fit used with control: ntc."""
+    from perturbseq_pipeline.knockdown_filter import _control_fit, _dispersion_prior, _log_gene_wise_phi, _shrink_phi
+
+    rng = np.random.default_rng(3)
+    n_cells, n_genes = 200, 300
+    mean = np.exp(rng.uniform(np.log(0.5), np.log(50), n_genes))
+    s = rng.lognormal(0.0, 0.2, n_cells)
+    s = s / np.median(s)
+    counts = sp.csr_matrix(
+        np.column_stack([_nb(rng, mean[g] * s, 0.05 + 0.5 / mean[g]) for g in range(n_genes)]).astype(np.float64)
+    )
+    mu_all, phi_all = _control_fit(counts, s)
+    prior = _dispersion_prior(counts, s, *_log_gene_wise_phi(counts, s))
+    for g in (0, 17, 150):
+        mu_g, log_phi_g = _log_gene_wise_phi(counts[:, [g]], s)
+        assert np.isclose(mu_g[0], mu_all[g], rtol=1e-12)
+        assert np.isclose(_shrink_phi(mu_g, log_phi_g, prior)[0], phi_all[g], rtol=1e-12)

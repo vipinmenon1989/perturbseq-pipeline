@@ -709,7 +709,7 @@ estimates are written side by side for the final filtering:
 
 | Where | Contents |
 |---|---|
-| `obs['kd_ratio']` | target expression / mean in non-targeting cells of the same context |
+| `obs['kd_ratio']` | target expression / mean in the baseline cells (`control`) of the same context |
 | `obs['kd_status']` | `knockdown`, `escaper`, `failed_group`, `low_control_expression`, `not_measured`, `non_testable`, `unfiltered_context`, `control`, `untouched` |
 | `obs['kd_keep']` | False for the marked statuses (`escaper`, `failed_group`, `low_control_expression`, `not_measured`) |
 | `obs['pert_log2fc_ntc']`, `pert_ks_fdr_ntc`, … | section-3 estimates for the cell's target |
@@ -725,6 +725,12 @@ target × context), or `any_context` (step 1 per context with
 `max_mean_ratio_any`; a target that passes anywhere is filtered only in its
 passing contexts and keeps every cell elsewhere). The control baseline is per
 context in every mode whenever `context_key` is set.
+
+`control` picks the baseline cells: `ntc` (non-targeting cells) or, in
+`high_moi` mode only, `non_carriers` (targeting cells that do not carry the
+target, the same `other` control the statistics stages use). The default `null`
+means `non_carriers` in `high_moi` mode, where NTC-only cells are few and carry
+fewer guides than the cells they are compared with, and `ntc` otherwise.
 
 The default is `mode: pooled` with `context_key: null`: one baseline over all
 control cells and one group per target, so `enabled: true` runs as is. With
