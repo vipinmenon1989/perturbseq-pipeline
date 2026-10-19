@@ -503,7 +503,14 @@ class KnockdownFilterConfig:
     max_cell_ratio: float = 0.5
     #: Step 3: groups with fewer cells are marked ``non_testable``, not filtered.
     min_cells: int = 30
-    #: Contexts with fewer non-targeting cells have no baseline: ``non_testable``.
+    #: Cells the baseline comes from. ``ntc``: non-targeting cells of the
+    #: context. ``non_carriers`` (``high_moi`` only): targeting cells of the
+    #: context that do not carry the target, the membership-aware ``other``
+    #: control of the statistics stages; in a high-MOI screen NTC-only cells are
+    #: few and carry fewer guides than the cells they are compared with. null:
+    #: ``non_carriers`` in ``high_moi`` mode, ``ntc`` otherwise.
+    control: Optional[str] = None
+    #: Contexts with fewer baseline cells have no baseline: ``non_testable``.
     min_control_cells: int = 10
     #: Targets detected in fewer than this percent of the context's control
     #: cells are marked for filtering: with mostly-zero counts every cell would
@@ -1447,6 +1454,10 @@ class Config:
             raise ValueError(f"knockdown_filter.mode {k.mode!r} needs knockdown_filter.context_key")
         if k.method not in ("mean_ratio", "count_model"):
             raise ValueError(f"knockdown_filter.method must be 'mean_ratio' or 'count_model' (got {k.method!r})")
+        if k.control not in (None, "ntc", "non_carriers"):
+            raise ValueError(f"knockdown_filter.control must be null, 'ntc' or 'non_carriers' (got {k.control!r})")
+        if k.control == "non_carriers" and self.guides.assignment_mode != "high_moi":
+            raise ValueError("knockdown_filter.control 'non_carriers' needs guides.assignment_mode 'high_moi'")
         if not 0 < k.max_escaper_fraction <= 1:
             raise ValueError(
                 f"knockdown_filter.max_escaper_fraction must be in (0, 1] (got {k.max_escaper_fraction!r})"

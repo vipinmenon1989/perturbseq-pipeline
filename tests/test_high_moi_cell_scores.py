@@ -143,6 +143,7 @@ def test_knockdown_filter_matches_single_guide_on_one_target_cells(paired_object
         c.knockdown_filter.enabled = True
         c.knockdown_filter.min_cells = 5
         c.knockdown_filter.min_control_cells = 5
+    cfg_hm.knockdown_filter.control = "ntc"  # same baseline as single_guide; high-MOI defaults to non_carriers
     a, ta = kd_mod.compute_knockdown_mask(sg.copy(), cfg_sg)
     b, tb = kd_mod.compute_knockdown_mask(hm.copy(), cfg_hm)
     keys = ["target_gene", "context"]
@@ -219,3 +220,79 @@ def test_knockdown_filter_overlapping_memberships(tmp_path, method):
     assert set(table["target_gene"]) >= set(KD_TARGETS + NULL_TARGETS)
     if method == "count_model":
         assert "kd_escaper_prob" in obs.columns
+
+
+@pytest.fixture(scope="module")
+def moi4_normalized(tmp_path_factory):
+    """moi=4 cells after guide assignment and normalisation, where the pipeline runs the knockdown filter."""
+    from perturbseq_pipeline import cluster as cluster_mod
+    from perturbseq_pipeline import io as io_mod
+    from perturbseq_pipeline import qc as qc_mod
+    from perturbseq_pipeline.guides import assign_guides
+
+    root = tmp_path_factory.mktemp("kd_non_carriers")
+    data = make_dataset(root / "synthetic", n_lanes=2, n_cells=300, moi=4)
+    cfg = _base_cfg(data, root / "run", assignment_mode="high_moi", high_moi={"min_umi": 5})
+    cfg.validate()
+    loaded = io_mod.load_data(cfg)
+    expr = qc_mod.prefilter(loaded.expr, cfg)
+    expr = qc_mod.compute_qc_metrics(expr, cfg)
+    expr, _ = qc_mod.filter_cells_and_genes(expr, cfg)
+    expr = assign_guides(expr, loaded.guides, cfg)
+    return cluster_mod.normalize(expr, cfg), cfg
+
+
+def _kd_run(moi4, **kd):
+    from perturbseq_pipeline import knockdown_filter as kd_mod
+
+    expr, base = moi4
+    cfg = Config.from_dict(base.to_dict())
+    cfg.knockdown_filter.enabled = True
+    cfg.knockdown_filter.min_cells = 5
+    for key, value in kd.items():
+        setattr(cfg.knockdown_filter, key, value)
+    cfg.validate()
+    return kd_mod.compute_knockdown_mask(expr.copy(), cfg)
+
+
+@pytest.mark.parametrize("method", ["mean_ratio", "count_model"])
+def test_knockdown_filter_non_carrier_baseline_with_few_ntc_only_cells(moi4_normalized, method):
+    """With fewer NTC-only cells than min_control_cells, the NTC baseline leaves every target
+    non_testable. The high-MOI default (non-carriers) still passes the planted knockdowns and
+    fails the null targets."""
+    from perturbseq_pipeline.high_moi import OBS_NTC_ONLY
+
+    expr, _ = moi4_normalized
+    n_ntc_only = int(expr.obs[OBS_NTC_ONLY].sum())
+    _, t_ntc = _kd_run(moi4_normalized, method=method, control="ntc", min_control_cells=n_ntc_only + 1)
+    assert (t_ntc["n_control"] == n_ntc_only).all()
+    assert (t_ntc["group_status"] == "non_testable").all()
+    _, t = _kd_run(moi4_normalized, method=method, min_control_cells=n_ntc_only + 1)
+    assert (t["n_control"] > n_ntc_only).all()  # the default baseline is the non-carriers
+    status = t.set_index("target_gene")["group_status"]  # context_key null: one row per target
+    assert (status[KD_TARGETS] == "pass").all()
+    assert (status[NULL_TARGETS] == "failed_group").all()
+
+
+def test_knockdown_filter_non_carrier_baseline_is_the_targets_non_carriers(moi4_normalized):
+    """control_mean is the mean over targeting cells that do not carry the target, read from the membership matrix."""
+    from perturbseq_pipeline.cluster import LOGNORM_LAYER
+
+    expr, cfg = moi4_normalized
+    _, t = _kd_run(moi4_normalized)
+    T = expr.obsm[cfg.guides.high_moi.membership_obsm_key].toarray().astype(bool)
+    names = list(expr.uns["membership_targets"])
+    targeting_cols = [j for j, name in enumerate(names) if name != cfg.guides.ntc_label]
+    carries_any_target = T[:, targeting_cols].any(axis=1)
+    for gene in KD_TARGETS + NULL_TARGETS:
+        non_carriers = carries_any_target & ~T[:, names.index(gene)]
+        x = np.expm1(expr.layers[LOGNORM_LAYER][:, expr.var_names.get_loc(gene)].toarray().ravel().astype(np.float64))
+        row = t.set_index("target_gene").loc[gene]
+        assert row["n_control"] == non_carriers.sum()
+        assert np.isclose(row["control_mean"], x[non_carriers].mean(), rtol=1e-9)
+
+
+def test_knockdown_filter_non_carriers_needs_high_moi():
+    cfg = Config.from_dict({"input": {"h5ad": "x.h5ad"}, "knockdown_filter": {"enabled": True, "control": "non_carriers"}})
+    with pytest.raises(ValueError, match="non_carriers"):
+        cfg.validate()

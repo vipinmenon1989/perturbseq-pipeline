@@ -7,11 +7,16 @@ filtering decision stays with the user.
 
 For every targeting cell ``i`` with target ``g`` in context ``c``::
 
-    kd_ratio_i = x_ig / mean(x_g over non-targeting cells in c)
+    kd_ratio_i = x_ig / mean(x_g over the baseline cells of g in c)
 
 on library-size-normalized, *linear* expression (``expm1`` of the lognorm
 layer). The control baseline is always per context, so in ``pooled`` mode a
 context with a naturally lower baseline cannot pass for a knockdown.
+
+The baseline cells (``control``) are the non-targeting cells (``ntc``), or in
+``high_moi`` mode, by default, the targeting cells that do not carry ``g``
+(``non_carriers``): with several guides per cell, NTC-only cells are few and
+carry fewer guides than the cells they are compared with.
 
 Per group — (target, context) in ``per_context`` / ``any_context``, target in
 ``pooled`` — the filter then runs:
@@ -37,8 +42,10 @@ with library-size factor ``s_i`` in context ``c`` is
     x_i ~ pi * NB(mu_c * s_i, phi_c) + (1 - pi) * NB(rho * mu_c * s_i, phi_c)
 
 where ``mu_c`` and ``phi_c`` (mean per unit library size and overdispersion)
-come from the non-targeting cells of ``c``, with ``phi_c`` shared across genes
-(see ``_control_fit``); ``pi`` (escaper fraction) and
+come from the baseline cells of ``c``, with ``phi_c`` shrunk toward a trend
+over genes (see ``_control_fit``; with ``non_carriers`` the trend is fitted on
+the context's targeting cells and each target's own mean and gene-wise
+dispersion on its non-carriers); ``pi`` (escaper fraction) and
 ``rho`` (expression left in knocked-down cells) are fitted per group by maximum likelihood. The
 group passes when ``rho < max_rho``, so escapers do not dilute the test, and
 the escaper fraction is below ``max_escaper_fraction`` (a group with no
@@ -170,21 +177,28 @@ def _control_fit(counts: sparse.csr_matrix, s: np.ndarray) -> Tuple[np.ndarray, 
 
     ``counts`` holds every gene for the context's non-targeting cells. Gene-wise
     ``phi`` is noisy when controls are few or counts low, so, as in DESeq2, its
-    log is shrunk toward a trend over genes, phi(mu) = a + b / mu, fitted
-    robustly on log scale, with a normal prior around the trend.
+    log is shrunk toward a trend over genes (see ``_dispersion_prior``).
+    """
+    mu, log_gene = _log_gene_wise_phi(counts, s)
+    return mu, _shrink_phi(mu, log_gene, _dispersion_prior(counts, s, mu, log_gene))
 
+
+def _dispersion_prior(counts: sparse.csr_matrix, s: np.ndarray, mu: np.ndarray, log_gene: np.ndarray) -> tuple:
+    """Trend phi(mu) = a + b / mu over genes, and how far a gene is shrunk toward it.
+
+    The trend is fitted robustly on log scale, with a normal prior around it.
     How far each gene is shrunk depends on how noisy its own estimate is. That
-    sampling variance is measured, not assumed: the controls are split in two
+    sampling variance is measured, not assumed: the cells are split in two
     halves, and the squared difference between the halves' log phi, divided by
     4, estimates the variance of the full-sample log phi. It is averaged within
     10 bins of mean expression, because low-count genes are much noisier. The
     prior variance is the genes' spread around the trend minus the average
     sampling variance, at least 0.25 (DESeq2's floor), so genes that really
     differ from the trend are not forced onto it.
+
+    Returns ``(a, b, prior_var, bin_centres, var_per_bin)`` for ``_shrink_phi``.
     """
-    mu, log_gene = _log_gene_wise_phi(counts, s)
     expressed = np.isfinite(log_gene)
-    phi = np.full(mu.shape, np.nan)
     halves = np.random.default_rng(0).permutation(counts.shape[0]) % 2 == 0
     _, log_a = _log_gene_wise_phi(counts[halves], s[halves])
     _, log_b = _log_gene_wise_phi(counts[~halves], s[~halves])
@@ -209,12 +223,22 @@ def _control_fit(counts: sparse.csr_matrix, s: np.ndarray) -> Tuple[np.ndarray, 
     log_trend = np.log(fit.x[0] + fit.x[1] / m)
     spread = float(np.var(log_g[use] - log_trend[use]))
     prior_var = max(spread - float(np.mean(sampling_var[use])), 0.25)
+    return fit.x[0], fit.x[1], prior_var, centres, var_per_bin
+
+
+def _shrink_phi(mu: np.ndarray, log_gene: np.ndarray, prior: tuple) -> np.ndarray:
+    """Gene-wise log phi shrunk toward the trend of ``prior``; NaN for genes with no counts."""
+    a, b, prior_var, centres, var_per_bin = prior
+    expressed = np.isfinite(log_gene)
+    phi = np.full(mu.shape, np.nan)
+    sampling_var = np.interp(np.log(mu[expressed]), centres, var_per_bin)
+    log_trend = np.log(a + b / mu[expressed])
     # Precision-weighted average of gene-wise and trend; written with the weight on
     # the gene so that a sampling variance of 0 (identical halves) gives weight 1.
     gene_weight = prior_var / (prior_var + sampling_var)
-    log_phi = gene_weight * log_g + (1 - gene_weight) * log_trend
+    log_phi = gene_weight * log_gene[expressed] + (1 - gene_weight) * log_trend
     phi[expressed] = np.exp(log_phi)
-    return mu, phi
+    return phi
 
 
 def _nb_logpmf(x: np.ndarray, mean: np.ndarray, phi: np.ndarray) -> np.ndarray:
@@ -274,6 +298,9 @@ def compute_knockdown_mask(expr: ad.AnnData, cfg: Config) -> Tuple[ad.AnnData, p
     membership = membership_index(expr, cfg)
     if membership is not None:
         logger.info("knockdown_filter: high-MOI membership — evaluating every (cell, carried target) pair")
+    # Validation allows non_carriers only in high-MOI mode, so membership is set whenever it is used.
+    control = kcfg.control or ("non_carriers" if membership is not None else "ntc")
+    non_carriers = control == "non_carriers"
     contexts = _contexts(expr, cfg)
     context_values = sorted(set(contexts))
     count_model = kcfg.method == "count_model"
@@ -311,9 +338,22 @@ def compute_knockdown_mask(expr: ad.AnnData, cfg: Config) -> Tuple[ad.AnnData, p
             )
         raw_columns = _raw_target_columns(expr, measured) if measured else None
         size_factor = _size_factors(expr)
-        # Mean and shared overdispersion of every gene in each context's controls.
+        # ntc: mean and shared overdispersion of every gene in each context's controls.
+        # non_carriers: the baseline cells differ per target, so only the dispersion trend
+        # over genes is fitted here, on the context's targeting cells (any one target's
+        # carriers are a small fraction of them); each target's own mean and dispersion
+        # come from its non-carriers in the loop below.
         control_fit = {}
+        dispersion_prior = {}
         for ctx in context_values:
+            if non_carriers:
+                rows_ctx = np.flatnonzero(membership.targeting_mask & (contexts == ctx))
+                if rows_ctx.size >= kcfg.min_control_cells:
+                    mu_ctx, log_phi_ctx = _log_gene_wise_phi(counts[rows_ctx], size_factor[rows_ctx])
+                    dispersion_prior[ctx] = _dispersion_prior(
+                        counts[rows_ctx], size_factor[rows_ctx], mu_ctx, log_phi_ctx
+                    )
+                continue
             ctrl_rows = np.flatnonzero(ntc & (contexts == ctx))
             if ctrl_rows.size >= kcfg.min_control_cells:
                 control_fit[ctx] = _control_fit(counts[ctrl_rows], size_factor[ctrl_rows])
@@ -324,6 +364,7 @@ def compute_knockdown_mask(expr: ad.AnnData, cfg: Config) -> Tuple[ad.AnnData, p
     rows: List[Dict[str, object]] = []
     for gene_number, gene in enumerate(all_targets):
         gene_cells = membership.mask(gene) if membership is not None else targeting & (targets == gene)
+        baseline_cells = membership.other_mask(gene) if non_carriers else ntc
         x = None
         if gene in col_of:
             x = columns[:, col_of[gene]].toarray().ravel()
@@ -337,7 +378,7 @@ def compute_knockdown_mask(expr: ad.AnnData, cfg: Config) -> Tuple[ad.AnnData, p
             n_cells = int(cells.sum())
             if n_cells == 0:
                 continue
-            ctrl = ntc & in_ctx
+            ctrl = baseline_cells & in_ctx
             row: Dict[str, object] = {
                 "target_gene": gene,
                 "context": ctx,
@@ -365,9 +406,17 @@ def compute_knockdown_mask(expr: ad.AnnData, cfg: Config) -> Tuple[ad.AnnData, p
                     row["mean_ratio"] = float(np.mean(ratio[cells]))
                     row["group_status"] = "ok"
                     if count_model:
-                        gene_index = expr.var_names.get_loc(gene)
-                        mu = control_fit[ctx][0][gene_index]
-                        phi = control_fit[ctx][1][gene_index]
+                        if non_carriers:
+                            rows_ctrl = np.flatnonzero(ctrl)
+                            mu_g, log_phi_g = _log_gene_wise_phi(
+                                sparse.csr_matrix(x_raw[rows_ctrl][:, None]), size_factor[rows_ctrl]
+                            )
+                            mu = float(mu_g[0])
+                            phi = float(_shrink_phi(mu_g, log_phi_g, dispersion_prior[ctx])[0])
+                        else:
+                            gene_index = expr.var_names.get_loc(gene)
+                            mu = control_fit[ctx][0][gene_index]
+                            phi = control_fit[ctx][1][gene_index]
                         row["control_mean_counts"] = mu
                         row["control_dispersion"] = phi
                         model_mean[cells] = mu * size_factor[cells]
@@ -454,10 +503,11 @@ def compute_knockdown_mask(expr: ad.AnnData, cfg: Config) -> Tuple[ad.AnnData, p
         table.insert(3, "method", kcfg.method)
     n_marked = int((targeting & ~expr.obs[OBS_KD_KEEP].to_numpy()).sum())
     logger.info(
-        "Knockdown mask (method=%s, mode=%s, context=%s): %d/%d targeting cells "
+        "Knockdown mask (method=%s, mode=%s, control=%s, context=%s): %d/%d targeting cells "
         "marked for removal across %d targets; no cells removed",
         kcfg.method,
         kcfg.mode,
+        control,
         kcfg.context_key or "none",
         n_marked,
         int(targeting.sum()),
